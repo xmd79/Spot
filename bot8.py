@@ -330,7 +330,7 @@ def analyze_volume_spike(client, symbol):
         print(f"analyze_volume_spike error: {e}")
         return None
 
-def calculate_time_to_target(current_price, target_price, cycle_period, current_phase, octagonal_phase, volume_spike_data, timeframe='1h'):
+def calculate_time_to_target(current_price, target_price, cycle_period, current_phase, octagonal_phase, volume_spike_data, timeframe='1h', price_history=None):
     """
     Enhanced time to target calculation with volume spike consideration.
     Returns estimated time in seconds and confidence.
@@ -365,9 +365,19 @@ def calculate_time_to_target(current_price, target_price, cycle_period, current_
         # Convert cycle period to seconds
         cycle_period_seconds = cycle_period * seconds_per_point
         
-        # Base time calculation - scale with price distance
-        # Larger price movements take proportionally more time
-        base_time = cycle_period_seconds * 0.5 * (1 + price_distance_pct)
+        # Enhanced base time calculation with historical volatility consideration
+        base_time = cycle_period_seconds * 0.5
+        
+        # Adjust for price distance - larger movements take proportionally more time
+        distance_factor = 1.0 + min(2.0, price_distance_pct * 10)  # Cap at 3x base time
+        
+        # Calculate historical volatility if price history is available
+        volatility_factor = 1.0
+        if price_history is not None and len(price_history) > 20:
+            returns = np.diff(price_history) / price_history[:-1]
+            volatility = np.std(returns)
+            # Higher volatility means faster price movements
+            volatility_factor = 1.0 / (1.0 + volatility * 50)  # Normalize volatility impact
         
         # Adjust based on octagonal phase
         # Phases 0 and 1 (uptrend) are fastest, 4 and 5 (downtrend) are slowest
@@ -395,12 +405,12 @@ def calculate_time_to_target(current_price, target_price, cycle_period, current_
                 volume_factor = 0.8  # 20% faster with volume spike
         
         # Calculate adjusted time to target
-        adjusted_time = base_time * phase_speed_factor * volume_factor
+        adjusted_time = base_time * distance_factor * volatility_factor * phase_speed_factor * volume_factor
         
         # Ensure time is within reasonable bounds
         adjusted_time = max(MIN_TIME_TO_TARGET, min(MAX_TIME_TO_TARGET, adjusted_time))
         
-        # Calculate confidence based on multiple factors
+        # Enhanced confidence calculation
         phase_alignment = 1.0 - abs(current_phase - 0.5) * 2  # 1.0 at peak, 0.0 at trough
         octagonal_alignment = 1.0 - abs(octagonal_phase - OCTAGONAL_SEGMENTS/2) / (OCTAGONAL_SEGMENTS/2)
         
@@ -411,10 +421,32 @@ def calculate_time_to_target(current_price, target_price, cycle_period, current_
         # Price distance confidence - closer targets are more confident
         distance_confidence = 1.0 - min(1.0, price_distance_pct * 5)  # Scale down confidence for distant targets
         
-        confidence = (phase_alignment * 0.25 + octagonal_alignment * 0.25 + volume_confidence * 0.3 + distance_confidence * 0.2)
+        # Historical pattern confidence - check if similar price movements occurred before
+        pattern_confidence = 0.5
+        if price_history is not None and len(price_history) > 50:
+            # Look for similar price movements in history
+            target_change = (target_price - current_price) / current_price
+            historical_changes = []
+            for i in range(20, len(price_history)):
+                change = (price_history[i] - price_history[i-20]) / price_history[i-20]
+                historical_changes.append(change)
+            
+            if historical_changes:
+                # Count how many times similar or larger changes occurred
+                similar_changes = sum(1 for change in historical_changes if abs(change) >= abs(target_change))
+                pattern_confidence = min(1.0, similar_changes / len(historical_changes) * 2)
         
-        # Ensure confidence is within 0-1 range
-        confidence = max(0.1, min(1.0, confidence))  # Minimum confidence of 0.1
+        # Combine all confidence factors
+        confidence = (
+            phase_alignment * 0.20 + 
+            octagonal_alignment * 0.20 + 
+            volume_confidence * 0.25 + 
+            distance_confidence * 0.15 + 
+            pattern_confidence * 0.20
+        )
+        
+        # Ensure confidence is within 0-1 range with minimum of 0.1
+        confidence = max(0.1, min(1.0, confidence))
         
         return adjusted_time, confidence
     except Exception as e:
@@ -1019,6 +1051,7 @@ def perform_final_analysis(client, symbol):
 
     current_price = float(df['close'].iloc[-1])
     timestamps = np.arange(len(df))
+    price_history = df['close'].values  # Store for time-to-target calculation
     
     print("Performing enhanced geometric analysis...")
     octagonal_phase, octagonal_strength = calculate_octagonal_symmetry(df['close'].values, timestamps)
@@ -1080,7 +1113,7 @@ def perform_final_analysis(client, symbol):
         current_phase = sin_phase if sin_phase is not None else 0.5
         oct_phase = octagonal_phase if octagonal_phase is not None else 4
         time_to_target, time_confidence = calculate_time_to_target(
-            current_price, consensus_target, cycle_period, current_phase, oct_phase, volume_spike_data, '1h'
+            current_price, consensus_target, cycle_period, current_phase, oct_phase, volume_spike_data, '1h', price_history
         )
 
     print("\n" + "="*80)
