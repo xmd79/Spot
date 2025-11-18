@@ -47,6 +47,9 @@ except Exception as e:
 # ------------------ Configuration ------------------
 API_FILE = 'api.txt'
 MTF_SCAN_TIMEFRAMES = ['5m', '15m', '30m', '1h', '4h', '1d']
+# Prioritize short timeframes for faster spike detection
+PRIORITY_TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1h']
+BACKUP_TIMEFRAMES = ['2h', '4h', '6h', '8h', '12h', '1d']
 DETAILED_1M_TIMEFRAMES = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '8h', '12h', '1d']
 
 # Scoring & criteria
@@ -56,6 +59,13 @@ PRICE_UPTREND_PERIOD = 5
 
 # Optimization & Weights
 TIMEFRAME_WEIGHTS = {'5m': 1.0, '15m': 1.2, '30m': 1.4, '1h': 1.6, '4h': 1.8, '1d': 2.0}
+# Give higher weight to shorter timeframes for faster spike detection
+PRIORITY_TIMEFRAME_WEIGHTS = {
+    '1m': 2.5, '3m': 2.2, '5m': 2.0, '15m': 1.8, 
+    '30m': 1.6, '1h': 1.4, '2h': 1.2, '4h': 1.0, 
+    '6h': 0.9, '8h': 0.8, '12h': 0.7, '1d': 0.6
+}
+
 ASSET_SCAN_LIMIT = 100
 MIN_24H_VOLUME_USD = 500000
 MIN_24H_PRICE_CHANGE_PCT = 0.5
@@ -1311,7 +1321,7 @@ def analyze_asset_for_table(client, symbol):
     try:
         # Get MTF data using concurrent processing
         with ThreadPoolExecutor(max_workers=6) as ex:
-            futures = [ex.submit(get_mtf_data, client, symbol, tf) for tf in MTF_SCAN_TIMEFRAMES]
+            futures = [ex.submit(get_mtf_data, client, symbol, tf) for tf in PRIORITY_TIMEFRAMES]
             for f in as_completed(futures):
                 if stop_event.is_set(): return None
                 data = f.result()
@@ -1322,7 +1332,7 @@ def analyze_asset_for_table(client, symbol):
                 result[f'{tf}_volume_change_pct'] = data['volume_change_pct']
                 result['current_price'] = data['current_price']
                 if data['is_dip']:
-                    weight = TIMEFRAME_WEIGHTS.get(tf, 1.0)
+                    weight = PRIORITY_TIMEFRAME_WEIGHTS.get(tf, 1.0)
                     dip_strength = float(data.get('dip_strength', 50)) / 100.0
                     weighted_dip_score += weight * dip_strength
 
