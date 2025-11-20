@@ -8,14 +8,15 @@ Features:
  - Multi-model forecasting with time-to-target calculation
  - Sinusoidal pattern analysis for cycle timing
  - Enhanced scoring system combining all factors
- - Single-run mode to find and analyze the best opportunity
+ - Single-run mode to find and analyze best opportunity
  - Optimized concurrent scanning for faster execution
- - Multiple moving averages confirmation (MA7 < SMA12 < SMA27 < SMA56 < SMA150 < SMA360)
+ - Multiple moving averages confirmation (SMA7 < SMA12 < SMA27 < SMA56 < SMA150)
  - Polynomial fit analysis for trend confirmation
  - Volume analysis (bullish vs bearish)
- - RSI analysis with oversold confirmation
+ - RSI analysis with oversold/overbought confirmation
  - Golden ratio support/resistance levels
  - FFT forecast price prediction
+ - Pre-spike detection with Hilbert Transform, FFT, and signal processing
 """
 
 import os
@@ -30,6 +31,8 @@ import math
 from binance.client import Client
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from scipy.signal import hilbert, find_peaks
+from scipy.fft import fft, fftfreq, ifft
 
 # Suppress warnings for clean output
 warnings.filterwarnings("ignore")
@@ -101,12 +104,22 @@ RSI_OVERBOUGHT = 70
 RSI_MIDDLE = 50
 
 # Moving Averages Configuration
-MA7_PERIOD = 7
+SMA7_PERIOD = 7
 SMA12_PERIOD = 12
 SMA27_PERIOD = 27
 SMA56_PERIOD = 56
 SMA150_PERIOD = 150
-SMA360_PERIOD = 360
+
+# Pre-Spike Detection Configuration
+BB_WIDTH_MIN = 0.05  # Minimum Bollinger Band width for squeeze
+BB_WIDTH_MAX = 0.12  # Maximum Bollinger Band width for squeeze
+ATR_PERCENTILE_MIN = 5  # Minimum ATR percentile for squeeze
+ATR_PERCENTILE_MAX = 10  # Maximum ATR percentile for squeeze
+ROC2_GROWTH_MIN = 50  # Minimum ROC2 growth percentage
+ROC2_GROWTH_MAX = 200  # Maximum ROC2 growth percentage
+BUY_PRESSURE_MIN = 60  # Minimum buy pressure percentage
+LIQUIDITY_GAP_MIN = 0.5  # Minimum liquidity gap percentage
+LIQUIDITY_GAP_MAX = 1.5  # Maximum liquidity gap percentage
 
 # Misc
 MAX_KLINES_LIMIT = 2000
@@ -388,6 +401,400 @@ def analyze_volume_spike(client, symbol):
         print(f"analyze_volume_spike error: {e}")
         return None
 
+def analyze_pre_spike_conditions(df):
+    """
+    Enhanced pre-spike analysis using Hilbert Transform, FFT, and signal processing.
+    Analyzes:
+    1. Hilbert Transform Sine wave (HT_SINE) for phase analysis
+    2. FFT-based forecasting from argmin to argmax
+    3. Signal processing metrics: energy, frequency, vibration, power, angular momentum, pulse, impulse
+    4. Golden ratio integration for volume analysis
+    Returns a tuple of (is_valid, score, details)
+    """
+    try:
+        if df is None or len(df) < 50:
+            return False, 0.0, {"error": "Not enough data for pre-spike analysis"}
+        
+        # Initialize results
+        conditions_met = 0
+        total_score = 0.0
+        details = {}
+        
+        # Extract price and volume data
+        close_prices = df['close'].values
+        volume_data = df['volume'].values
+        timestamps = np.arange(len(close_prices))
+        
+        # Handle NaN and zero values
+        close_prices = np.nan_to_num(close_prices, nan=np.mean(close_prices[~np.isnan(close_prices)]))
+        close_prices = np.where(close_prices == 0, np.mean(close_prices[close_prices > 0]), close_prices)
+        volume_data = np.nan_to_num(volume_data, nan=np.mean(volume_data[~np.isnan(volume_data)]))
+        volume_data = np.where(volume_data == 0, np.mean(volume_data[volume_data > 0]), volume_data)
+        
+        # Normalize price data for signal processing
+        norm_prices = (close_prices - np.mean(close_prices)) / np.std(close_prices)
+        
+        # 1. Hilbert Transform Analysis
+        try:
+            # Apply Hilbert Transform to get analytic signal
+            analytic_signal = hilbert(norm_prices)
+            amplitude_envelope = np.abs(analytic_signal)
+            instantaneous_phase = np.unwrap(np.angle(analytic_signal))
+            instantaneous_frequency = np.diff(instantaneous_phase) / (2.0 * np.pi)
+            
+            # Calculate HT_SINE
+            ht_sine = np.sin(instantaneous_phase)
+            
+            # Find most recent minimum (argmin) in price data
+            argmin_idx = np.argmin(close_prices[-200:]) + len(close_prices) - 200
+            
+            # Get phase at minimum
+            phase_at_min = instantaneous_phase[argmin_idx]
+            
+            # Current phase
+            current_phase = instantaneous_phase[-1]
+            
+            # Calculate phase difference from minimum to current
+            phase_diff = (current_phase - phase_at_min) % (2 * np.pi)
+            
+            # Phase condition: we're in upward phase (0 to π)
+            phase_condition = 0 < phase_diff < np.pi
+            
+            # Calculate amplitude growth from minimum
+            amplitude_at_min = amplitude_envelope[argmin_idx]
+            current_amplitude = amplitude_envelope[-1]
+            amplitude_growth = (current_amplitude - amplitude_at_min) / amplitude_at_min if amplitude_at_min > 0 else 0
+            
+            # Amplitude condition: amplitude is growing
+            amplitude_condition = amplitude_growth > 0.1  # 10% growth threshold
+            
+            # Frequency condition: frequency is increasing (acceleration)
+            recent_freq = np.mean(instantaneous_frequency[-10:])
+            previous_freq = np.mean(instantaneous_frequency[-20:-10])
+            freq_acceleration = (recent_freq - previous_freq) / previous_freq if previous_freq != 0 else 0
+            freq_condition = freq_acceleration > 0.05  # 5% acceleration threshold
+            
+            # Overall Hilbert condition
+            hilbert_condition = phase_condition and amplitude_condition and freq_condition
+            
+            if hilbert_condition:
+                conditions_met += 1
+                phase_score = 1.0 - (phase_diff / np.pi) if phase_diff < np.pi else 0  # Closer to 0 is better
+                amp_score = min(1.0, amplitude_growth * 10)  # Scale amplitude growth
+                freq_score = min(1.0, freq_acceleration * 20)  # Scale frequency acceleration
+                condition_score = (phase_score * 0.4 + amp_score * 0.3 + freq_score * 0.3) * 25
+                total_score += condition_score
+                details['hilbert_transform'] = {
+                    'met': True,
+                    'phase_diff': phase_diff,
+                    'phase_condition': phase_condition,
+                    'amplitude_growth': amplitude_growth,
+                    'amplitude_condition': amplitude_condition,
+                    'freq_acceleration': freq_acceleration,
+                    'freq_condition': freq_condition,
+                    'score': condition_score
+                }
+            else:
+                details['hilbert_transform'] = {
+                    'met': False,
+                    'phase_diff': phase_diff,
+                    'phase_condition': phase_condition,
+                    'amplitude_growth': amplitude_growth,
+                    'amplitude_condition': amplitude_condition,
+                    'freq_acceleration': freq_acceleration,
+                    'freq_condition': freq_condition,
+                    'score': 0
+                }
+        except Exception as e:
+            details['hilbert_transform'] = {'met': False, 'error': str(e)}
+        
+        # 2. FFT-based Forecasting
+        try:
+            # Get last 1200 values or all if less than 1200
+            last_1200_prices = close_prices[-1200:] if len(close_prices) >= 1200 else close_prices
+            
+            # Find most recent minimum (argmin) in price data
+            argmin_idx = np.argmin(last_1200_prices)
+            
+            # Extract data from minimum to now
+            segment_prices = last_1200_prices[argmin_idx:]
+            
+            # Apply FFT to find dominant frequencies
+            n = len(segment_prices)
+            if n < FFT_MIN_LENGTH:
+                fft_condition = False
+                fft_score = 0
+            else:
+                # Detrend data
+                trend = np.polyfit(np.arange(n), segment_prices, 1)
+                detrended = segment_prices - np.polyval(trend, np.arange(n))
+                
+                # Apply FFT
+                yf = fft(detrended)
+                xf = fftfreq(n, d=1.0)
+                
+                # Find dominant frequency (excluding zero frequency)
+                half = n // 2
+                mag = np.abs(yf[:half])
+                freqs = xf[:half]
+                mag[0] = 0  # Remove DC component
+                
+                if np.max(mag) < 1e-6:
+                    fft_condition = False
+                    fft_score = 0
+                else:
+                    # Get dominant frequency and amplitude
+                    idx = np.argmax(mag[1:]) + 1
+                    dominant_freq = freqs[idx]
+                    amplitude = mag[idx] / n
+                    
+                    # Calculate phase
+                    phase = np.angle(yf[idx])
+                    
+                    # Calculate next expected peak
+                    period = 1.0 / abs(dominant_freq) if dominant_freq != 0 else 0
+                    current_time = n - 1
+                    
+                    # Time since last minimum
+                    time_since_min = current_time
+                    
+                    # Determine if we're heading to a peak
+                    phase_position = (time_since_min / period) % 1.0 if period > 0 else 0
+                    
+                    # Next peak at 0.25, trough at 0.75
+                    next_peak_time = period * 0.25
+                    next_trough_time = period * 0.75
+                    
+                    # Determine which comes next
+                    if current_time < next_peak_time:
+                        next_extremum_type = "peak"
+                        time_to_next = next_peak_time - current_time
+                    elif current_time < next_trough_time:
+                        next_extremum_type = "trough"
+                        time_to_next = next_trough_time - current_time
+                    else:
+                        next_extremum_type = "peak"
+                        time_to_next = period * 1.25 - current_time
+                    
+                    # FFT condition: we're heading to a peak within a reasonable time
+                    fft_condition = next_extremum_type == "peak" and 0 < time_to_next < period * 0.5
+                    
+                    # Calculate FFT score
+                    time_score = 1.0 - (time_to_next / (period * 0.5)) if period > 0 else 0
+                    amp_score = min(1.0, amplitude * 1000)  # Scale amplitude
+                    fft_score = (time_score * 0.6 + amp_score * 0.4) * 25
+                    
+                    # Store FFT details
+                    details['fft_analysis'] = {
+                        'met': fft_condition,
+                        'dominant_freq': dominant_freq,
+                        'amplitude': amplitude,
+                        'phase': phase,
+                        'period': period,
+                        'next_extremum_type': next_extremum_type,
+                        'time_to_next': time_to_next,
+                        'score': fft_score if fft_condition else 0
+                    }
+            
+            if fft_condition:
+                conditions_met += 1
+                total_score += fft_score
+        except Exception as e:
+            details['fft_analysis'] = {'met': False, 'error': str(e)}
+        
+        # 3. Signal Processing Metrics
+        try:
+            # Calculate signal energy (sum of squared values)
+            signal_energy = np.sum(norm_prices ** 2)
+            
+            # Calculate signal power (energy per unit time)
+            signal_power = signal_energy / len(norm_prices)
+            
+            # Calculate dominant frequency using FFT
+            n = len(norm_prices)
+            yf = fft(norm_prices)
+            xf = fftfreq(n, d=1.0)
+            half = n // 2
+            mag = np.abs(yf[:half])
+            freqs = xf[:half]
+            dominant_freq_idx = np.argmax(mag[1:]) + 1
+            dominant_freq = abs(freqs[dominant_freq_idx])
+            
+            # Calculate vibration (standard deviation of the signal)
+            vibration = np.std(norm_prices)
+            
+            # Calculate angular momentum (phase velocity * amplitude)
+            analytic_signal = hilbert(norm_prices)
+            instantaneous_phase = np.unwrap(np.angle(analytic_signal))
+            instantaneous_frequency = np.diff(instantaneous_phase) / (2.0 * np.pi)
+            amplitude_envelope = np.abs(analytic_signal)
+            angular_momentum = np.mean(amplitude_envelope[:-1] * instantaneous_frequency)
+            
+            # Calculate pulse (rate of significant changes)
+            threshold = np.std(norm_prices) * 2
+            significant_changes = np.where(np.abs(np.diff(norm_prices)) > threshold)[0]
+            pulse_rate = len(significant_changes) / len(norm_prices)
+            
+            # Calculate impulse (sudden changes in momentum)
+            momentum = np.diff(norm_prices)
+            impulse = np.sum(np.abs(np.diff(momentum)))
+            
+            # Calculate signal processing score
+            # Higher energy, power, and angular momentum are positive indicators
+            # Moderate vibration and pulse rate are ideal
+            # High impulse indicates potential breakout
+            
+            energy_score = min(1.0, signal_energy / 1000)  # Normalize
+            power_score = min(1.0, signal_power * 10)  # Normalize
+            freq_score = min(1.0, dominant_freq * 100)  # Normalize
+            vibration_score = 1.0 - min(1.0, abs(vibration - 1.0))  # Ideal around 1.0
+            angular_momentum_score = min(1.0, angular_momentum * 10)  # Normalize
+            pulse_score = 1.0 - min(1.0, abs(pulse_rate - 0.1) * 10)  # Ideal around 0.1
+            impulse_score = min(1.0, impulse / 10)  # Normalize
+            
+            # Overall signal processing condition
+            signal_condition = (
+                energy_score > 0.5 and 
+                power_score > 0.5 and 
+                angular_momentum_score > 0.5 and 
+                impulse_score > 0.3
+            )
+            
+            if signal_condition:
+                conditions_met += 1
+                condition_score = (
+                    energy_score * 0.15 + 
+                    power_score * 0.15 + 
+                    freq_score * 0.1 + 
+                    vibration_score * 0.1 + 
+                    angular_momentum_score * 0.2 + 
+                    pulse_score * 0.1 + 
+                    impulse_score * 0.2
+                ) * 25
+                total_score += condition_score
+                details['signal_processing'] = {
+                    'met': True,
+                    'signal_energy': signal_energy,
+                    'signal_power': signal_power,
+                    'dominant_freq': dominant_freq,
+                    'vibration': vibration,
+                    'angular_momentum': angular_momentum,
+                    'pulse_rate': pulse_rate,
+                    'impulse': impulse,
+                    'score': condition_score
+                }
+            else:
+                details['signal_processing'] = {
+                    'met': False,
+                    'signal_energy': signal_energy,
+                    'signal_power': signal_power,
+                    'dominant_freq': dominant_freq,
+                    'vibration': vibration,
+                    'angular_momentum': angular_momentum,
+                    'pulse_rate': pulse_rate,
+                    'impulse': impulse,
+                    'score': 0
+                }
+        except Exception as e:
+            details['signal_processing'] = {'met': False, 'error': str(e)}
+        
+        # 4. Golden Ratio Volume Analysis
+        try:
+            # Get the last 1200 values or all if less than 1200
+            last_1200_prices = close_prices[-1200:] if len(close_prices) >= 1200 else close_prices
+            last_1200_volumes = volume_data[-1200:] if len(volume_data) >= 1200 else volume_data
+            
+            # Find the most recent minimum and maximum in the price data
+            min_idx = np.argmin(last_1200_prices)
+            max_idx = np.argmax(last_1200_prices)
+            
+            # Calculate price range
+            min_price = last_1200_prices[min_idx]
+            max_price = last_1200_prices[max_idx]
+            price_range = max_price - min_price
+            
+            # Calculate golden ratio levels for volume
+            # We expect volume to follow golden ratio patterns relative to price movement
+            min_volume = np.min(last_1200_volumes)
+            max_volume = np.max(last_1200_volumes)
+            volume_range = max_volume - min_volume
+            
+            # Calculate current position in price range (0 to 1)
+            current_price = last_1200_prices[-1]
+            price_position = (current_price - min_price) / price_range if price_range > 0 else 0.5
+            
+            # Calculate current position in volume range (0 to 1)
+            current_volume = last_1200_volumes[-1]
+            volume_position = (current_volume - min_volume) / volume_range if volume_range > 0 else 0.5
+            
+            # Golden ratio levels (0, 0.236, 0.382, 0.618, 0.786, 1.0)
+            golden_levels = [0.0, 0.236, 0.382, 0.618, 0.786, 1.0]
+            
+            # Find closest golden level to current price position
+            closest_price_level = min(golden_levels, key=lambda x: abs(x - price_position))
+            price_level_diff = abs(price_position - closest_price_level)
+            
+            # Find closest golden level to current volume position
+            closest_volume_level = min(golden_levels, key=lambda x: abs(x - volume_position))
+            volume_level_diff = abs(volume_position - closest_volume_level)
+            
+            # Check if price and volume are aligned with golden ratio
+            alignment_score = 1.0 - (price_level_diff + volume_level_diff) / 2.0
+            
+            # Check if we're at a golden ratio support/resistance level
+            at_golden_level = price_level_diff < 0.05  # Within 5% of a golden level
+            
+            # Check if volume is confirming price movement
+            volume_confirmation = (
+                (price_position > 0.5 and volume_position > 0.5) or  # Both above middle
+                (price_position < 0.5 and volume_position < 0.5)      # Both below middle
+            )
+            
+            # Overall golden ratio condition
+            golden_condition = at_golden_level and volume_confirmation and alignment_score > 0.7
+            
+            if golden_condition:
+                conditions_met += 1
+                condition_score = (alignment_score * 0.6 + (1.0 - price_level_diff) * 0.2 + (1.0 - volume_level_diff) * 0.2) * 25
+                total_score += condition_score
+                details['golden_ratio_volume'] = {
+                    'met': True,
+                    'price_position': price_position,
+                    'volume_position': volume_position,
+                    'closest_price_level': closest_price_level,
+                    'closest_volume_level': closest_volume_level,
+                    'price_level_diff': price_level_diff,
+                    'volume_level_diff': volume_level_diff,
+                    'alignment_score': alignment_score,
+                    'at_golden_level': at_golden_level,
+                    'volume_confirmation': volume_confirmation,
+                    'score': condition_score
+                }
+            else:
+                details['golden_ratio_volume'] = {
+                    'met': False,
+                    'price_position': price_position,
+                    'volume_position': volume_position,
+                    'closest_price_level': closest_price_level,
+                    'closest_volume_level': closest_volume_level,
+                    'price_level_diff': price_level_diff,
+                    'volume_level_diff': volume_level_diff,
+                    'alignment_score': alignment_score,
+                    'at_golden_level': at_golden_level,
+                    'volume_confirmation': volume_confirmation,
+                    'score': 0
+                }
+        except Exception as e:
+            details['golden_ratio_volume'] = {'met': False, 'error': str(e)}
+        
+        # Determine if spike is imminent based on conditions met
+        spike_imminent = conditions_met >= 3  # At least 3 of 4 conditions
+        
+        return spike_imminent, total_score, details
+    except Exception as e:
+        print(f"analyze_pre_spike_conditions error: {e}")
+        return False, 0.0, {"error": str(e)}
+
 def calculate_time_to_target(current_price, target_price, cycle_period, current_phase, octagonal_phase, volume_spike_data, timeframe='1m', price_history=None):
     """
     Enhanced time to target calculation with volume spike consideration.
@@ -548,7 +955,7 @@ def analyze_sinuosidal_pattern(prices, timestamps, timeframe='1m'):
             return None, None, None, None, None
             
         # Get dominant frequency and amplitude
-        idx = np.argmax(mag)
+        idx = np.argmax(mag[1:]) + 1
         dominant_freq = freqs[idx]
         amplitude = mag[idx] / n
         
@@ -652,20 +1059,19 @@ def calculate_rsi(df, period=RSI_PERIOD):
 def calculate_moving_averages(df):
     """Calculate multiple moving averages for trend confirmation."""
     try:
-        if df is None or len(df) < SMA360_PERIOD:
+        if df is None or len(df) < SMA150_PERIOD:
             return None
             
         df = df.copy()
         
-        # Calculate MA7
-        df['MA7'] = df['close'].rolling(window=MA7_PERIOD).mean()
+        # Calculate SMA7 (changed from MA7)
+        df['SMA7'] = df['close'].rolling(window=SMA7_PERIOD).mean()
         
-        # Calculate SMAs
+        # Calculate other SMAs
         df['SMA12'] = df['close'].rolling(window=SMA12_PERIOD).mean()
         df['SMA27'] = df['close'].rolling(window=SMA27_PERIOD).mean()
         df['SMA56'] = df['close'].rolling(window=SMA56_PERIOD).mean()
         df['SMA150'] = df['close'].rolling(window=SMA150_PERIOD).mean()
-        df['SMA360'] = df['close'].rolling(window=SMA360_PERIOD).mean()
         
         return df
     except Exception as e:
@@ -697,6 +1103,188 @@ def check_polynomial_fit(prices, timestamps):
     except Exception as e:
         print(f"check_polynomial_fit error: {e}")
         return False
+
+def analyze_rsi_conditions(rsi_values, current_rsi):
+    """
+    Enhanced RSI analysis with two separate conditions:
+    1. Is the most recent RSI value oversold (true/false)
+    2. Is the most recent RSI value overbought (true/false)
+    Returns a tuple of (is_oversold, is_overbought, score, details)
+    """
+    try:
+        if rsi_values is None or len(rsi_values) < 100:
+            return False, False, 0.0, {"error": "Not enough RSI data"}
+        
+        # Find the most recent oversold and overbought occurrences
+        last_oversold_idx = None
+        last_overbought_idx = None
+        
+        for i in range(len(rsi_values) - 1, -1, -1):
+            if last_oversold_idx is None and rsi_values[i] <= RSI_OVERSOLD:
+                last_oversold_idx = i
+            if last_overbought_idx is None and rsi_values[i] >= RSI_OVERBOUGHT:
+                last_overbought_idx = i
+                
+            if last_oversold_idx is not None and last_overbought_idx is not None:
+                break
+        
+        # Check if current RSI is oversold or overbought
+        is_oversold = current_rsi <= RSI_OVERSOLD
+        is_overbought = current_rsi >= RSI_OVERBOUGHT
+        
+        # Check if oversold is the most recent occurrence
+        oversold_is_most_recent = False
+        if last_oversold_idx is not None:
+            oversold_is_most_recent = (last_oversold_idx > last_overbought_idx) if last_overbought_idx is not None else True
+        
+        # Check if overbought is the most recent occurrence
+        overbought_is_most_recent = False
+        if last_overbought_idx is not None:
+            overbought_is_most_recent = (last_overbought_idx > last_oversold_idx) if last_oversold_idx is not None else True
+        
+        # Calculate score based on how oversold or overbought RSI is
+        oversold_score = 0.0
+        if is_oversold:
+            # More oversold = higher score
+            oversold_score = (RSI_OVERSOLD - current_rsi) / RSI_OVERSOLD * 50
+        else:
+            # If not oversold, give partial score based on how close to oversold
+            oversold_score = max(0, (RSI_OVERSOLD - current_rsi) / RSI_OVERSOLD * 30)
+        
+        overbought_score = 0.0
+        if is_overbought:
+            # More overbought = higher score
+            overbought_score = (current_rsi - RSI_OVERBOUGHT) / (100 - RSI_OVERBOUGHT) * 50
+        else:
+            # If not overbought, give partial score based on how close to overbought
+            overbought_score = max(0, (current_rsi - RSI_OVERBOUGHT) / (100 - RSI_OVERBOUGHT) * 30)
+        
+        # Combined score
+        total_score = oversold_score + overbought_score
+        
+        details = {
+            "current_rsi": current_rsi,
+            "is_oversold": is_oversold,
+            "is_overbought": is_overbought,
+            "oversold_is_most_recent": oversold_is_most_recent,
+            "overbought_is_most_recent": overbought_is_most_recent,
+            "last_oversold_idx": last_oversold_idx,
+            "last_overbought_idx": last_overbought_idx,
+            "oversold_score": oversold_score,
+            "overbought_score": overbought_score
+        }
+        
+        return is_oversold, is_overbought, total_score, details
+    except Exception as e:
+        print(f"analyze_rsi_conditions error: {e}")
+        return False, False, 0.0, {"error": str(e)}
+
+def analyze_price_dip_conditions(prices, current_price):
+    """
+    Enhanced price dip analysis using argmin vs argmax of last 1200 values.
+    Returns a tuple of (is_valid, score, details)
+    """
+    try:
+        if prices is None or len(prices) < 100:
+            return False, 0.0, {"error": "Not enough price data"}
+            
+        # Get the last 1200 values or all if less than 1200
+        last_1200_values = prices[-1200:] if len(prices) >= 1200 else prices
+        
+        # Find the index of the absolute minimum and maximum in the last 1200 values
+        min_idx = np.argmin(last_1200_values)
+        max_idx = np.argmax(last_1200_values)
+        
+        # Check if the minimum is more recent than the maximum
+        if min_idx < max_idx:
+            return False, 0.0, {"reason": "Most recent minimum is not more recent than most recent maximum"}
+        
+        # Calculate how much the current price is above the minimum
+        min_price = last_1200_values[min_idx]
+        max_price = last_1200_values[max_idx]
+        
+        # Calculate score based on position between min and max
+        # If current price is closer to min, score is higher
+        price_range = max_price - min_price
+        if price_range <= 0:
+            return False, 0.0, {"error": "Invalid price range"}
+            
+        position_in_range = (current_price - min_price) / price_range
+        score = (1.0 - position_in_range) * 100  # Closer to min = higher score
+        
+        details = {
+            "min_idx": min_idx,
+            "max_idx": max_idx,
+            "min_price": min_price,
+            "max_price": max_price,
+            "current_price": current_price,
+            "position_in_range": position_in_range,
+            "score": score
+        }
+        
+        return True, score, details
+    except Exception as e:
+        print(f"analyze_price_dip_conditions error: {e}")
+        return False, 0.0, {"error": str(e)}
+
+def analyze_momentum_conditions(df):
+    """
+    Enhanced momentum analysis with the following conditions:
+    1. Momentum > 0
+    2. Most recent momentum minimum value is more recent than the most recent momentum maximum value from the last 1200 values of 1min timeframe
+    Returns a tuple of (is_valid, score, details)
+    """
+    try:
+        if df is None or len(df) < 100:
+            return False, 0.0, {"error": "Not enough data for momentum analysis"}
+        
+        # Calculate momentum (price change)
+        df['momentum'] = df['close'].pct_change()
+        momentum_values = df['momentum'].values
+        
+        # Condition 1: Current momentum > 0
+        current_momentum = df['momentum'].iloc[-1]
+        if current_momentum <= 0:
+            return False, 0.0, {"reason": "Current momentum is not positive"}
+        
+        # Condition 2: Most recent momentum minimum value is more recent than the most recent momentum maximum value from the last 1200 values
+        # Get the last 1200 values or all if less than 1200
+        last_1200_momentum = momentum_values[-1200:] if len(momentum_values) >= 1200 else momentum_values
+        
+        # Find the index of the absolute minimum and maximum in the last 1200 values
+        min_momentum_idx = np.argmin(last_1200_momentum)
+        max_momentum_idx = np.argmax(last_1200_momentum)
+        
+        # Check if the minimum is more recent than the maximum
+        if min_momentum_idx < max_momentum_idx:
+            return False, 0.0, {"reason": "Most recent momentum minimum is not more recent than most recent momentum maximum"}
+        
+        # Calculate score based on how well conditions are met
+        score = 0.0
+        
+        # Score based on how high current momentum is (higher is better)
+        momentum_score = min(100, current_momentum * 1000)  # Scale momentum to score
+        
+        # Score based on how recent the minimum is compared to maximum
+        if min_momentum_idx is not None and max_momentum_idx is not None:
+            min_max_score = 1.0 - ((max_momentum_idx - min_momentum_idx) / len(last_1200_momentum))
+            score += min_max_score * 50
+        
+        # Ensure score is between 0 and 100
+        score = max(0.0, min(100.0, score))
+        
+        details = {
+            "current_momentum": current_momentum,
+            "min_momentum_idx": min_momentum_idx,
+            "max_momentum_idx": max_momentum_idx,
+            "momentum_score": momentum_score,
+            "min_max_score": min_max_score if min_momentum_idx is not None and max_momentum_idx is not None else 0
+        }
+        
+        return True, score, details
+    except Exception as e:
+        print(f"analyze_momentum_conditions error: {e}")
+        return False, 0.0, {"error": str(e)}
 
 def approx_entropy(series, m=ENTROPY_M, r_scale=ENTROPY_R_SCALE):
     """Approximate Entropy (ApEn) implementation."""
@@ -760,7 +1348,7 @@ def get_mtf_data(client, symbol, timeframe):
         df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
         
         # Convert all numeric columns to float with robust error handling
-        for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume']:
+        for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore']:
             try:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
             except:
@@ -802,7 +1390,7 @@ def get_mtf_data(client, symbol, timeframe):
         volume_change_pct = 0.0
         if len(df) >= 2:
             past_price, past_vol = df['close'].iloc[-2], df['volume'].iloc[-2]
-            if past_price > 0: price_change_pct = ((current_price - past_price) / past_price) * 100
+            if past_price > 0: price_change_pct = ((df['close'].iloc[-1] - past_price) / past_price) * 100
             if past_vol > 0: volume_change_pct = ((df['volume'].iloc[-1] - past_vol) / past_vol) * 100
 
         time_ago_sec = None
@@ -904,6 +1492,7 @@ def prepare_features(df):
                 d.ta.ema(length=21, append=True)
                 d.ta.macd(append=True)
                 d.ta.bbands(append=True)
+                d.ta.sma(length=50, append=True)
             except Exception:
                 pass
         d['return_1'] = d['close'].pct_change(1)
@@ -928,9 +1517,9 @@ def prepare_features(df):
         return X
     except Exception as e:
         try:
-            df['return_1'] = df['close'].pct_change(1)
-            df['vol_ma_10'] = df['volume'].rolling(10, min_periods=1).mean()
-            X = df[['close','volume','return_1','vol_ma_10']].copy()
+            d['return_1'] = d['close'].pct_change(1)
+            d['vol_ma_10'] = d['volume'].rolling(10, min_periods=1).mean()
+            X = d[['close','volume','return_1','vol_ma_10']].copy()
             X.ffill(inplace=True)
             X.dropna(inplace=True)
             return X
@@ -1049,7 +1638,7 @@ def get_mtf_thresholds(client, symbol):
             df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
             
             # Convert all numeric columns to float with error handling
-            for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume']:
+            for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore']:
                 try:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
                 except:
@@ -1119,7 +1708,7 @@ def print_dynamic_table(all_results, scan_stats):
             df = df.sort_values(by=['power_score', 'weighted_dip_score'], ascending=[False, False])
         else:
             df = df.sort_values(by='weighted_dip_score', ascending=False)
-        print(df.head(20).to_string(index=False, float_format="%.25f"))
+        print(df.head(20).to_string(index=False, float_format="%.4f"))
     print("\n--- Scan Statistics ---")
     for k,v in scan_stats.items():
         print(f" - {k:<25}: {v}")
@@ -1141,7 +1730,7 @@ def perform_final_analysis(client, symbol):
         df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
         
         # Convert all numeric columns to float with error handling
-        for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume']:
+        for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore']:
             try:
                 df[c] = pd.to_numeric(df[c], errors='coerce')
             except:
@@ -1151,7 +1740,7 @@ def perform_final_analysis(client, symbol):
         df.fillna(0.0, inplace=True)
         
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        for c in ['open','high','low','close','volume']:
+        for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore']:
             df[c] = df[c].astype(float)
         df.set_index('timestamp', inplace=True)
     except Exception as e:
@@ -1188,14 +1777,16 @@ def perform_final_analysis(client, symbol):
     # Get volume spike data
     volume_spike_data = analyze_volume_spike(client, symbol)
     
+    # Analyze pre-spike conditions with new enhanced function
+    pre_spike_valid, pre_spike_score, pre_spike_details = analyze_pre_spike_conditions(df)
+    
     # Calculate moving averages
     df_ma = calculate_moving_averages(df)
-    ma7 = float(df_ma['MA7'].iloc[-1]) if df_ma is not None and 'MA7' in df_ma.columns else None
+    sma7 = float(df_ma['SMA7'].iloc[-1]) if df_ma is not None and 'SMA7' in df_ma.columns else None
     sma12 = float(df_ma['SMA12'].iloc[-1]) if df_ma is not None and 'SMA12' in df_ma.columns else None
     sma27 = float(df_ma['SMA27'].iloc[-1]) if df_ma is not None and 'SMA27' in df_ma.columns else None
     sma56 = float(df_ma['SMA56'].iloc[-1]) if df_ma is not None and 'SMA56' in df_ma.columns else None
     sma150 = float(df_ma['SMA150'].iloc[-1]) if df_ma is not None and 'SMA150' in df_ma.columns else None
-    sma360 = float(df_ma['SMA360'].iloc[-1]) if df_ma is not None and 'SMA360' in df_ma.columns else None
     
     # Check polynomial fit
     is_below_poly_fit = check_polynomial_fit(df['close'].values, timestamps)
@@ -1203,9 +1794,16 @@ def perform_final_analysis(client, symbol):
     # Calculate RSI
     df_rsi = calculate_rsi(df, RSI_PERIOD)
     current_rsi = float(df_rsi[f'RSI_{RSI_PERIOD}'].iloc[-1]) if df_rsi is not None and f'RSI_{RSI_PERIOD}' in df_rsi.columns else 50.0
-    is_oversold = current_rsi < RSI_OVERSOLD
-    rsi_to_oversold = max(0, RSI_OVERSOLD - current_rsi)
-    rsi_to_middle = abs(RSI_MIDDLE - current_rsi)
+    
+    # Enhanced RSI analysis with new conditions
+    rsi_values = df_rsi[f'RSI_{RSI_PERIOD}'].values if df_rsi is not None and f'RSI_{RSI_PERIOD}' in df_rsi.columns else None
+    is_oversold, is_overbought, rsi_score, rsi_details = analyze_rsi_conditions(rsi_values, current_rsi)
+    
+    # Enhanced price dip analysis
+    price_valid, price_score, price_details = analyze_price_dip_conditions(df['close'].values, current_price)
+    
+    # Enhanced momentum analysis
+    momentum_valid, momentum_score, momentum_details = analyze_momentum_conditions(df)
     
     print("Running ML & cycle models (this may take a moment)...")
     rf_target = run_random_forest(df)
@@ -1216,7 +1814,6 @@ def perform_final_analysis(client, symbol):
 
     ap_en = approx_entropy(df['close'].values, m=ENTROPY_M, r_scale=ENTROPY_R_SCALE)
     entropy_norm = float(1.0 - (1.0 / (1.0 + ap_en)))
-
     model_targets = {}
     model_confidences = {}
 
@@ -1271,60 +1868,100 @@ def perform_final_analysis(client, symbol):
     print("!!! FINAL ANALYSIS REPORT !!!")
     print("="*80)
     print(f"Asset: {symbol}")
-    print(f"Current Price: {current_price:.25f}")
-    print(f"Approximate Entropy (ApEn): {ap_en:.25f} (norm predictability factor: {1.0-entropy_norm:.25f})")
+    print(f"Current Price: {current_price:.6f}")
+    print(f"Approximate Entropy (ApEn): {ap_en:.6f} (norm predictability factor: {1.0-entropy_norm:.6f})")
     
     print("\n--- Enhanced Geometric Analysis ---")
-    print(f"Octagonal Phase: {octagonal_phase}/7 ({octagonal_strength:.25f} strength)")
-    print(f"Golden Triangle Direction: {triangle_direction} ({triangle_strength:.25f} strength)")
+    print(f"Octagonal Phase: {octagonal_phase}/7 ({octagonal_strength:.6f} strength)")
+    print(f"Golden Triangle Direction: {triangle_direction} ({triangle_strength:.6f} strength)")
     if next_extremum:
         extremum_time, extremum_type = next_extremum
-        print(f"Next {extremum_type}: {extremum_time:.25f} (sinusoidal analysis)")
+        print(f"Next {extremum_type}: {extremum_time:.6f} (sinusoidal analysis)")
     if golden_levels:
         print("\n--- Golden Ratio Levels ---")
         print("Golden Ratio Levels (Pure 0→1 Internal):")
         for name, price in golden_levels.items():
-            print(f"  {name}: {price:.25f}")
+            print(f"  {name}: {price:.6f}")
     
     if volume_spike_data:
         print("\n--- Volume Spike Analysis ---")
-        print(f"Volume Spike Ratio: {volume_spike_data.get('volume_spike_ratio', 0):.25f}x")
-        print(f"Price Change (5m): {volume_spike_data.get('price_change_5', 0)*100:.25f}%")
-        print(f"Price Change (10m): {volume_spike_data.get('price_change_10', 0)*100:.25f}%")
-        print(f"Buy/Sell Ratio: {volume_spike_data.get('buy_sell_ratio', 0.5):.25f}")
-        print(f"Bullish Volume: {volume_spike_data.get('bullish_volume', 0):.25f} ({volume_spike_data.get('bullish_volume_pct', 0):.25f}%)")
-        print(f"Bearish Volume: {volume_spike_data.get('bearish_volume', 0):.25f} ({volume_spike_data.get('bearish_volume_pct', 0):.25f}%)")
+        print(f"Volume Spike Ratio: {volume_spike_data.get('volume_spike_ratio', 0):.6f}x")
+        print(f"Price Change (5m): {volume_spike_data.get('price_change_5', 0)*100:.6f}%")
+        print(f"Price Change (10m): {volume_spike_data.get('price_change_10', 0)*100:.6f}%")
+        print(f"Buy/Sell Ratio: {volume_spike_data.get('buy_sell_ratio', 0.5):.6f}")
+        print(f"Bullish Volume: {volume_spike_data.get('bullish_volume', 0):.6f} ({volume_spike_data.get('bullish_volume_pct', 0):.6f}%)")
+        print(f"Bearish Volume: {volume_spike_data.get('bearish_volume', 0):.6f} ({volume_spike_data.get('bearish_volume_pct', 0):.6f}%)")
     
-    print("\n--- Moving Averages Analysis ---")
-    print(f"MA7: {ma7:.25f}")
-    print(f"SMA12: {sma12:.25f}")
-    print(f"SMA27: {sma27:.25f}")
-    print(f"SMA56: {sma56:.25f}")
-    print(f"SMA150: {sma150:.25f}")
-    print(f"SMA360: {sma360:.25f}")
+    print("\n--- Enhanced Pre-Spike Analysis ---")
+    print(f"Pre-Spike Conditions Met: {pre_spike_valid}")
+    print(f"Pre-Spike Score: {pre_spike_score:.6f}")
+    if pre_spike_valid:
+        print("Pre-Spike Details:")
+        for condition, details in pre_spike_details.items():
+            if isinstance(details, dict) and 'met' in details:
+                status = "✓" if details['met'] else "✗"
+                print(f"  {condition.replace('_', ' ').title()}: {status} (Score: {details.get('score', 0):.6f})")
+
+    print("\n--- SMA Analysis ---")
+    print(f"SMA7: {sma7:.6f}")
+    print(f"SMA12: {sma12:.6f}")
+    print(f"SMA27: {sma27:.6f}")
+    print(f"SMA56: {sma56:.6f}")
+    print(f"SMA150: {sma150:.6f}")
     
-    ma_condition = "PASS" if (current_price < ma7 < sma12 < sma27 < sma56 < sma150 < sma360) else "FAIL"
-    print(f"MA Condition (Close < MA7 < SMA12 < SMA27 < SMA56 < SMA150 < SMA360): {ma_condition}")
+    # Updated SMA condition check (removed SMA360 requirement)
+    sma_condition = "PASS" if (current_price < sma7 < sma12 < sma27 < sma56 < sma150) else "FAIL"
+    print(f"SMA Condition (Close < SMA7 < SMA12 < SMA27 < SMA56 < SMA150): {sma_condition}")
     
     print("\n--- Polynomial Fit Analysis ---")
     print(f"Below Poly Fit: {is_below_poly_fit}")
     
-    print("\n--- RSI Analysis ---")
-    print(f"Current RSI: {current_rsi:.25f}")
-    print(f"RSI Oversold: {is_oversold}")
-    print(f"Distance to Oversold: {rsi_to_oversold:.25f}")
-    print(f"Distance to Middle: {rsi_to_middle:.25f}")
+    print("\n--- Enhanced RSI Analysis ---")
+    print(f"Current RSI: {current_rsi:.6f}")
+    print(f"RSI Oversold is Most Recent: {rsi_details.get('oversold_is_most_recent', False)}")
+    print(f"RSI Overbought is Most Recent: {rsi_details.get('overbought_is_most_recent', False)}")
+    print(f"RSI Score: {rsi_score:.6f}")
+    if rsi_details:
+        print(f"RSI Details: {rsi_details}")
+    
+    print("\n--- Enhanced Price Dip Analysis ---")
+    print(f"Price Dip Conditions Met: {price_valid}")
+    print(f"Price Dip Score: {price_score:.6f}")
+    if price_valid:
+        # Simplified price dip details display
+        min_idx = price_details.get('min_idx', 0)
+        max_idx = price_details.get('max_idx', 0)
+        min_price = price_details.get('min_price', 0)
+        position_pct = price_details.get('position_in_range', 0) * 100
+        print(f"  Min Price: {min_price:.6f} (Index: {min_idx})")
+        print(f"  Max Price: {price_details.get('max_price', 0):.6f} (Index: {max_idx})")
+        print(f"  Current Position: {position_pct:.6f}% from Min")
+    
+    print("\n--- Enhanced Momentum Analysis ---")
+    print(f"Momentum Conditions Met: {momentum_valid}")
+    print(f"Momentum Score: {momentum_score:.6f}")
+    if momentum_valid:
+        # Simplified momentum details display
+        min_idx = momentum_details.get('min_momentum_idx', 0)
+        max_idx = momentum_details.get('max_momentum_idx', 0)
+        current_momentum = momentum_details.get('current_momentum', 0)
+        momentum_score_val = momentum_details.get('momentum_score', 0)
+        min_max_score = momentum_details.get('min_max_score', 0)
+        print(f"  Min Momentum Index: {min_idx}")
+        print(f"  Max Momentum Index: {max_idx}")
+        print(f"  Current Momentum: {current_momentum:.6f}")
+        print(f"  Min-Max Score: {min_max_score:.6f}")
     
     print("\n--- Model Predictions ---")
     for name, target in model_targets.items():
         conf = model_confidences.get(name, 0.0)
-        print(f" - {name:<15}: {float(target):.25f}  conf={conf:.25f}")
+        print(f" - {name:<15}: {float(target):.6f}  conf={conf:.6f}")
     
     print("\n--- Consensus Forecast ---")
-    print(f"!!! CONSENSUS TARGET: {consensus_target:.25f} ({potential_change_pct:+.25f}%) !!!")
+    print(f"!!! CONSENSUS TARGET: {consensus_target:.6f} ({potential_change_pct:+.6f}%) !!!")
     if time_to_target:
         time_str = format_time_to_target(time_to_target)
-        print(f"!!! ESTIMATED TIME TO TARGET: {time_str} (confidence: {time_confidence:.25f}) !!!")
+        print(f"!!! ESTIMATED TIME TO TARGET: {time_str} (confidence: {time_confidence:.6f}) !!!")
     
     print("\n--- MTF Thresholds & Predictive Zones (sample) ---")
     if mtf_thresholds:
@@ -1334,22 +1971,12 @@ def perform_final_analysis(client, symbol):
                 data = mtf_thresholds[tf]
                 min_p, max_p, middle_p, std_dev = data['min'], data['max'], data['middle'], data['std_dev']
                 cp = data.get('current_price', 0.0)
-                
-                # Calculate symmetrical percentages within the min-max range
-                if max_p > min_p:
-                    total_range = max_p - min_p
-                    pct_from_min = ((cp - min_p) / total_range) * 100
-                    pct_from_max = ((max_p - cp) / total_range) * 100
-                else:
-                    # Handle edge case where min and max are the same
-                    pct_from_min = 0.0
-                    pct_from_max = 100.0
-                
-                print(f" | {tf:<4} | Min:{min_p:.25f} Max:{max_p:.25f} Middle:{middle_p:.25f} Std:{std_dev:.25f}")
-                print(f" |     | Current:{cp:.25f} (Pos: {pct_from_min:.25f}% from Min, {pct_from_max:.25f}% from Max) ATR:{data.get('atr',0):.25f}")
+                pct_from_min = ((cp - min_p) / (max_p - min_p) * 100) if max_p > min_p else 0.0
+                pct_from_max = ((max_p - cp) / (max_p - min_p) * 100) if max_p > min_p else 100.0
+                print(f" | {tf:<4} | Min:{min_p:.6f} Max:{max_p:.6f} Middle:{middle_p:.6f} Std:{std_dev:.6f}")
+                print(f" |     | Current:{cp:.6f} (Pos: {pct_from_min:.6f}% from Min, {pct_from_max:.6f}% from Max) ATR:{data.get('atr',0):.6f}")
     print("="*80)
     print("Analysis complete.")
-
 
 # ------------------ Single-asset analysis wrapper ------------------
 
@@ -1372,10 +1999,12 @@ def analyze_asset_for_table(client, symbol):
                 tf = data['timeframe']
                 result[f'{tf}_price_change_pct'] = data['price_change_pct']
                 result[f'{tf}_volume_change_pct'] = data['volume_change_pct']
-                result['current_price'] = data['current_price']
+                # Store current_price from MTF data to ensure it's defined
+                if 'current_price' not in result:
+                    result['current_price'] = data['current_price']
                 if data['is_dip']:
                     weight = TIMEFRAME_WEIGHTS.get(tf, 1.0)
-                    dip_strength = float(data.get('dip_strength', 50)) / 100.0
+                    dip_strength = float(data.get('dip_strength', 50) / 100.0)
                     weighted_dip_score += weight * dip_strength
 
         # Get volume spike data
@@ -1391,8 +2020,10 @@ def analyze_asset_for_table(client, symbol):
         # Get 1h quick price/volume change
         klines_1h = client.get_klines(symbol=symbol, interval='1h', limit=2)
         if klines_1h and len(klines_1h) >= 2:
-            current_c = float(klines_1h[-1][4]); past_c = float(klines_1h[-2][4])
-            current_v = float(klines_1h[-1][5]); past_v = float(klines_1h[-2][5])
+            current_c = float(klines_1h[-1][4])
+            past_c = float(klines_1h[-2][4])
+            current_v = float(klines_1h[-1][5])
+            past_v = float(klines_1h[-2][5])
             result['current_price'] = current_c
             result['price_change_1h_pct'] = ((current_c - past_c) / past_c) * 100 if past_c > 0 else 0
             result['volume_change_1h_pct'] = ((current_v - past_v) / past_v) * 100 if past_v > 0 else 0
@@ -1404,7 +2035,7 @@ def analyze_asset_for_table(client, symbol):
                 df_geo = pd.DataFrame(klines_geo, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
                 
                 # Convert all numeric columns to float with error handling
-                for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume']:
+                for c in ['open','high','low','close','volume','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore']:
                     try:
                         df_geo[c] = pd.to_numeric(df_geo[c], errors='coerce')
                     except:
@@ -1419,7 +2050,7 @@ def analyze_asset_for_table(client, symbol):
                 
                 result['octagonal_phase'] = oct_phase if oct_phase is not None else 0
                 result['octagonal_strength'] = oct_strength if oct_strength is not None else 0
-                result['triangle_direction'] = tri_direction
+                result['triangle_direction'] = tri_direction if tri_direction is not None else 0
                 result['triangle_strength'] = tri_strength if tri_strength is not None else 0
                 
                 # Check polynomial fit
@@ -1428,30 +2059,50 @@ def analyze_asset_for_table(client, symbol):
                 # Calculate moving averages
                 df_geo_ma = calculate_moving_averages(df_geo)
                 if df_geo_ma is not None:
-                    result['ma7'] = float(df_geo_ma['MA7'].iloc[-1]) if 'MA7' in df_geo_ma.columns else None
+                    result['sma7'] = float(df_geo_ma['SMA7'].iloc[-1]) if 'SMA7' in df_geo_ma.columns else None
                     result['sma12'] = float(df_geo_ma['SMA12'].iloc[-1]) if 'SMA12' in df_geo_ma.columns else None
                     result['sma27'] = float(df_geo_ma['SMA27'].iloc[-1]) if 'SMA27' in df_geo_ma.columns else None
                     result['sma56'] = float(df_geo_ma['SMA56'].iloc[-1]) if 'SMA56' in df_geo_ma.columns else None
                     result['sma150'] = float(df_geo_ma['SMA150'].iloc[-1]) if 'SMA150' in df_geo_ma.columns else None
-                    result['sma360'] = float(df_geo_ma['SMA360'].iloc[-1]) if 'SMA360' in df_geo_ma.columns else None
                     
-                    # Check MA condition
+                    # Check updated SMA condition (removed SMA360 requirement)
                     current_price = result.get('current_price', 0)
-                    if (current_price < result['ma7'] < result['sma12'] < result['sma27'] < 
-                        result['sma56'] < result['sma150'] < result['sma360']):
-                        result['ma_condition_met'] = True
+                    if (current_price < result['sma7'] < result['sma12'] < result['sma27'] < result['sma56'] < result['sma150']):
+                        result['sma_condition_met'] = True
                     else:
-                        result['ma_condition_met'] = False
+                        result['sma_condition_met'] = False
                 
-                # Calculate RSI
+                # Calculate RSI and enhanced RSI conditions
                 df_geo_rsi = calculate_rsi(df_geo, RSI_PERIOD)
                 if df_geo_rsi is not None and f'RSI_{RSI_PERIOD}' in df_geo_rsi.columns:
                     current_rsi = float(df_geo_rsi[f'RSI_{RSI_PERIOD}'].iloc[-1])
                     result['rsi'] = current_rsi
-                    result['is_oversold'] = current_rsi < RSI_OVERSOLD
-                    result['rsi_to_oversold'] = max(0, RSI_OVERSOLD - current_rsi)
-                    result['rsi_to_middle'] = abs(RSI_MIDDLE - current_rsi)
+                    # Enhanced RSI analysis
+                    rsi_values = df_geo_rsi[f'RSI_{RSI_PERIOD}'].values
+                    is_oversold, is_overbought, rsi_score, rsi_details = analyze_rsi_conditions(rsi_values, current_rsi)
+                    result['rsi_oversold'] = is_oversold
+                    result['rsi_overbought'] = is_overbought
+                    result['rsi_score'] = rsi_score
+                    result['rsi_details'] = rsi_details
                 
+                # Enhanced price dip analysis
+                price_valid, price_score, price_details = analyze_price_dip_conditions(df_geo['close'].values, result.get('current_price', 0))
+                result['price_dip_conditions_met'] = price_valid
+                result['price_dip_score'] = price_score
+                result['price_dip_details'] = price_details
+                
+                # Enhanced momentum analysis
+                momentum_valid, momentum_score, momentum_details = analyze_momentum_conditions(df_geo)
+                result['momentum_conditions_met'] = momentum_valid
+                result['momentum_score'] = momentum_score
+                result['momentum_details'] = momentum_details
+                
+                # Pre-spike analysis with new function
+                pre_spike_valid, pre_spike_score, pre_spike_details = analyze_pre_spike_conditions(df_geo)
+                result['pre_spike_conditions_met'] = pre_spike_valid
+                result['pre_spike_score'] = pre_spike_score
+                result['pre_spike_details'] = pre_spike_details
+
         except Exception as e:
             print(f"Error getting geometric data for {symbol}: {e}")
             result['octagonal_phase'] = 0
@@ -1459,11 +2110,13 @@ def analyze_asset_for_table(client, symbol):
             result['triangle_direction'] = None
             result['triangle_strength'] = 0
             result['is_below_poly_fit'] = False
-            result['ma_condition_met'] = False
-            result['rsi'] = 50.0
-            result['is_oversold'] = False
-            result['rsi_to_oversold'] = 0.0
-            result['rsi_to_middle'] = 0.0
+            result['sma_condition_met'] = False
+            result['rsi_oversold'] = False
+            result['rsi_overbought'] = False
+            result['price_dip_conditions_met'] = False
+            result['momentum_conditions_met'] = False
+            result['pre_spike_conditions_met'] = False
+            result['pre_spike_score'] = 0.0
 
     except Exception as e:
         return None
@@ -1477,9 +2130,11 @@ def analyze_asset_for_table(client, symbol):
     triangle_score = result.get('triangle_strength', 0) * 30
     volume_score = result.get('spike_score', 0) * 0.5
     poly_fit_score = 20 if result.get('is_below_poly_fit', False) else 0
-    ma_condition_score = 30 if result.get('ma_condition_met', False) else 0
-    rsi_oversold_score = result.get('rsi_to_oversold', 0) * 2
-    rsi_middle_score = result.get('rsi_to_middle', 0)
+    sma_condition_score = 30 if result.get('sma_condition_met', False) else 0
+    rsi_score = result.get('rsi_score', 0)  # Use the new RSI score
+    price_dip_score = result.get('price_dip_score', 0)  # Use the new price dip score
+    momentum_score = result.get('momentum_score', 0)  # Use the new momentum score
+    pre_spike_score = result.get('pre_spike_score', 0)  # Use the new pre-spike score
     bullish_volume_score = result.get('bullish_volume_pct', 0) * 0.5
     
     # Calculate power score with all factors
@@ -1489,9 +2144,11 @@ def analyze_asset_for_table(client, symbol):
         octagonal_score +  # Octagonal strength
         triangle_score +  # Golden triangle strength
         poly_fit_score +  # Polynomial fit score
-        ma_condition_score +  # Moving averages condition score
-        rsi_oversold_score +  # RSI oversold score
-        rsi_middle_score +  # RSI to middle score
+        sma_condition_score +  # Moving averages condition score
+        rsi_score +  # Enhanced RSI score
+        price_dip_score +  # Enhanced price dip score
+        momentum_score +  # Enhanced momentum score
+        pre_spike_score +  # Pre-spike detection score
         bullish_volume_score  # Bullish volume score
     )
     
@@ -1574,19 +2231,26 @@ def main():
             # 1. Upward octagonal phase (0, 1, 2, 3)
             # 2. Upward golden triangle direction
             # 3. Minimum strength thresholds
-            # 4. MA condition met
+            # 4. SMA condition met
             # 5. Below poly fit
-            # 6. RSI oversold or close to middle
+            # 6. Enhanced RSI conditions met
+            # 7. Enhanced price dip conditions met
+            # 8. Enhanced momentum conditions met
+            # 9. Pre-spike conditions met
             has_upward_phase = oct_phase in MIN_UPWARD_PHASES
             has_upward_triangle = tri_direction == "upward"
             meets_strength_threshold = oct_strength >= MIN_OCTAGONAL_STRENGTH or tri_strength >= MIN_TRIANGLE_STRENGTH
-            ma_condition_met = r.get('ma_condition_met', False)
+            sma_condition_met = r.get('sma_condition_met', False)
             below_poly_fit = r.get('is_below_poly_fit', False)
-            rsi_oversold = r.get('is_oversold', False)
-            rsi_to_middle = r.get('rsi_to_middle', 0) < 10  # Close to middle
+            rsi_oversold = r.get('rsi_oversold', False)
+            rsi_overbought = r.get('rsi_overbought', False)
+            price_dip_conditions_met = r.get('price_dip_conditions_met', False)
+            momentum_conditions_met = r.get('momentum_conditions_met', False)
+            pre_spike_conditions_met = r.get('pre_spike_conditions_met', False)
             
             if (has_upward_phase and has_upward_triangle and meets_strength_threshold and 
-                ma_condition_met and below_poly_fit and (rsi_oversold or rsi_to_middle)):
+                sma_condition_met and below_poly_fit and rsi_oversold and 
+                price_dip_conditions_met and momentum_conditions_met and pre_spike_conditions_met):
                 filtered_results.append(r)
         
         if filtered_results:
@@ -1599,7 +2263,7 @@ def main():
     print_dynamic_table(all_results, scan_stats)
 
     if analysis_winner:
-        print(f"\n!!! WINNER: {analysis_winner['symbol']} (score: {analysis_winner.get('power_score'):.25f}) !!!")
+        print(f"\n!!! WINNER: {analysis_winner['symbol']} (score: {analysis_winner.get('power_score'):.6f}) !!!")
         perform_final_analysis(client, analysis_winner['symbol'])
     else:
         print("\nNo suitable MTF dip found in this scan.")
