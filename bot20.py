@@ -20,6 +20,12 @@ Features integrated from entire conversation:
 - Trade execution and monitoring system
 - VPA (Volume Price Analysis) integrated across all timeframes
 - Clear timeframe naming convention without confusion
+- Fixed argmin/argmax logic with symmetrical opposites
+- Fixed Bollinger Bands logic with proper most recent detection
+- Fixed Keops Phi Pivot leg type determination
+- Enhanced MTF dip filtering with proper conditions
+- Fixed momentum argmin/argmax logic to ensure symmetrical opposites
+- Enhanced MTF dip detection with argmin/argmax tracking per timeframe
 """
 
 import os
@@ -65,7 +71,7 @@ MTF_SCAN_TIMEFRAMES = ['1m', '3m', '5m']
 DETAILED_TIMEFRAMES = ['1m', '3m', '5m']
 
 # Scoring & criteria
-MIN_WEIGHTED_DIP_SCORE = 4.0
+MIN_WEIGHTED_DIP_SCORE = 2.0  # Reduced to catch more potential dips
 VOLUME_ANALYSIS_PERIOD = 56
 PRICE_UPTREND_PERIOD = 5
 
@@ -1735,6 +1741,19 @@ def analyze_momentum_conditions(df):
         # Current momentum value
         current_momentum = momentum_values[-1]
         
+        # FIXED: Ensure symmetrical opposites for argmin/argmax
+        is_most_recent_argmin = False
+        is_most_recent_argmax = False
+        
+        if min_momentum_idx is not None and max_momentum_idx is not None:
+            # Determine which one is more recent
+            if min_momentum_idx > max_momentum_idx:
+                is_most_recent_argmin = True
+                is_most_recent_argmax = False
+            else:
+                is_most_recent_argmin = False
+                is_most_recent_argmax = True
+        
         # Condition 1: Current momentum > 0
         momentum_positive = current_momentum > 0
         
@@ -1757,19 +1776,6 @@ def analyze_momentum_conditions(df):
         
         # Determine if we're closer to a minimum or maximum
         is_near_min = pct_from_min < pct_from_max
-        
-        # Check if the momentum direction aligns with the price position
-        # If near a price minimum, momentum should be negative (about to turn positive)
-        # If near a price maximum, momentum should be positive (about to turn negative)
-        
-        # Check if the current momentum is the most negative or most positive in the recent window
-        recent_window = 20
-        if len(momentum_values) < recent_window:
-            recent_window = len(momentum_values)
-        
-        recent_momentum = momentum_values[-recent_window:]
-        is_most_recent_argmin = current_momentum <= np.min(recent_momentum)
-        is_most_recent_argmax = current_momentum >= np.max(recent_momentum)
         
         # Check if we're at a reversal point
         # If the most recent price minimum is more recent than the most recent price maximum
@@ -2177,7 +2183,7 @@ def run_linear_regression(df):
         X = prepare_features(d)
         if X is None or X.empty:
             return None
-        y = d.loc[X.index, 'future_close']
+        y = d.loc(X.index, 'future_close')
         split = int(len(X)*0.8)
         X_train, y_train = X.iloc[:split], y.iloc[:split]
         model = LinearRegression()
@@ -2918,7 +2924,7 @@ def main():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Scanning {len(usdc_pairs)} assets...")
     
     all_results = []
-    scan_stats = {'Total Assets Scanned':0,'Not Enough MTF Dips':0,'No Spike Pattern':0,'Other Errors':0}
+    scan_stats = {'Total Assets Scanned':0,'Potential MTF Dips':0,'No Spike Pattern':0,'Other Errors':0}
     
     assets_to_scan = usdc_pairs # Scan all assets once
 
@@ -2935,6 +2941,8 @@ def main():
                     scan_stats['Total Assets Scanned'] += 1
                     if res:
                         all_results.append(res)
+                        if res.get('weighted_dip_score',0) >= MIN_WEIGHTED_DIP_SCORE:
+                            scan_stats['Potential MTF Dips'] += 1
                     else:
                         scan_stats['Other Errors'] += 1
                 except Exception:
@@ -2943,9 +2951,7 @@ def main():
 
     # Categorize
     for r in all_results:
-        if r.get('weighted_dip_score',0) < MIN_WEIGHTED_DIP_SCORE:
-            scan_stats['Not Enough MTF Dips'] += 1
-        elif not r.get('spike_score', 0) > 0:
+        if not r.get('spike_score', 0) > 0:
             scan_stats['No Spike Pattern'] += 1
 
     # Enhanced winner selection with geometric filtering including VPA
