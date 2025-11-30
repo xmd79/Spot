@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-ENHANCED BTCUSDC TRADING BOT - SINGLE ITERATION FRAME
-Specialized for single asset trading with enhanced dip detection
+ENHANCED BTCUSDC TRADING BOT - SYMMETRICAL PERCENTAGES
+Fixed percentage calculations to ensure symmetrical 100% sums
 """
 
 import os
@@ -242,10 +242,40 @@ def check_polynomial_fit(prices, timestamps):
         print(f"check_polynomial_fit error: {e}")
         return False
 
-# ------------------ Enhanced Analysis Functions ------------------
+# ------------------ Enhanced Analysis Functions with Symmetrical Percentages ------------------
+
+def calculate_symmetrical_percentages(value1, value2, current_value):
+    """Calculate symmetrical percentages that sum to 100%."""
+    try:
+        if value1 == value2:
+            return 50.0, 50.0
+            
+        # Calculate raw distances
+        dist_to_val1 = abs(current_value - value1)
+        dist_to_val2 = abs(current_value - value2)
+        
+        # Calculate symmetrical percentages
+        total_dist = dist_to_val1 + dist_to_val2
+        if total_dist > 0:
+            pct_val1 = (dist_to_val2 / total_dist) * 100  # Inverted for proximity
+            pct_val2 = (dist_to_val1 / total_dist) * 100  # Inverted for proximity
+        else:
+            pct_val1 = 50.0
+            pct_val2 = 50.0
+        
+        # Ensure they sum to exactly 100%
+        total_pct = pct_val1 + pct_val2
+        if total_pct > 0:
+            pct_val1 = (pct_val1 / total_pct) * 100
+            pct_val2 = (pct_val2 / total_pct) * 100
+        
+        return pct_val1, pct_val2
+    except Exception as e:
+        print(f"calculate_symmetrical_percentages error: {e}")
+        return 50.0, 50.0
 
 def analyze_argmin_argmax_condition(client, symbol, timeframe='1m', lookback=1200):
-    """Analyze argmin vs argmax condition for dip detection."""
+    """Analyze argmin vs argmax condition for dip detection with symmetrical percentages."""
     try:
         klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
         if not klines or len(klines) < 100:
@@ -270,32 +300,33 @@ def analyze_argmin_argmax_condition(client, symbol, timeframe='1m', lookback=120
         # Determine which is more recent
         min_more_recent = argmin_idx > argmax_idx
         
-        # Calculate distance percentages
-        dist_to_min = abs((current_price - min_price) / min_price * 100) if min_price > 0 else 0
-        dist_to_max = abs((current_price - max_price) / max_price * 100) if max_price > 0 else 0
+        # Calculate symmetrical percentages
+        pct_from_min, pct_from_max = calculate_symmetrical_percentages(min_price, max_price, current_price)
         
-        # Condition: min more recent AND distance to min < distance to max
-        condition_met = min_more_recent and (dist_to_min < dist_to_max)
+        # Condition: min more recent AND percentage from min < percentage from max
+        # (Lower percentage from min means closer to min)
+        condition_met = min_more_recent and (pct_from_min < pct_from_max)
         
         details = {
             "min_more_recent": min_more_recent,
-            "dist_to_min": dist_to_min,
-            "dist_to_max": dist_to_max,
+            "pct_from_min": pct_from_min,
+            "pct_from_max": pct_from_max,
             "argmin_idx": argmin_idx,
             "argmax_idx": argmax_idx,
             "min_price": min_price,
             "max_price": max_price,
-            "current_price": current_price
+            "current_price": current_price,
+            "total_percentage": pct_from_min + pct_from_max
         }
         
-        return condition_met, dist_to_min, dist_to_max, details
+        return condition_met, pct_from_min, pct_from_max, details
         
     except Exception as e:
         print(f"analyze_argmin_argmax_condition error: {e}")
         return False, 0.0, 0.0, {"error": str(e)}
 
 def analyze_volume_condition(client, symbol, timeframe='1m', lookback=50):
-    """Analyze volume bullish vs bearish condition."""
+    """Analyze volume bullish vs bearish condition with symmetrical percentages."""
     try:
         klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
         if not klines or len(klines) < 20:
@@ -312,9 +343,19 @@ def analyze_volume_condition(client, symbol, timeframe='1m', lookback=50):
         total_volume = df['volume'].sum()
         bearish_volume = total_volume - bullish_volume
         
-        # Calculate percentages
-        bullish_pct = (bullish_volume / total_volume * 100) if total_volume > 0 else 0
-        bearish_pct = (bearish_volume / total_volume * 100) if total_volume > 0 else 0
+        # Calculate symmetrical percentages
+        if total_volume > 0:
+            bullish_pct = (bullish_volume / total_volume) * 100
+            bearish_pct = (bearish_volume / total_volume) * 100
+        else:
+            bullish_pct = 50.0
+            bearish_pct = 50.0
+        
+        # Ensure they sum to exactly 100%
+        total_pct = bullish_pct + bearish_pct
+        if total_pct > 0:
+            bullish_pct = (bullish_pct / total_pct) * 100
+            bearish_pct = (bearish_pct / total_pct) * 100
         
         # Condition: bullish volume percentage > bearish volume percentage
         condition_met = bullish_pct > bearish_pct
@@ -324,7 +365,8 @@ def analyze_volume_condition(client, symbol, timeframe='1m', lookback=50):
             "bearish_volume": bearish_volume,
             "total_volume": total_volume,
             "bullish_pct": bullish_pct,
-            "bearish_pct": bearish_pct
+            "bearish_pct": bearish_pct,
+            "total_percentage": bullish_pct + bearish_pct
         }
         
         return condition_met, bullish_pct, bearish_pct, details
@@ -570,14 +612,22 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=1200):
             # Determine which is more recent
             negative_more_recent = global_min_idx > global_max_idx
             
+            # Calculate symmetrical percentages for momentum extremes
+            min_momentum = recent_momentum[min_momentum_idx]
+            max_momentum = recent_momentum[max_momentum_idx]
+            pct_from_min, pct_from_max = calculate_symmetrical_percentages(min_momentum, max_momentum, current_momentum)
+            
             details = {
                 "current_momentum": current_momentum,
                 "momentum_positive": momentum_positive,
                 "min_momentum_idx": global_min_idx,
                 "max_momentum_idx": global_max_idx,
                 "negative_more_recent": negative_more_recent,
-                "most_negative_momentum": recent_momentum[min_momentum_idx],
-                "most_positive_momentum": recent_momentum[max_momentum_idx]
+                "most_negative_momentum": min_momentum,
+                "most_positive_momentum": max_momentum,
+                "pct_from_negative": pct_from_min,
+                "pct_from_positive": pct_from_max,
+                "total_percentage": pct_from_min + pct_from_max
             }
             
             return momentum_positive and negative_more_recent, current_momentum, details
@@ -826,15 +876,16 @@ def perform_single_iteration_analysis(client):
     print("\n--- Condition 1: ArgMin vs ArgMax Analysis ---")
     all_tf_argmin_met = True
     for timeframe in TIMEFRAMES:
-        argmin_met, dist_min, dist_max, details = analyze_argmin_argmax_condition(client, SYMBOL, timeframe, 1200)
+        argmin_met, pct_min, pct_max, details = analyze_argmin_argmax_condition(client, SYMBOL, timeframe, 1200)
         condition_details[f'argmin_{timeframe}'] = {
             'met': argmin_met,
-            'dist_min': dist_min,
-            'dist_max': dist_max,
+            'pct_min': pct_min,
+            'pct_max': pct_max,
             'details': details
         }
         print(f"{timeframe}: Min More Recent: {details.get('min_more_recent', False)}, "
-              f"Dist to Min: {dist_min:.2f}%, Dist to Max: {dist_max:.2f}%, "
+              f"Pct from Min: {pct_min:.2f}%, Pct from Max: {pct_max:.2f}%, "
+              f"Total: {details.get('total_percentage', 0):.2f}%, "
               f"Condition: {argmin_met}")
         
         if not argmin_met:
@@ -856,6 +907,7 @@ def perform_single_iteration_analysis(client):
         'details': vol_details
     }
     print(f"Bullish Volume: {bull_pct:.2f}%, Bearish Volume: {bear_pct:.2f}%")
+    print(f"Total Percentage: {vol_details.get('total_percentage', 0):.2f}%")
     print(f"Condition: {volume_met}")
     
     if volume_met:
@@ -934,6 +986,9 @@ def perform_single_iteration_analysis(client):
     print(f"Current Momentum: {current_momentum:.4f}")
     print(f"Momentum > 0: {mom_details.get('momentum_positive', False)}")
     print(f"Negative More Recent: {mom_details.get('negative_more_recent', False)}")
+    print(f"Pct from Negative: {mom_details.get('pct_from_negative', 0):.2f}%")
+    print(f"Pct from Positive: {mom_details.get('pct_from_positive', 0):.2f}%")
+    print(f"Total Percentage: {mom_details.get('total_percentage', 0):.2f}%")
     print(f"Condition: {momentum_met}")
     
     if momentum_met:
@@ -1005,49 +1060,47 @@ def get_binance_client():
         print(f"Error reading API file: {e}")
         return None
 
-# ------------------ Main Loop (UPDATED PART) ------------------
 def main():
     client = get_binance_client()
     if not client:
         print("No client available. Exiting.")
         return
-   
-    print("=== BTCUSDC TRADING BOT - SINGLE ITERATION MODE ===")
+    
+    print("=== BTCUSDC TRADING BOT - SYMMETRICAL PERCENTAGES ===")
     print("Press Ctrl+C to stop monitoring.")
     print("Each iteration will:")
     print("1. Check and convert BTC dust")
-    print("2. Analyze all 7 trading conditions")
+    print("2. Analyze all 7 trading conditions with symmetrical percentages") 
     print("3. Execute trade if ALL conditions met")
     print("4. Use 100% USDC balance for entry")
     print("5. Clean up for next iteration")
     print("="*60)
-   
+    
     iteration_count = 0
-   
+    
     while not stop_event.is_set():
         iteration_count += 1
         print(f"\n>>> Starting Iteration #{iteration_count} <<<")
-       
+        
         try:
             perform_single_iteration_analysis(client)
         except Exception as e:
             print(f"Error in iteration #{iteration_count}: {e}")
-       
-        # ----- NEW: Always wait exactly 5 seconds between iterations -----
-        if stop_event.is_set():
-            break
-            
-        print(f"\nWaiting 5 seconds before next iteration...")
-        for i in range(5, 0, -1):
-            if stop_event.is_set():
-                break
-            print(f"\rNext iteration in: {i} seconds", end="", flush=True)
-            time.sleep(1)
-        print("\r" + " " * 40 + "\r", end="")  # clear the countdown line
-
-        # Even when a trade is active we still run a new analysis every 5 seconds
-        # (the monitor thread already runs independently)
-   
+        
+        # Wait before next iteration - CHANGED FROM 30 SECONDS TO 5 SECONDS
+        if not trade_active:
+            print(f"\nWaiting 5 seconds before next iteration...")
+            for i in range(5, 0, -1):
+                if stop_event.is_set():
+                    break
+                print(f"\rNext iteration in: {i:2d} seconds", end="")
+                time.sleep(1)
+            print("\r" + " " * 30 + "\r")
+        else:
+            # If trade is active, wait longer
+            print("Trade active, waiting 5 minutes before next analysis...")
+            time.sleep(300)
+    
     print("\nTrading bot stopped.")
 
 if __name__ == "__main__":
