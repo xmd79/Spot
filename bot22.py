@@ -947,11 +947,10 @@ def perform_single_iteration_analysis(client):
         'details': details
     }
     
-    # Print price thresholds for this timeframe
+    # Print details for this condition
     min_threshold = details.get('min_threshold', 0)
     middle_threshold = details.get('middle_threshold', 0)
     max_threshold = details.get('max_threshold', 0)
-    current_price = details.get('current_price', 0)
     
     print(f"\nTimeframe: 1m")
     print(f"Most recent extrema was found at argmin: {details.get('min_more_recent', False)}")
@@ -961,8 +960,6 @@ def perform_single_iteration_analysis(client):
     print(f"Min threshold: {min_threshold:.2f}")
     print(f"Middle threshold: {middle_threshold:.2f}")
     print(f"Max threshold: {max_threshold:.2f}")
-    print(f"Close below middle threshold: {current_price < middle_threshold}")
-    print(f"Close above middle threshold: {current_price > middle_threshold}")
     print(f"Condition Met: {argmin_met}")
     
     if argmin_met:
@@ -981,12 +978,12 @@ def perform_single_iteration_analysis(client):
         'details': vol_details
     }
     
-    # Print price thresholds
+    # Print details for this condition
     min_threshold = vol_details.get('min_threshold', 0)
     middle_threshold = vol_details.get('middle_threshold', 0)
     max_threshold = vol_details.get('max_threshold', 0)
     current_price = vol_details.get('current_price', 0)
-    
+
     print(f"\nBullish Volume: {bull_pct:.2f}%")
     print(f"Bearish Volume: {bear_pct:.2f}%")
     print(f"Min threshold: {min_threshold:.2f}")
@@ -1012,12 +1009,12 @@ def perform_single_iteration_analysis(client):
         'details': rsi_details
     }
     
-    # Print price thresholds
+    # Print details for this condition
     min_threshold = rsi_details.get('min_threshold', 0)
     middle_threshold = rsi_details.get('middle_threshold', 0)
     max_threshold = rsi_details.get('max_threshold', 0)
     current_price = rsi_details.get('current_price', 0)
-    
+
     print(f"\nCurrent RSI: {current_rsi:.2f}")
     print(f"Oversold Most Recent: {rsi_oversold_recent}")
     print(f"Overbought Most Recent: {rsi_overbought_recent}")
@@ -1045,12 +1042,12 @@ def perform_single_iteration_analysis(client):
         'details': stoch_details
     }
     
-    # Print price thresholds
+    # Print details for this condition
     min_threshold = stoch_details.get('min_threshold', 0)
     middle_threshold = stoch_details.get('middle_threshold', 0)
     max_threshold = stoch_details.get('max_threshold', 0)
     current_price = stoch_details.get('current_price', 0)
-    
+
     print(f"\nMerged Stochastic K: {stoch_k:.2f}")
     print(f"Merged Stochastic D: {stoch_d:.2f}")
     print(f"Oversold Most Recent: {stoch_oversold_recent}")
@@ -1077,14 +1074,14 @@ def perform_single_iteration_analysis(client):
         'details': bb_details
     }
     
-    # Print price thresholds
+    # Print details for this condition
     min_threshold = bb_details.get('min_threshold', 0)
     middle_threshold = bb_details.get('middle_threshold', 0)
     max_threshold = bb_details.get('max_threshold', 0)
     current_price = bb_details.get('current_price', 0)
     bb_upper = bb_details.get('bb_upper', 0)
     bb_lower = bb_details.get('bb_lower', 0)
-    
+
     print(f"\nLowest Below More Recent: {bb_lowest_recent}")
     print(f"Highest Above More Recent: {bb_highest_recent}")
     print(f"Min threshold: {min_threshold:.2f}")
@@ -1112,12 +1109,12 @@ def perform_single_iteration_analysis(client):
         'details': mom_details
     }
     
-    # Print price thresholds
+    # Print details for this condition
     min_threshold = mom_details.get('min_threshold', 0)
     middle_threshold = mom_details.get('middle_threshold', 0)
     max_threshold = mom_details.get('max_threshold', 0)
     current_price = mom_details.get('current_price', 0)
-    
+
     print(f"\nCurrent Momentum: {current_momentum:.4f}")
     print(f"Momentum > 0: {mom_details.get('momentum_positive', False)}")
     print(f"Negative More Recent: {mom_details.get('negative_more_recent', False)}")
@@ -1145,12 +1142,12 @@ def perform_single_iteration_analysis(client):
         'details': poly_details
     }
     
-    # Print price thresholds
+    # Print details for this condition
     min_threshold = poly_details.get('min_threshold', 0)
     middle_threshold = poly_details.get('middle_threshold', 0)
     max_threshold = poly_details.get('max_threshold', 0)
     current_price = poly_details.get('current_price', 0)
-    
+
     print(f"\nBelow Poly Fit: {poly_met}")
     print(f"Min threshold: {min_threshold:.2f}")
     print(f"Middle threshold: {middle_threshold:.2f}")
@@ -1159,7 +1156,7 @@ def perform_single_iteration_analysis(client):
     print(f"Close above middle threshold: {current_price > middle_threshold}")
     print(f"Current Price: {current_price:.2f}")
     print(f"Condition Met: {poly_met}")
-
+    
     if poly_met:
         conditions_met += 1
         print("\n✓ Polynomial Fit condition MET")
