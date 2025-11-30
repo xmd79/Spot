@@ -297,6 +297,11 @@ def analyze_argmin_argmax_condition(client, symbol, timeframe='1m', lookback=120
         min_price = close_prices[argmin_idx]
         max_price = close_prices[argmax_idx]
         
+        # Calculate min, middle, and max threshold values
+        min_threshold = np.min(close_prices)
+        max_threshold = np.max(close_prices)
+        middle_threshold = np.median(close_prices)
+        
         # Determine which is more recent
         min_more_recent = argmin_idx > argmax_idx
         
@@ -316,7 +321,9 @@ def analyze_argmin_argmax_condition(client, symbol, timeframe='1m', lookback=120
             "min_price": min_price,
             "max_price": max_price,
             "current_price": current_price,
-            "total_percentage": pct_from_min + pct_from_max
+            "min_threshold": min_threshold,
+            "middle_threshold": middle_threshold,
+            "max_threshold": max_threshold
         }
         
         return condition_met, pct_from_min, pct_from_max, details
@@ -357,6 +364,12 @@ def analyze_volume_condition(client, symbol, timeframe='1m', lookback=50):
             bullish_pct = (bullish_pct / total_pct) * 100
             bearish_pct = (bearish_pct / total_pct) * 100
         
+        # Calculate price thresholds
+        close_prices = df['close'].values
+        min_threshold = np.min(close_prices)
+        max_threshold = np.max(close_prices)
+        middle_threshold = np.median(close_prices)
+        
         # Condition: bullish volume percentage > bearish volume percentage
         condition_met = bullish_pct > bearish_pct
         
@@ -366,7 +379,9 @@ def analyze_volume_condition(client, symbol, timeframe='1m', lookback=50):
             "total_volume": total_volume,
             "bullish_pct": bullish_pct,
             "bearish_pct": bearish_pct,
-            "total_percentage": bullish_pct + bearish_pct
+            "min_threshold": min_threshold,
+            "middle_threshold": middle_threshold,
+            "max_threshold": max_threshold
         }
         
         return condition_met, bullish_pct, bearish_pct, details
@@ -408,6 +423,12 @@ def analyze_rsi_condition(client, symbol, timeframe='1m', lookback=1200):
             if last_oversold_idx is not None and last_overbought_idx is not None:
                 break
         
+        # Calculate price thresholds
+        close_prices = df['close'].values
+        min_threshold = np.min(close_prices)
+        max_threshold = np.max(close_prices)
+        middle_threshold = np.median(close_prices)
+        
         # Determine which is most recent
         oversold_most_recent = False
         overbought_most_recent = False
@@ -425,7 +446,10 @@ def analyze_rsi_condition(client, symbol, timeframe='1m', lookback=1200):
             "last_oversold_idx": last_oversold_idx,
             "last_overbought_idx": last_overbought_idx,
             "oversold_most_recent": oversold_most_recent,
-            "overbought_most_recent": overbought_most_recent
+            "overbought_most_recent": overbought_most_recent,
+            "min_threshold": min_threshold,
+            "middle_threshold": middle_threshold,
+            "max_threshold": max_threshold
         }
         
         return oversold_most_recent, overbought_most_recent, current_rsi, details
@@ -439,6 +463,7 @@ def analyze_merged_stochastic_condition(client, symbol, timeframes=['1m', '3m', 
     try:
         all_k_values = []
         all_d_values = []
+        all_close_prices = []
         
         for timeframe in timeframes:
             klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
@@ -459,9 +484,15 @@ def analyze_merged_stochastic_condition(client, symbol, timeframes=['1m', '3m', 
             # Add to merged arrays
             all_k_values.extend(df_stoch['STOCH_K'].values)
             all_d_values.extend(df_stoch['STOCH_D'].values)
+            all_close_prices.extend(df_stoch['close'].values)
         
         if len(all_k_values) == 0:
             return False, False, 0.0, 0.0, {"error": "No stochastic data"}
+        
+        # Calculate price thresholds
+        min_threshold = np.min(all_close_prices)
+        max_threshold = np.max(all_close_prices)
+        middle_threshold = np.median(all_close_prices)
         
         # Use the last values from the merged arrays
         current_k = all_k_values[-1] if all_k_values else 50
@@ -501,7 +532,10 @@ def analyze_merged_stochastic_condition(client, symbol, timeframes=['1m', '3m', 
             "last_overbought_idx": last_overbought_idx,
             "oversold_most_recent": oversold_most_recent,
             "overbought_most_recent": overbought_most_recent,
-            "total_periods": len(all_k_values)
+            "total_periods": len(all_k_values),
+            "min_threshold": min_threshold,
+            "middle_threshold": middle_threshold,
+            "max_threshold": max_threshold
         }
         
         return oversold_most_recent, overbought_most_recent, current_k, current_d, details
@@ -531,6 +565,11 @@ def analyze_bollinger_bands_condition(client, symbol, timeframe='1m', period=BB_
         close_prices = df_bb['close'].values
         upper_band = df_bb[f'BB_UPPER_{period}'].values
         lower_band = df_bb[f'BB_LOWER_{period}'].values
+        
+        # Calculate price thresholds
+        min_threshold = np.min(close_prices)
+        max_threshold = np.max(close_prices)
+        middle_threshold = np.median(close_prices)
         
         # Find prices below lower band and above upper band
         below_lower_mask = close_prices < lower_band
@@ -562,7 +601,10 @@ def analyze_bollinger_bands_condition(client, symbol, timeframe='1m', period=BB_
             "highest_above_more_recent": highest_above_more_recent,
             "current_price": close_prices[-1],
             "bb_upper": upper_band[-1],
-            "bb_lower": lower_band[-1]
+            "bb_lower": lower_band[-1],
+            "min_threshold": min_threshold,
+            "middle_threshold": middle_threshold,
+            "max_threshold": max_threshold
         }
         
         return lowest_below_more_recent, highest_above_more_recent, details
@@ -585,6 +627,11 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=1200):
         df.fillna(0.0, inplace=True)
         
         close_prices = df['close'].values
+        
+        # Calculate price thresholds
+        min_threshold = np.min(close_prices)
+        max_threshold = np.max(close_prices)
+        middle_threshold = np.median(close_prices)
         
         # Calculate momentum (10-period)
         momentum_values = []
@@ -627,7 +674,9 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=1200):
                 "most_positive_momentum": max_momentum,
                 "pct_from_negative": pct_from_min,
                 "pct_from_positive": pct_from_max,
-                "total_percentage": pct_from_min + pct_from_max
+                "min_threshold": min_threshold,
+                "middle_threshold": middle_threshold,
+                "max_threshold": max_threshold
             }
             
             return momentum_positive and negative_more_recent, current_momentum, details
@@ -654,12 +703,20 @@ def analyze_poly_fit_condition(client, symbol, timeframe='1m', lookback=200):
         close_prices = df['close'].values
         timestamps = np.arange(len(close_prices))
         
+        # Calculate price thresholds
+        min_threshold = np.min(close_prices)
+        max_threshold = np.max(close_prices)
+        middle_threshold = np.median(close_prices)
+        
         # Check polynomial fit condition
         below_poly_fit = check_polynomial_fit(close_prices, timestamps)
         
         details = {
             "below_poly_fit": below_poly_fit,
-            "current_price": close_prices[-1]
+            "current_price": close_prices[-1],
+            "min_threshold": min_threshold,
+            "middle_threshold": middle_threshold,
+            "max_threshold": max_threshold
         }
         
         return below_poly_fit, details
@@ -883,19 +940,31 @@ def perform_single_iteration_analysis(client):
             'pct_max': pct_max,
             'details': details
         }
-        print(f"{timeframe}: Min More Recent: {details.get('min_more_recent', False)}, "
-              f"Pct from Min: {pct_min:.2f}%, Pct from Max: {pct_max:.2f}%, "
-              f"Total: {details.get('total_percentage', 0):.2f}%, "
-              f"Condition: {argmin_met}")
+        
+        # Print price thresholds for this timeframe
+        min_threshold = details.get('min_threshold', 0)
+        middle_threshold = details.get('middle_threshold', 0)
+        max_threshold = details.get('max_threshold', 0)
+        current_price = details.get('current_price', 0)
+        
+        print(f"\nTimeframe: {timeframe}")
+        print(f"  Min More Recent: {details.get('min_more_recent', False)}")
+        print(f"  Pct from Min: {pct_min:.2f}%")
+        print(f"  Pct from Max: {pct_max:.2f}%")
+        print(f"  Condition Met: {argmin_met}")
+        
+        # Add price threshold information
+        print(f"  Price Thresholds - Min: {min_threshold:.2f}, Middle: {middle_threshold:.2f}, Max: {max_threshold:.2f}")
+        print(f"  Current Price: {current_price:.2f} (Position: {'Lower' if current_price < middle_threshold else 'Higher'} than middle)")
         
         if not argmin_met:
             all_tf_argmin_met = False
     
     if all_tf_argmin_met:
         conditions_met += 1
-        print("✓ ALL TIMEFRAMES: ArgMin condition MET")
+        print("\n✓ ALL TIMEFRAMES: ArgMin condition MET")
     else:
-        print("✗ ArgMin condition NOT met for all timeframes")
+        print("\n✗ ArgMin condition NOT met for all timeframes")
     
     # Condition 2: Volume Bullish vs Bearish
     print("\n--- Condition 2: Volume Analysis ---")
@@ -906,15 +975,22 @@ def perform_single_iteration_analysis(client):
         'bear_pct': bear_pct,
         'details': vol_details
     }
-    print(f"Bullish Volume: {bull_pct:.2f}%, Bearish Volume: {bear_pct:.2f}%")
-    print(f"Total Percentage: {vol_details.get('total_percentage', 0):.2f}%")
-    print(f"Condition: {volume_met}")
+    
+    # Print price thresholds
+    min_threshold = vol_details.get('min_threshold', 0)
+    middle_threshold = vol_details.get('middle_threshold', 0)
+    max_threshold = vol_details.get('max_threshold', 0)
+    
+    print(f"\nBullish Volume: {bull_pct:.2f}%")
+    print(f"Bearish Volume: {bear_pct:.2f}%")
+    print(f"Price Thresholds - Min: {min_threshold:.2f}, Middle: {middle_threshold:.2f}, Max: {max_threshold:.2f}")
+    print(f"Condition Met: {volume_met}")
     
     if volume_met:
         conditions_met += 1
-        print("✓ Volume condition MET")
+        print("\n✓ Volume condition MET")
     else:
-        print("✗ Volume condition NOT met")
+        print("\n✗ Volume condition NOT met")
     
     # Condition 3: RSI Condition
     print("\n--- Condition 3: RSI Analysis ---")
@@ -925,16 +1001,23 @@ def perform_single_iteration_analysis(client):
         'current_rsi': current_rsi,
         'details': rsi_details
     }
-    print(f"Current RSI: {current_rsi:.2f}")
+    
+    # Print price thresholds
+    min_threshold = rsi_details.get('min_threshold', 0)
+    middle_threshold = rsi_details.get('middle_threshold', 0)
+    max_threshold = rsi_details.get('max_threshold', 0)
+    
+    print(f"\nCurrent RSI: {current_rsi:.2f}")
     print(f"Oversold Most Recent: {rsi_oversold_recent}")
     print(f"Overbought Most Recent: {rsi_overbought_recent}")
-    print(f"Condition: {rsi_oversold_recent and not rsi_overbought_recent}")
+    print(f"Price Thresholds - Min: {min_threshold:.2f}, Middle: {middle_threshold:.2f}, Max: {max_threshold:.2f}")
+    print(f"Condition Met: {rsi_oversold_recent and not rsi_overbought_recent}")
     
     if rsi_oversold_recent and not rsi_overbought_recent:
         conditions_met += 1
-        print("✓ RSI condition MET")
+        print("\n✓ RSI condition MET")
     else:
-        print("✗ RSI condition NOT met")
+        print("\n✗ RSI condition NOT met")
     
     # Condition 4: Merged Stochastic Condition
     print("\n--- Condition 4: Merged Stochastic Analysis ---")
@@ -946,16 +1029,24 @@ def perform_single_iteration_analysis(client):
         'stoch_d': stoch_d,
         'details': stoch_details
     }
-    print(f"Merged Stochastic K: {stoch_k:.2f}, D: {stoch_d:.2f}")
+    
+    # Print price thresholds
+    min_threshold = stoch_details.get('min_threshold', 0)
+    middle_threshold = stoch_details.get('middle_threshold', 0)
+    max_threshold = stoch_details.get('max_threshold', 0)
+    
+    print(f"\nMerged Stochastic K: {stoch_k:.2f}")
+    print(f"Merged Stochastic D: {stoch_d:.2f}")
     print(f"Oversold Most Recent: {stoch_oversold_recent}")
     print(f"Overbought Most Recent: {stoch_overbought_recent}")
-    print(f"Condition: {stoch_oversold_recent and not stoch_overbought_recent}")
+    print(f"Price Thresholds - Min: {min_threshold:.2f}, Middle: {middle_threshold:.2f}, Max: {max_threshold:.2f}")
+    print(f"Condition Met: {stoch_oversold_recent and not stoch_overbought_recent}")
     
     if stoch_oversold_recent and not stoch_overbought_recent:
         conditions_met += 1
-        print("✓ Stochastic condition MET")
+        print("\n✓ Stochastic condition MET")
     else:
-        print("✗ Stochastic condition NOT met")
+        print("\n✗ Stochastic condition NOT met")
     
     # Condition 5: Bollinger Bands Condition
     print("\n--- Condition 5: Bollinger Bands Analysis ---")
@@ -965,15 +1056,26 @@ def perform_single_iteration_analysis(client):
         'highest_above_more_recent': bb_highest_recent,
         'details': bb_details
     }
-    print(f"Lowest Below More Recent: {bb_lowest_recent}")
+    
+    # Print price thresholds
+    min_threshold = bb_details.get('min_threshold', 0)
+    middle_threshold = bb_details.get('middle_threshold', 0)
+    max_threshold = bb_details.get('max_threshold', 0)
+    current_price = bb_details.get('current_price', 0)
+    bb_upper = bb_details.get('bb_upper', 0)
+    bb_lower = bb_details.get('bb_lower', 0)
+    
+    print(f"\nLowest Below More Recent: {bb_lowest_recent}")
     print(f"Highest Above More Recent: {bb_highest_recent}")
-    print(f"Condition: {bb_lowest_recent and not bb_highest_recent}")
+    print(f"Price Thresholds - Min: {min_threshold:.2f}, Middle: {middle_threshold:.2f}, Max: {max_threshold:.2f}")
+    print(f"Current Price: {current_price:.2f}, BB Upper: {bb_upper:.2f}, BB Lower: {bb_lower:.2f}")
+    print(f"Condition Met: {bb_lowest_recent and not bb_highest_recent}")
     
     if bb_lowest_recent and not bb_highest_recent:
         conditions_met += 1
-        print("✓ Bollinger Bands condition MET")
+        print("\n✓ Bollinger Bands condition MET")
     else:
-        print("✗ Bollinger Bands condition NOT met")
+        print("\n✗ Bollinger Bands condition NOT met")
     
     # Condition 6: Momentum Condition
     print("\n--- Condition 6: Momentum Analysis ---")
@@ -983,19 +1085,25 @@ def perform_single_iteration_analysis(client):
         'current_momentum': current_momentum,
         'details': mom_details
     }
-    print(f"Current Momentum: {current_momentum:.4f}")
+    
+    # Print price thresholds
+    min_threshold = mom_details.get('min_threshold', 0)
+    middle_threshold = mom_details.get('middle_threshold', 0)
+    max_threshold = mom_details.get('max_threshold', 0)
+    
+    print(f"\nCurrent Momentum: {current_momentum:.4f}")
     print(f"Momentum > 0: {mom_details.get('momentum_positive', False)}")
     print(f"Negative More Recent: {mom_details.get('negative_more_recent', False)}")
     print(f"Pct from Negative: {mom_details.get('pct_from_negative', 0):.2f}%")
     print(f"Pct from Positive: {mom_details.get('pct_from_positive', 0):.2f}%")
-    print(f"Total Percentage: {mom_details.get('total_percentage', 0):.2f}%")
-    print(f"Condition: {momentum_met}")
+    print(f"Price Thresholds - Min: {min_threshold:.2f}, Middle: {middle_threshold:.2f}, Max: {max_threshold:.2f}")
+    print(f"Condition Met: {momentum_met}")
     
     if momentum_met:
         conditions_met += 1
-        print("✓ Momentum condition MET")
+        print("\n✓ Momentum condition MET")
     else:
-        print("✗ Momentum condition NOT met")
+        print("\n✗ Momentum condition NOT met")
     
     # Condition 7: Polynomial Fit Condition
     print("\n--- Condition 7: Polynomial Fit Analysis ---")
@@ -1004,13 +1112,22 @@ def perform_single_iteration_analysis(client):
         'met': poly_met,
         'details': poly_details
     }
-    print(f"Below Poly Fit: {poly_met}")
+    
+    # Print price thresholds
+    min_threshold = poly_details.get('min_threshold', 0)
+    middle_threshold = poly_details.get('middle_threshold', 0)
+    max_threshold = poly_details.get('max_threshold', 0)
+    current_price = poly_details.get('current_price', 0)
+    
+    print(f"\nBelow Poly Fit: {poly_met}")
+    print(f"Price Thresholds - Min: {min_threshold:.2f}, Middle: {middle_threshold:.2f}, Max: {max_threshold:.2f}")
+    print(f"Current Price: {current_price:.2f} (Position: {'Lower' if current_price < middle_threshold else 'Higher'} than middle)")
     
     if poly_met:
         conditions_met += 1
-        print("✓ Polynomial Fit condition MET")
+        print("\n✓ Polynomial Fit condition MET")
     else:
-        print("✗ Polynomial Fit condition NOT met")
+        print("\n✗ Polynomial Fit condition NOT met")
     
     # Step 4: Trading Decision
     print("\n" + "="*80)
