@@ -246,21 +246,27 @@ def calculate_bollinger_bands(df, period=BB_PERIOD, std_dev=BB_STD):
 def calculate_momentum(df, period=MOMENTUM_PERIOD):
     """Calculate Momentum using TA-Lib."""
     try:
-        if df is None or len(df) < period:
+        if df is None or len(df) < period + 1:
             return None
             
         df = df.copy()
         close_prices = df['close'].values
         
+        # Ensure we have valid data
+        if len(close_prices) <= period:
+            return None
+        
         if TALIB_AVAILABLE:
+            # Use TA-Lib's MOM function which calculates (price - price[n periods ago])
             momentum = talib.MOM(close_prices, timeperiod=period)
         else:
             # Fallback to manual calculation
-            momentum = []
+            momentum = np.zeros(len(close_prices))
             for i in range(period, len(close_prices)):
-                mom = ((close_prices[i] - close_prices[i-period]) / close_prices[i-period]) * 100
-                momentum.append(mom)
-            momentum = [0] * period + momentum
+                if close_prices[i-period] > 0:  # Avoid division by zero
+                    momentum[i] = ((close_prices[i] - close_prices[i-period]) / close_prices[i-period]) * 100
+                else:
+                    momentum[i] = 0  # Default to 0 if previous price is 0 or negative
         
         df['MOMENTUM'] = momentum
         return df
@@ -653,9 +659,16 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=500):
             
         df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
         
-        for c in ['open','high','low','close']:
+        # Clean OHLC and volume data first
+        for c in ['open','high','low','close','volume']:
             df[c] = pd.to_numeric(df[c], errors='coerce')
         df.fillna(0.0, inplace=True)
+        
+        # Remove any zero or negative prices that could cause issues
+        df = df[(df['open'] > 0) & (df['high'] > 0) & (df['low'] > 0) & (df['close'] > 0)]
+        
+        if len(df) < MOMENTUM_PERIOD + 1:
+            return False, 0.0, {"error": "Insufficient valid data after cleaning"}
         
         close_prices = df['close'].values
         
@@ -670,7 +683,13 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=500):
             return False, 0.0, {"error": "Momentum calculation failed"}
         
         momentum_values = df_momentum['MOMENTUM'].values
-        current_momentum = momentum_values[-1] if len(momentum_values) > 0 else 0
+        # Filter out NaN values
+        valid_momentum = momentum_values[~np.isnan(momentum_values)]
+        
+        if len(valid_momentum) == 0:
+            return False, 0.0, {"error": "No valid momentum values"}
+        
+        current_momentum = valid_momentum[-1]
         momentum_positive = current_momentum > 0
         
         # Find most negative and most positive momentum occurrences
@@ -678,15 +697,15 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=500):
         last_positive_idx = None
         
         # Track most recent negative and positive momentum occurrences
-        for i in range(len(momentum_values)-1, -1, -1):
-            if last_negative_idx is None and momentum_values[i] < 0:
+        for i in range(len(valid_momentum)-1, -1, -1):
+            if last_negative_idx is None and valid_momentum[i] < 0:
                 last_negative_idx = i
-            if last_positive_idx is None and momentum_values[i] > 0:
+            if last_positive_idx is None and valid_momentum[i] > 0:
                 last_positive_idx = i
             if last_negative_idx is not None and last_positive_idx is not None:
                 break
         
-        # Determine which is most recent
+        # Determine which is more recent
         negative_more_recent = False
         positive_more_recent = False
         
@@ -699,13 +718,25 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=500):
             positive_more_recent = True
         
         # Find extreme values for symmetrical percentages
-        if len(momentum_values) > 0:
-            min_momentum = np.min(momentum_values)
-            max_momentum = np.max(momentum_values)
-            pct_from_negative, pct_from_positive = calculate_symmetrical_percentages(min_momentum, max_momentum, current_momentum)
+        min_momentum = np.min(valid_momentum)
+        max_momentum = np.max(valid_momentum)
+        
+        # Calculate symmetrical percentages properly
+        if min_momentum != max_momentum:
+            # Calculate distance from min and max
+            dist_from_min = abs(current_momentum - min_momentum)
+            dist_from_max = abs(current_momentum - max_momentum)
+            
+            # Calculate symmetrical percentages
+            total_dist = dist_from_min + dist_from_max
+            if total_dist > 0:
+                pct_from_negative = (dist_from_max / total_dist) * 100  # Closer to max means higher pct from negative
+                pct_from_positive = (dist_from_min / total_dist) * 100  # Closer to min means higher pct from positive
+            else:
+                pct_from_negative = 50.0
+                pct_from_positive = 50.0
         else:
-            min_momentum = 0
-            max_momentum = 0
+            # All momentum values are the same
             pct_from_negative = 50.0
             pct_from_positive = 50.0
         
