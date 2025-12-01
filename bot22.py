@@ -6,6 +6,9 @@ Integrated polynomial fit with price, lower band, upper band, and channel
 Added proper condition checking for current close below polynomial fit lower band
 Using TA-Lib for technical indicators
 Fixed momentum and polynomial fit most recent tracking
+Enhanced risk management with position sizing and stop-loss
+Improved API rate limiting
+Added condition summary display without marks
 """
 
 import os
@@ -46,6 +49,8 @@ TIMEFRAMES = ['1m']  # Only using 1m timeframe as requested
 PROFIT_TARGET_PERCENT = 1.45
 TOTAL_FEE_PERCENT = 0.22
 MIN_TRADE_AMOUNT = 10
+MAX_POSITION_PERCENT = 20  # Only use 20% of available balance for risk management
+STOP_LOSS_PERCENT = 2.0  # 2% stop loss
 
 # Dust Conversion Configuration
 MIN_DUST_CONVERSION_AMOUNT = 0.0001
@@ -65,6 +70,9 @@ BB_PERIOD = 360
 BB_STD = 2
 
 MOMENTUM_PERIOD = 10
+
+# API Rate Limiting
+MIN_ITERATION_INTERVAL = 15  # Minimum 15 seconds between iterations
 
 # Global stop event
 stop_event = threading.Event()
@@ -276,8 +284,19 @@ def calculate_momentum(df, period=MOMENTUM_PERIOD):
 
 # ------------------ Enhanced Analysis Functions with Symmetrical Percentages ------------------
 
+def validate_percentage_calculations(pct1, pct2, name="Percentages"):
+    """Validate that percentages sum to 100% and are within valid range."""
+    total = pct1 + pct2
+    if abs(total - 100.0) > 0.01:  # Allow for small floating point errors
+        print(f"WARNING: {name} don't sum to 100%: {pct1:.2f}% + {pct2:.2f}% = {total:.2f}%")
+        return False
+    if pct1 < 0 or pct1 > 100 or pct2 < 0 or pct2 > 100:
+        print(f"WARNING: {name} out of range: {pct1:.2f}%, {pct2:.2f}%")
+        return False
+    return True
+
 def calculate_symmetrical_percentages(value1, value2, current_value):
-    """Calculate symmetrical percentages that sum to 100%."""
+    """Calculate symmetrical percentages that sum to 100% with proper normalization."""
     try:
         if value1 == value2:
             return 50.0, 50.0
@@ -286,11 +305,12 @@ def calculate_symmetrical_percentages(value1, value2, current_value):
         dist_to_val1 = abs(current_value - value1)
         dist_to_val2 = abs(current_value - value2)
         
-        # Calculate symmetrical percentages
+        # Calculate symmetrical percentages with proper normalization
         total_dist = dist_to_val1 + dist_to_val2
         if total_dist > 0:
-            pct_val1 = (dist_to_val2 / total_dist) * 100  # Inverted for proximity
-            pct_val2 = (dist_to_val1 / total_dist) * 100  # Inverted for proximity
+            # Inverted for proximity (closer = higher percentage)
+            pct_val1 = (dist_to_val2 / total_dist) * 100
+            pct_val2 = (dist_to_val1 / total_dist) * 100
         else:
             pct_val1 = 50.0
             pct_val2 = 50.0
@@ -307,7 +327,7 @@ def calculate_symmetrical_percentages(value1, value2, current_value):
         return 50.0, 50.0
 
 def analyze_argmin_argmax_condition(client, symbol, timeframe='1m', lookback=500):
-    """Analyze argmin vs argmax condition for dip detection with symmetrical percentages."""
+    """Analyze argmin vs argmax condition for dip detection with improved percentage calculation."""
     try:
         klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
         if not klines or len(klines) < 100:
@@ -338,10 +358,26 @@ def analyze_argmin_argmax_condition(client, symbol, timeframe='1m', lookback=500
         min_more_recent = argmin_idx > argmax_idx
         max_more_recent = argmax_idx > argmin_idx
         
-        # Calculate symmetrical percentages
-        pct_from_min, pct_from_max = calculate_symmetrical_percentages(min_price, max_price, current_price)
+        # Improved percentage calculation
+        # Calculate position of current price within the min-max range
+        if max_threshold != min_threshold:
+            # Linear interpolation: 0% at min, 100% at max
+            pct_from_min = ((current_price - min_threshold) / (max_threshold - min_threshold)) * 100
+            pct_from_max = ((max_threshold - current_price) / (max_threshold - min_threshold)) * 100
+        else:
+            pct_from_min = 50.0
+            pct_from_max = 50.0
         
-        # Condition: min more recent AND percentage from min < percentage from max
+        # Ensure they sum to exactly 100%
+        total_pct = pct_from_min + pct_from_max
+        if total_pct > 0:
+            pct_from_min = (pct_from_min / total_pct) * 100
+            pct_from_max = (pct_from_max / total_pct) * 100
+        
+        # Validate percentages
+        validate_percentage_calculations(pct_from_min, pct_from_max, "ArgMin/ArgMax percentages")
+        
+        # Condition: min more recent AND current price is closer to min than max
         # (Lower percentage from min means closer to min)
         condition_met = min_more_recent and (pct_from_min < pct_from_max)
         
@@ -397,6 +433,9 @@ def analyze_volume_condition(client, symbol, timeframe='1m', lookback=50):
         if total_pct > 0:
             bullish_pct = (bullish_pct / total_pct) * 100
             bearish_pct = (bearish_pct / total_pct) * 100
+        
+        # Validate percentages
+        validate_percentage_calculations(bullish_pct, bearish_pct, "Volume percentages")
         
         details = {
             "bullish_volume": bullish_volume,
@@ -614,7 +653,7 @@ def analyze_bollinger_bands_condition(client, symbol, timeframe='1m', period=BB_
         return False, False, {"error": str(e)}
 
 def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=500):
-    """Analyze momentum condition using TA-Lib Momentum with proper most recent tracking."""
+    """Analyze momentum condition with improved percentage calculation."""
     try:
         klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
         if not klines or len(klines) < 100:
@@ -683,26 +722,24 @@ def analyze_momentum_condition(client, symbol, timeframe='1m', lookback=500):
         most_negative_momentum = valid_momentum[last_negative_idx] if last_negative_idx is not None else None
         most_positive_momentum = valid_momentum[last_positive_idx] if last_positive_idx is not None else None
         
-        # Calculate symmetrical percentages properly
-        if min_momentum != max_momentum:
-            # Calculate distance from min and max
-            dist_from_min = abs(current_momentum - min_momentum)
-            dist_from_max = abs(current_momentum - max_momentum)
-            
-            # Calculate symmetrical percentages
-            total_dist = dist_from_min + dist_from_max
-            if total_dist > 0:
-                # Fixed: Corrected percentage calculation
-                # pct_from_negative should be 0% when at the negative extreme and 100% when at the positive extreme
-                pct_from_negative = (dist_from_min / total_dist) * 100  # Distance from negative extreme
-                pct_from_positive = (dist_from_max / total_dist) * 100  # Distance from positive extreme
-            else:
-                pct_from_negative = 50.0
-                pct_from_positive = 50.0
+        # Improved percentage calculation using linear interpolation
+        if max_momentum != min_momentum:
+            # Linear interpolation: 0% at min, 100% at max
+            pct_from_negative = ((current_momentum - min_momentum) / (max_momentum - min_momentum)) * 100
+            pct_from_positive = ((max_momentum - current_momentum) / (max_momentum - min_momentum)) * 100
         else:
             # All momentum values are the same
             pct_from_negative = 50.0
             pct_from_positive = 50.0
+        
+        # Ensure they sum to exactly 100%
+        total_pct = pct_from_negative + pct_from_positive
+        if total_pct > 0:
+            pct_from_negative = (pct_from_negative / total_pct) * 100
+            pct_from_positive = (pct_from_positive / total_pct) * 100
+        
+        # Validate percentages
+        validate_percentage_calculations(pct_from_negative, pct_from_positive, "Momentum percentages")
         
         details = {
             "current_momentum": current_momentum,
@@ -848,12 +885,14 @@ def analyze_poly_fit_condition(client, symbol, timeframe='1m', lookback=200):
 # ------------------ Trade Execution Functions ------------------
 
 def execute_buy_order(client, symbol, usdc_amount):
-    """Execute a market buy order using 100% of available USDC."""
+    """Execute a market buy order using a percentage of available USDC."""
     try:
         ticker = client.get_symbol_ticker(symbol=symbol)
         current_price = float(ticker['price'])
         
-        quantity = usdc_amount / current_price * 0.99  # 1% buffer for fees
+        # Use only a percentage of available balance for risk management
+        max_usdc = usdc_amount * (MAX_POSITION_PERCENT / 100)
+        quantity = max_usdc / current_price * 0.99  # 1% buffer for fees
         
         symbol_info = client.get_symbol_info(symbol)
         lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
@@ -921,7 +960,7 @@ def execute_sell_order(client, symbol, quantity):
         }
 
 def get_current_price(client, symbol):
-    """Get the current price for a symbol."""
+    """Get current price for a symbol."""
     try:
         ticker = client.get_symbol_ticker(symbol=symbol)
         return float(ticker['price'])
@@ -930,7 +969,7 @@ def get_current_price(client, symbol):
         return None
 
 def get_account_balance(client, asset):
-    """Get the balance of a specific asset in the account."""
+    """Get balance of a specific asset in the account."""
     try:
         account_info = client.get_account()
         for balance in account_info['balances']:
@@ -942,10 +981,11 @@ def get_account_balance(client, asset):
         return 0.0
 
 def monitor_trade(client, symbol, entry_price, entry_time, quantity):
-    """Monitor the trade and sell when profit target is reached."""
+    """Monitor the trade and sell when profit target or stop loss is reached."""
     global trade_active, trade_info
     
     target_price = entry_price * (1 + (PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT) / 100)
+    stop_loss_price = entry_price * (1 - STOP_LOSS_PERCENT / 100)
     
     while trade_active and not stop_event.is_set():
         try:
@@ -961,6 +1001,9 @@ def monitor_trade(client, symbol, entry_price, entry_time, quantity):
             target_diff = target_price - current_price
             target_diff_pct = (target_diff / current_price) * 100
             
+            stop_loss_diff = current_price - stop_loss_price
+            stop_loss_diff_pct = (stop_loss_diff / current_price) * 100
+            
             trade_info = {
                 'symbol': symbol,
                 'entry_price': entry_price,
@@ -971,6 +1014,9 @@ def monitor_trade(client, symbol, entry_price, entry_time, quantity):
                 'target_price': target_price,
                 'target_diff': target_diff,
                 'target_diff_pct': target_diff_pct,
+                'stop_loss_price': stop_loss_price,
+                'stop_loss_diff': stop_loss_diff,
+                'stop_loss_diff_pct': stop_loss_diff_pct,
                 'quantity': quantity
             }
             
@@ -986,9 +1032,12 @@ def monitor_trade(client, symbol, entry_price, entry_time, quantity):
             print(f"{'Time Elapsed:':<20}{time_elapsed}")
             print(f"{'Target Price:':<20}{target_price:.6f}")
             print(f"{'Distance to Target:':<20}{target_diff:.6f} ({target_diff_pct:.2f}%)")
+            print(f"{'Stop Loss Price:':<20}{stop_loss_price:.6f}")
+            print(f"{'Distance to Stop Loss:':<20}{stop_loss_diff:.6f} ({stop_loss_diff_pct:.2f}%)")
             print(f"{'Quantity:':<20}{quantity}")
             print("="*80)
             
+            # Check for profit target
             if current_price >= target_price:
                 print(f"PROFIT TARGET REACHED! Selling at {current_price:.6f}")
                 sell_result = execute_sell_order(client, symbol, quantity)
@@ -998,6 +1047,21 @@ def monitor_trade(client, symbol, entry_price, entry_time, quantity):
                     print(f"Order ID: {sell_result['order_id']}")
                     print(f"Quantity Sold: {sell_result['quantity']}")
                     print(f"Estimated Profit: {(current_price - entry_price) * quantity:.6f} USDC")
+                    trade_active = False
+                    return True
+                else:
+                    print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
+            
+            # Check for stop loss
+            if current_price <= stop_loss_price:
+                print(f"STOP LOSS TRIGGERED! Selling at {current_price:.6f}")
+                sell_result = execute_sell_order(client, symbol, quantity)
+                
+                if sell_result['success']:
+                    print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
+                    print(f"Order ID: {sell_result['order_id']}")
+                    print(f"Quantity Sold: {sell_result['quantity']}")
+                    print(f"Estimated Loss: {(current_price - entry_price) * quantity:.6f} USDC")
                     trade_active = False
                     return True
                 else:
@@ -1048,6 +1112,7 @@ def perform_single_iteration_analysis(client):
     conditions_met = 0
     total_conditions = 7
     condition_details = {}
+    condition_results = {}  # Store individual condition results
     
     # Condition 1: ArgMin vs ArgMax for 1m timeframe only
     print("\n--- Condition 1: ArgMin vs ArgMax Analysis ---")
@@ -1058,6 +1123,7 @@ def perform_single_iteration_analysis(client):
         'pct_max': pct_max,
         'details': details
     }
+    condition_results['ArgMin vs ArgMax'] = argmin_met
     
     # Print details for this condition - ONLY FOR ARGMIN VS ARGMAX (with threshold labels)
     min_threshold = details.get('min_threshold', 0)
@@ -1080,9 +1146,9 @@ def perform_single_iteration_analysis(client):
     
     if argmin_met:
         conditions_met += 1
-        print("\n✓ ArgMin condition MET")
+        print("\nTRUE - ArgMin condition MET")
     else:
-        print("\n✗ ArgMin condition NOT met")
+        print("\nFALSE - ArgMin condition NOT met")
     
     # Condition 2: Volume Bullish vs Bearish
     print("\n--- Condition 2: Volume Analysis ---")
@@ -1093,6 +1159,7 @@ def perform_single_iteration_analysis(client):
         'bear_pct': bear_pct,
         'details': vol_details
     }
+    condition_results['Volume Bullish > Bearish'] = volume_met
     
     # Print details for this condition - WITHOUT threshold labels
     print(f"\nBullish Volume: {bull_pct:.2f}%")
@@ -1101,9 +1168,9 @@ def perform_single_iteration_analysis(client):
     
     if volume_met:
         conditions_met += 1
-        print("\n✓ Volume condition MET")
+        print("\nTRUE - Volume condition MET")
     else:
-        print("\n✗ Volume condition NOT met")
+        print("\nFALSE - Volume condition NOT met")
     
     # Condition 3: RSI Condition
     print("\n--- Condition 3: RSI Analysis ---")
@@ -1114,6 +1181,7 @@ def perform_single_iteration_analysis(client):
         'current_rsi': current_rsi,
         'details': rsi_details
     }
+    condition_results['RSI Oversold Most Recent'] = rsi_oversold_recent and not rsi_overbought_recent
     
     # Print details for this condition - WITHOUT threshold labels
     print(f"\nCurrent RSI: {current_rsi:.2f}")
@@ -1123,9 +1191,9 @@ def perform_single_iteration_analysis(client):
     
     if rsi_oversold_recent and not rsi_overbought_recent:
         conditions_met += 1
-        print("\n✓ RSI condition MET")
+        print("\nTRUE - RSI condition MET")
     else:
-        print("\n✗ RSI condition NOT met")
+        print("\nFALSE - RSI condition NOT met")
     
     # Condition 4: Merged Stochastic Condition
     print("\n--- Condition 4: Merged Stochastic Analysis ---")
@@ -1137,6 +1205,7 @@ def perform_single_iteration_analysis(client):
         'stoch_d': stoch_d,
         'details': stoch_details
     }
+    condition_results['Stochastic Oversold Most Recent'] = stoch_oversold_recent and not stoch_overbought_recent
     
     # Print details for this condition - WITHOUT threshold labels
     print(f"\nMerged Stochastic K: {stoch_k:.2f}")
@@ -1147,9 +1216,9 @@ def perform_single_iteration_analysis(client):
     
     if stoch_oversold_recent and not stoch_overbought_recent:
         conditions_met += 1
-        print("\n✓ Stochastic condition MET")
+        print("\nTRUE - Stochastic condition MET")
     else:
-        print("\n✗ Stochastic condition NOT met")
+        print("\nFALSE - Stochastic condition NOT met")
     
     # Condition 5: Bollinger Bands Condition
     print("\n--- Condition 5: Bollinger Bands Analysis ---")
@@ -1159,6 +1228,7 @@ def perform_single_iteration_analysis(client):
         'highest_above_more_recent': bb_highest_recent,
         'details': bb_details
     }
+    condition_results['Bollinger Bands Lowest Below Most Recent'] = bb_lowest_recent and not bb_highest_recent
     
     # Print details for this condition - WITHOUT threshold labels
     bb_upper = bb_details.get('bb_upper', 0)
@@ -1172,9 +1242,9 @@ def perform_single_iteration_analysis(client):
     
     if bb_lowest_recent and not bb_highest_recent:
         conditions_met += 1
-        print("\n✓ Bollinger Bands condition MET")
+        print("\nTRUE - Bollinger Bands condition MET")
     else:
-        print("\n✗ Bollinger Bands condition NOT met")
+        print("\nFALSE - Bollinger Bands condition NOT met")
     
     # Condition 6: Momentum Condition
     print("\n--- Condition 6: Momentum Analysis ---")
@@ -1184,6 +1254,8 @@ def perform_single_iteration_analysis(client):
         'current_momentum': current_momentum,
         'details': mom_details
     }
+    # Updated condition name as requested - shortened to fit properly
+    condition_results['Most Recent Extrema Momentum Negative'] = momentum_met
     
     # Print details for this condition - WITHOUT threshold labels
     most_negative_momentum = mom_details.get('most_negative_momentum', 0)
@@ -1206,9 +1278,9 @@ def perform_single_iteration_analysis(client):
     
     if momentum_met:
         conditions_met += 1
-        print("\n✓ Momentum condition MET")
+        print("\nTRUE - Momentum condition MET")
     else:
-        print("\n✗ Momentum condition NOT met")
+        print("\nFALSE - Momentum condition NOT met")
     
     # Condition 7: Polynomial Fit Condition
     print("\n--- Condition 7: Polynomial Fit Analysis ---")
@@ -1217,6 +1289,7 @@ def perform_single_iteration_analysis(client):
         'met': poly_met,
         'details': poly_details
     }
+    condition_results['Polynomial Fit Below Lower Band'] = poly_met
     
     # Print details for this condition with enhanced information
     current_price = poly_details.get('current_price', 0)
@@ -1237,9 +1310,9 @@ def perform_single_iteration_analysis(client):
     
     if poly_met:
         conditions_met += 1
-        print("\n✓ Polynomial Fit condition MET")
+        print("\nTRUE - Polynomial Fit condition MET")
     else:
-        print("\n✗ Polynomial Fit condition NOT met")
+        print("\nFALSE - Polynomial Fit condition NOT met")
     
     # Step 4: Trading Decision
     print("\n" + "="*80)
@@ -1247,27 +1320,35 @@ def perform_single_iteration_analysis(client):
     print("="*80)
     print(f"Conditions Met: {conditions_met}/{total_conditions}")
     
+    # Print individual condition results
+    print("\nCondition Summary:")
+    print("-" * 65)
+    for condition_name, result in condition_results.items():
+        status = "TRUE" if result else "FALSE"
+        print(f"{condition_name:<50}{status}")
+    print("-" * 65)
+    
     # All conditions must be met for trade entry
     if conditions_met == total_conditions:
-        print("!!! ALL CONDITIONS MET - EXECUTING TRADE !!!")
+        print("\n!!! ALL CONDITIONS MET - EXECUTING TRADE !!!")
         
-        # Execute buy order with 100% USDC balance
+        # Execute buy order with a percentage of USDC balance
         buy_result = execute_buy_order(client, SYMBOL, usdc_balance)
         
         if buy_result['success']:
-            print(f"BUY ORDER EXECUTED SUCCESSFULLY!")
+            print(f"\nBUY ORDER EXECUTED SUCCESSFULLY!")
             print(f"Order ID: {buy_result['order_id']}")
             print(f"Quantity: {buy_result['quantity']:.6f}")
             print(f"Price: {buy_result['price']:.6f}")
-            print(f"Cost: {buy_result['cost']:.2f} USDC")
+            print(f"Cost: {buy_result['cost']:.2f} USDC ({MAX_POSITION_PERCENT}% of balance)")
             
             # Start trade monitoring
             trade_active = True
             monitor_trade(client, SYMBOL, buy_result['price'], buy_result['timestamp'], buy_result['quantity'])
         else:
-            print(f"ERROR EXECUTING BUY ORDER: {buy_result['error']}")
+            print(f"\nERROR EXECUTING BUY ORDER: {buy_result['error']}")
     else:
-        print("!!! CONDITIONS NOT MET - NO TRADE EXECUTED !!!")
+        print("\n!!! CONDITIONS NOT MET - NO TRADE EXECUTED !!!")
         print("Waiting for next iteration...")
     
     # Step 5: Cleanup for next iteration
@@ -1301,8 +1382,9 @@ def main():
     print("1. Check and convert BTC dust")
     print("2. Analyze all 7 trading conditions with symmetrical percentages") 
     print("3. Execute trade if ALL conditions met")
-    print("4. Use 100% USDC balance for entry")
-    print("5. Clean up for next iteration")
+    print("4. Use a percentage of USDC balance for entry")
+    print("5. Monitor for profit target or stop loss")
+    print("6. Clean up for next iteration")
     print("="*60)
     
     iteration_count = 0
@@ -1316,10 +1398,11 @@ def main():
         except Exception as e:
             print(f"Error in iteration #{iteration_count}: {e}")
         
-        # Wait before next iteration - CHANGED FROM 30 SECONDS TO 5 SECONDS
+        # Wait before next iteration with improved rate limiting
         if not trade_active:
-            print(f"\nWaiting 5 seconds before next iteration...")
-            for i in range(5, 0, -1):
+            wait_time = max(MIN_ITERATION_INTERVAL, 5)
+            print(f"\nWaiting {wait_time} seconds before next iteration...")
+            for i in range(wait_time, 0, -1):
                 if stop_event.is_set():
                     break
                 print(f"\rNext iteration in: {i:2d} seconds", end="")
