@@ -1,0 +1,1347 @@
+#!/usr/bin/env python3
+"""
+ENHANCED BTCUSDC TRADING BOT - MOMENTUM EXTREMA ANALYSIS
+→ Uses momentum extrema analysis for trade signals
+→ Analyzes last 500 values to find most recent negative or positive momentum
+→ Replaces Nuclear Pump Engine and Volatility Rules with single momentum condition
+→ Full original features preserved with simplified momentum analysis
+"""
+
+import os
+import time
+import numpy as np
+import pandas as pd
+import threading
+import signal
+import sys
+import warnings
+import math
+import gc
+import json
+import requests
+from flask import Flask, request, jsonify
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
+from datetime import datetime
+from scipy.signal import hilbert
+from scipy.fft import fft, fftfreq
+
+# Suppress warnings for clean output
+warnings.filterwarnings("ignore")
+
+# --- TA-Lib import ---
+try:
+    import talib
+    TALIB_AVAILABLE = True
+except ImportError:
+    print("TA-Lib not available. Please install TA-Lib for better technical analysis.")
+    TALIB_AVAILABLE = False
+
+# ------------------ Configuration ------------------
+API_FILE = 'api.txt'
+SYMBOL = 'BTCUSDC'
+
+# Timeframes for analysis
+TIMEFRAMES = ['1m']  # Only using 1m timeframe as requested
+
+# Trading Configuration
+PROFIT_TARGET_PERCENT = 1.45
+TOTAL_FEE_PERCENT = 0.22
+MIN_TRADE_AMOUNT = 10
+MAX_POSITION_PERCENT = 20  # Only use 20% of available balance for risk management
+STOP_LOSS_PERCENT = 2.0  # 2% stop loss
+
+# Dust Conversion Configuration
+MIN_DUST_CONVERSION_AMOUNT = 0.0001
+MAX_DUST_CONVERSION_AMOUNT = 0.001
+
+# Technical Indicators Configuration
+RSI_PERIOD = 14
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+
+STOCH_K_PERIOD = 14
+STOCH_D_PERIOD = 3
+STOCH_OVERSOLD = 20
+STOCH_OVERBOUGHT = 80
+
+BB_PERIOD = 360
+BB_STD = 2
+
+# Momentum Configuration
+MOMENTUM_PERIOD = 12
+MOMENTUM_LOOKBACK = 500  # Number of values to analyze for extrema
+
+# API Rate Limiting
+MIN_ITERATION_INTERVAL = 5  # 5 seconds between iterations
+
+# Webhook Configuration
+WEBHOOK_PORT = 5000
+WEBHOOK_HOST = '0.0.0.0'
+
+# Global stop event
+stop_event = threading.Event()
+
+# Trade state variables
+trade_active = False
+trade_info = {}
+
+# Webhook data storage
+webhook_data = {
+    'current_price': None,
+    'last_update': None,
+    'price_history': []
+}
+
+# Flask app for webhooks
+app = Flask(__name__)
+
+def signal_handler(sig, frame):
+    print('\nCtrl+C pressed! Shutting down gracefully...')
+    stop_event.set()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# ------------------ Webhook Endpoints ------------------
+
+@app.route('/webhook/price', methods=['POST'])
+def receive_price_webhook():
+    """Receive price data via webhook"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({'error': 'No data received'}), 400
+        
+        # Extract price data
+        if 'price' in data:
+            price = float(data['price'])
+            timestamp = data.get('timestamp', datetime.now().isoformat())
+            
+            # Update webhook data
+            webhook_data['current_price'] = price
+            webhook_data['last_update'] = timestamp
+            
+            # Add to price history (keep last 1000 points)
+            webhook_data['price_history'].append({
+                'price': price,
+                'timestamp': timestamp
+            })
+            if len(webhook_data['price_history']) > 1000:
+                webhook_data['price_history'].pop(0)
+            
+            print(f"Webhook received: {price} at {timestamp}")
+            return jsonify({'status': 'success', 'price': price})
+        
+        return jsonify({'error': 'Invalid data format'}), 400
+        
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'current_price': webhook_data['current_price'],
+        'last_update': webhook_data['last_update']
+    })
+
+def start_webhook_server():
+    """Start webhook server using production-ready server"""
+    try:
+        # Try to use Gunicorn if available (recommended for production)
+        try:
+            import gunicorn.app.base
+            from gunicorn.six import iteritems
+            
+            class StandaloneApplication(gunicorn.app.base.BaseApplication):
+                def __init__(self, app, options=None):
+                    self.options = options or {}
+                    self.application = app
+                    super(StandaloneApplication, self).__init__()
+                
+                def load_config(self):
+                    config = dict([(key, value) for key, value in iteritems(self.options)
+                                 if key in self.cfg.settings and value is not None])
+                    for key, value in iteritems(config):
+                        self.cfg.set(key.lower(), value)
+                
+                def load(self):
+                    return self.application
+            
+            options = {
+                'bind': f'{WEBHOOK_HOST}:{WEBHOOK_PORT}',
+                'workers': 1,
+                'threads': 4,
+                'timeout': 30,
+                'keepalive': 2,
+                'max_requests': 1000,
+                'max_requests_jitter': 100,
+                'preload_app': True,
+                'accesslog': '-',
+                'errorlog': '-',
+                'loglevel': 'info'
+            }
+            
+            print(f"Starting webhook server with Gunicorn on port {WEBHOOK_PORT}")
+            StandaloneApplication(app, options).run()
+            
+        except ImportError:
+            # Fallback to Waitress if Gunicorn is not available
+            try:
+                from waitress import serve
+                
+                print(f"Starting webhook server with Waitress on port {WEBHOOK_PORT}")
+                serve(app, host=WEBHOOK_HOST, port=WEBHOOK_PORT)
+                
+            except ImportError:
+                # Last resort: use Flask development server with warnings suppressed
+                print("WARNING: Neither Gunicorn nor Waitress found. Using Flask development server.")
+                print("For production use, install Gunicorn: pip install gunicorn")
+                print("Or install Waitress: pip install waitress")
+                
+                # Suppress Flask development server warning
+                import logging
+                log = logging.getLogger('werkzeug')
+                log.setLevel(logging.ERROR)
+                
+                app.run(host=WEBHOOK_HOST, port=WEBHOOK_PORT, debug=False, use_reloader=False)
+                
+    except Exception as e:
+        print(f"Error starting webhook server: {e}")
+        # Fallback to Flask development server
+        app.run(host=WEBHOOK_HOST, port=WEBHOOK_PORT, debug=False, use_reloader=False)
+
+# ------------------ Enhanced BTC Dust Conversion ------------------
+
+def convert_btc_dust_to_usdc(client):
+    """Convert only BTC dust balances to USDC before trading with proper error handling."""
+    try:
+        print("Checking for BTC dust to convert...")
+        account_info = client.get_account()
+        
+        dust_assets = []
+        
+        for balance in account_info['balances']:
+            asset = balance['asset']
+            free_balance = float(balance['free'])
+            locked_balance = float(balance['locked'])
+            total_balance = free_balance + locked_balance
+            
+            # Check for BTC dust specifically
+            if asset == 'BTC' and MIN_DUST_CONVERSION_AMOUNT <= total_balance <= MAX_DUST_CONVERSION_AMOUNT:
+                try:
+                    # Get current price to calculate USD value
+                    symbol = f"{asset}USDC"
+                    ticker = client.get_symbol_ticker(symbol=symbol)
+                    price = float(ticker['price'])
+                    usd_value = total_balance * price
+                    
+                    if usd_value < MIN_TRADE_AMOUNT:
+                        print(f"Found BTC dust: {asset} - {total_balance:.8f} (≈${usd_value:.2f})")
+                        dust_assets.append(asset)
+                        
+                except Exception as e:
+                    print(f"Error checking {asset} value: {e}")
+                    continue
+        
+        # Convert dust assets if any found
+        if dust_assets:
+            try:
+                print(f"Attempting to convert dust assets: {dust_assets}")
+                
+                # Use correct API endpoint for dust conversion
+                result = client.transfer_dust(asset=dust_assets)
+                
+                if result.get('success', False):
+                    print("BTC dust conversion successful!")
+                    for item in result.get('transferResult', []):
+                        print(f"  {item['fromAsset']}: {item['amount']} → USDC")
+                    return True
+                else:
+                    print("Dust conversion failed or not supported for these assets")
+                    return False
+                    
+            except BinanceAPIException as e:
+                if 'illegal parameter' in str(e).lower():
+                    print("Dust conversion not supported for these assets or invalid parameters")
+                elif 'insufficient balance' in str(e).lower():
+                    print("Insufficient balance for dust conversion")
+                else:
+                    print(f"Binance API error during dust conversion: {e}")
+                return False
+                
+            except Exception as e:
+                print(f"Unexpected error during dust conversion: {e}")
+                return False
+        else:
+            print("No BTC dust found for conversion")
+            return True
+            
+    except Exception as e:
+        print(f"Error in BTC dust conversion process: {e}")
+        return False
+
+# ------------------ Enhanced Technical Analysis Functions with TA-Lib ------------------
+
+def calculate_rsi(df, period=RSI_PERIOD):
+    """Calculate RSI indicator using TA-Lib."""
+    try:
+        if df is None or len(df) < period + 1:
+            return None
+        
+        close_prices = df['close'].values
+        
+        if TALIB_AVAILABLE:
+            rsi = talib.RSI(close_prices, timeperiod=period)
+        else:
+            # Fallback to manual calculation
+            delta = pd.Series(close_prices).diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+        
+        df = df.copy()
+        df[f'RSI_{period}'] = rsi
+        return df
+    except Exception as e:
+        print(f"calculate_rsi error: {e}")
+        return None
+
+def calculate_stochastic(df, k_period=STOCH_K_PERIOD, d_period=STOCH_D_PERIOD):
+    """Calculate Stochastic Oscillator using TA-Lib."""
+    try:
+        if df is None or len(df) < k_period:
+            return None
+            
+        df = df.copy()
+        high_prices = df['high'].values
+        low_prices = df['low'].values
+        close_prices = df['close'].values
+        
+        if TALIB_AVAILABLE:
+            stoch_k, stoch_d = talib.STOCH(high_prices, low_prices, close_prices, 
+                                         fastk_period=k_period, slowk_period=3, 
+                                         slowk_matype=0, slowd_period=d_period, 
+                                         slowd_matype=0)
+        else:
+            # Fallback to manual calculation
+            lowest_low = pd.Series(low_prices).rolling(window=k_period, min_periods=1).min()
+            highest_high = pd.Series(high_prices).rolling(window=k_period, min_periods=1).max()
+            
+            stoch_k = 100 * ((close_prices - lowest_low) / (highest_high - lowest_low))
+            stoch_k = stoch_k.fillna(50)
+            stoch_d = pd.Series(stoch_k).rolling(window=d_period, min_periods=1).mean()
+        
+        # Add to dataframe
+        df['STOCH_K'] = stoch_k
+        df['STOCH_D'] = stoch_d
+        
+        return df
+    except Exception as e:
+        print(f"calculate_stochastic error: {e}")
+        return None
+
+def calculate_bollinger_bands(df, period=BB_PERIOD, std_dev=BB_STD):
+    """Calculate Bollinger Bands using TA-Lib."""
+    try:
+        if df is None or len(df) < period:
+            return None
+            
+        df = df.copy()
+        close_prices = df['close'].values
+        
+        if TALIB_AVAILABLE:
+            upper_band, middle_band, lower_band = talib.BBANDS(close_prices, 
+                                                             timeperiod=period, 
+                                                             nbdevup=std_dev, 
+                                                             nbdevdn=std_dev, 
+                                                             matype=0)
+        else:
+            # Fallback to manual calculation
+            middle_band = pd.Series(close_prices).rolling(window=period, min_periods=1).mean()
+            std = pd.Series(close_prices).rolling(window=period, min_periods=1).std()
+            upper_band = middle_band + (std * std_dev)
+            lower_band = middle_band - (std * std_dev)
+        
+        # Add to dataframe
+        df[f'BB_MIDDLE_{period}'] = middle_band
+        df[f'BB_UPPER_{period}'] = upper_band
+        df[f'BB_LOWER_{period}'] = lower_band
+        
+        return df
+    except Exception as e:
+        print(f"calculate_bollinger_bands error: {e}")
+        return None
+
+# ------------------ Enhanced Analysis Functions with Symmetrical Percentages ------------------
+
+def validate_percentage_calculations(pct1, pct2, name="Percentages"):
+    """Validate that percentages sum to 100% and are within valid range."""
+    total = pct1 + pct2
+    if abs(total - 100.0) > 0.01:  # Allow for small floating point errors
+        print(f"WARNING: {name} don't sum to 100%: {pct1:.2f}% + {pct2:.2f}% = {total:.2f}%")
+        return False
+    if pct1 < 0 or pct1 > 100 or pct2 < 0 or pct2 > 100:
+        print(f"WARNING: {name} out of range: {pct1:.2f}%, {pct2:.2f}%")
+        return False
+    return True
+
+def calculate_symmetrical_percentages(value1, value2, current_value):
+    """Calculate symmetrical percentages that sum to 100% with proper normalization."""
+    try:
+        if value1 == value2:
+            return 50.0, 50.0
+            
+        # Calculate raw distances
+        dist_to_val1 = abs(current_value - value1)
+        dist_to_val2 = abs(current_value - value2)
+        
+        # Calculate symmetrical percentages with proper normalization
+        total_dist = dist_to_val1 + dist_to_val2
+        if total_dist > 0:
+            # Inverted for proximity (closer = higher percentage)
+            pct_val1 = (dist_to_val2 / total_dist) * 100
+            pct_val2 = (dist_to_val1 / total_dist) * 100
+        else:
+            pct_val1 = 50.0
+            pct_val2 = 50.0
+        
+        # Ensure they sum to exactly 100%
+        total_pct = pct_val1 + pct_val2
+        if total_pct > 0:
+            pct_val1 = (pct_val1 / total_pct) * 100
+            pct_val2 = (pct_val2 / total_pct) * 100
+        
+        return pct_val1, pct_val2
+    except Exception as e:
+        print(f"calculate_symmetrical_percentages error: {e}")
+        return 50.0, 50.0
+
+def get_current_price_from_webhook():
+    """Get current price from webhook data, fallback to API if needed"""
+    global webhook_data
+    
+    # Try webhook first
+    if webhook_data['current_price'] is not None:
+        # Check if data is recent (within last 10 seconds)
+        if webhook_data['last_update']:
+            try:
+                last_update = datetime.fromisoformat(webhook_data['last_update'].replace('Z', '+00:00'))
+                time_diff = (datetime.now() - last_update).total_seconds()
+                if time_diff < 10:
+                    return webhook_data['current_price']
+            except:
+                pass
+    
+    # Fallback to API
+    return None
+
+def analyze_argmin_argmax_condition(client, symbol, timeframe='1m', lookback=500):
+    """Analyze argmin vs argmax condition for dip detection with improved percentage calculation."""
+    try:
+        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
+        if not klines or len(klines) < 100:
+            return False, 0.0, 0.0, {"error": "Insufficient data"}
+            
+        df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
+        
+        for c in ['open','high','low','close','volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df.fillna(0.0, inplace=True)
+        
+        close_prices = df['close'].values
+        
+        # Find argmin and argmax
+        argmin_idx = np.argmin(close_prices)
+        argmax_idx = np.argmax(close_prices)
+        
+        # Use webhook for current price if available
+        current_price = get_current_price_from_webhook()
+        if current_price is None:
+            current_price = close_prices[-1]
+        
+        min_price = close_prices[argmin_idx]
+        max_price = close_prices[argmax_idx]
+        
+        # Calculate min, middle, and max threshold values
+        min_threshold = np.min(close_prices)
+        max_threshold = np.max(close_prices)
+        middle_threshold = np.median(close_prices)
+        
+        # Determine which is more recent
+        min_more_recent = argmin_idx > argmax_idx
+        max_more_recent = argmax_idx > argmin_idx
+        
+        # Improved percentage calculation
+        # Calculate position of current price within the min-max range
+        if max_threshold != min_threshold:
+            # Linear interpolation: 0% at min, 100% at max
+            pct_from_min = ((current_price - min_threshold) / (max_threshold - min_threshold)) * 100
+            pct_from_max = ((max_threshold - current_price) / (max_threshold - min_threshold)) * 100
+        else:
+            pct_from_min = 50.0
+            pct_from_max = 50.0
+        
+        # Ensure they sum to exactly 100%
+        total_pct = pct_from_min + pct_from_max
+        if total_pct > 0:
+            pct_from_min = (pct_from_min / total_pct) * 100
+            pct_from_max = (pct_from_max / total_pct) * 100
+        
+        # Validate percentages
+        validate_percentage_calculations(pct_from_min, pct_from_max, "ArgMin/ArgMax percentages")
+        
+        # Condition: min more recent AND current price is closer to min than max
+        # (Lower percentage from min means closer to min)
+        condition_met = min_more_recent and (pct_from_min < pct_from_max)
+        
+        details = {
+            "min_more_recent": min_more_recent,
+            "max_more_recent": max_more_recent,
+            "pct_from_min": pct_from_min,
+            "pct_from_max": pct_from_max,
+            "argmin_idx": argmin_idx,
+            "argmax_idx": argmax_idx,
+            "min_price": min_price,
+            "max_price": max_price,
+            "current_price": current_price,
+            "min_threshold": min_threshold,
+            "middle_threshold": middle_threshold,
+            "max_threshold": max_threshold
+        }
+        
+        return condition_met, pct_from_min, pct_from_max, details
+        
+    except Exception as e:
+        print(f"analyze_argmin_argmax_condition error: {e}")
+        return False, 0.0, 0.0, {"error": str(e)}
+
+def analyze_volume_condition(client, symbol, timeframe='1m', lookback=50):
+    """Analyze volume bullish vs bearish condition with symmetrical percentages."""
+    try:
+        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
+        if not klines or len(klines) < 20:
+            return False, 0.0, 0.0, {"error": "Insufficient data"}
+            
+        df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
+        
+        for c in ['open','high','low','close','volume','taker_buy_base_asset_volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df.fillna(0.0, inplace=True)
+        
+        # Calculate bullish and bearish volume
+        bullish_volume = df['taker_buy_base_asset_volume'].sum()
+        total_volume = df['volume'].sum()
+        bearish_volume = total_volume - bullish_volume
+        
+        # Calculate symmetrical percentages
+        if total_volume > 0:
+            bullish_pct = (bullish_volume / total_volume) * 100
+            bearish_pct = (bearish_volume / total_volume) * 100
+        else:
+            bullish_pct = 50.0
+            bearish_pct = 50.0
+        
+        # Ensure they sum to exactly 100%
+        total_pct = bullish_pct + bearish_pct
+        if total_pct > 0:
+            bullish_pct = (bullish_pct / total_pct) * 100
+            bearish_pct = (bearish_pct / total_pct) * 100
+        
+        # Validate percentages
+        validate_percentage_calculations(bullish_pct, bearish_pct, "Volume percentages")
+        
+        details = {
+            "bullish_volume": bullish_volume,
+            "bearish_volume": bearish_volume,
+            "total_volume": total_volume,
+            "bullish_pct": bullish_pct,
+            "bearish_pct": bearish_pct
+        }
+        
+        # Condition: bullish volume percentage > bearish volume percentage
+        condition_met = bullish_pct > bearish_pct
+        
+        return condition_met, bullish_pct, bearish_pct, details
+        
+    except Exception as e:
+        print(f"analyze_volume_condition error: {e}")
+        return False, 0.0, 0.0, {"error": str(e)}
+
+def analyze_rsi_condition(client, symbol, timeframe='1m', lookback=500):
+    """Analyze RSI oversold/overbought most recent condition using TA-Lib."""
+    try:
+        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
+        if not klines or len(klines) < 100:
+            return False, False, 0.0, {"error": "Insufficient data"}
+            
+        df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
+        
+        for c in ['open','high','low','close']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df.fillna(0.0, inplace=True)
+        
+        # Calculate RSI using TA-Lib
+        df_rsi = calculate_rsi(df, RSI_PERIOD)
+        if df_rsi is None or f'RSI_{RSI_PERIOD}' not in df_rsi.columns:
+            return False, False, 0.0, {"error": "RSI calculation failed"}
+        
+        rsi_values = df_rsi[f'RSI_{RSI_PERIOD}'].values
+        current_rsi = rsi_values[-1]
+        
+        # Find last oversold and overbought occurrences
+        last_oversold_idx = None
+        last_overbought_idx = None
+        
+        for i in range(len(rsi_values) - 1, -1, -1):
+            if last_oversold_idx is None and rsi_values[i] <= RSI_OVERSOLD:
+                last_oversold_idx = i
+            if last_overbought_idx is None and rsi_values[i] >= RSI_OVERBOUGHT:
+                last_overbought_idx = i
+            if last_oversold_idx is not None and last_overbought_idx is not None:
+                break
+        
+        # Determine which is most recent
+        oversold_most_recent = False
+        overbought_most_recent = False
+        
+        if last_oversold_idx is not None and last_overbought_idx is not None:
+            oversold_most_recent = last_oversold_idx > last_overbought_idx
+            overbought_most_recent = last_overbought_idx > last_oversold_idx
+        elif last_oversold_idx is not None:
+            oversold_most_recent = True
+        elif last_overbought_idx is not None:
+            overbought_most_recent = True
+        
+        details = {
+            "current_rsi": current_rsi,
+            "last_oversold_idx": last_oversold_idx,
+            "last_overbought_idx": last_overbought_idx,
+            "oversold_most_recent": oversold_most_recent,
+            "overbought_most_recent": overbought_most_recent
+        }
+        
+        return oversold_most_recent, overbought_most_recent, current_rsi, details
+        
+    except Exception as e:
+        print(f"analyze_rsi_condition error: {e}")
+        return False, False, 0.0, {"error": str(e)}
+
+def analyze_bollinger_bands_condition(client, symbol, timeframe='1m', period=BB_PERIOD, lookback=500):
+    """Analyze Bollinger Bands condition with proper cyclical pattern handling."""
+    try:
+        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
+        if not klines or len(klines) < period:
+            return False, False, {"error": "Insufficient data"}
+            
+        df = pd.DataFrame(klines, columns=['timestamp','open','high','low','close','volume','close_time','quote_asset_volume','number_of_trades','taker_buy_base_asset_volume','taker_buy_quote_asset_volume','ignore'])
+        
+        for c in ['open','high','low','close']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+        df.fillna(0.0, inplace=True)
+        
+        # Calculate Bollinger Bands using TA-Lib
+        df_bb = calculate_bollinger_bands(df, period)
+        if df_bb is None:
+            return False, False, {"error": "Bollinger Bands calculation failed"}
+        
+        close_prices = df_bb['close'].values
+        upper_band = df_bb[f'BB_UPPER_{period}'].values
+        lower_band = df_bb[f'BB_LOWER_{period}'].values
+        
+        # Use webhook for current price if available
+        current_price = get_current_price_from_webhook()
+        if current_price is None:
+            current_price = close_prices[-1]
+        
+        # Find all instances where price crossed below lower band and then back above
+        # and all instances where price crossed above upper band and then back below
+        
+        # Track reversals (crossings)
+        below_lower_crossings = []
+        above_upper_crossings = []
+        
+        # Find crossing points (when price goes from inside to outside the bands)
+        for i in range(1, len(close_prices)):
+            # Check for crossing from inside to below lower band
+            if close_prices[i-1] >= lower_band[i-1] and close_prices[i] < lower_band[i]:
+                below_lower_crossings.append(i)
+            
+            # Check for crossing from inside to above upper band
+            if close_prices[i-1] <= upper_band[i-1] and close_prices[i] > upper_band[i]:
+                above_upper_crossings.append(i)
+        
+        # Find the most recent crossing of each type
+        most_recent_below_lower = below_lower_crossings[-1] if below_lower_crossings else None
+        most_recent_above_upper = above_upper_crossings[-1] if above_upper_crossings else None
+        
+        # Determine which crossing is more recent
+        below_lower_more_recent = False
+        above_upper_more_recent = False
+        
+        if most_recent_below_lower is not None and most_recent_above_upper is not None:
+            below_lower_more_recent = most_recent_below_lower > most_recent_above_upper
+            above_upper_more_recent = most_recent_above_upper > most_recent_below_lower
+        elif most_recent_below_lower is not None:
+            below_lower_more_recent = True
+            above_upper_more_recent = False
+        elif most_recent_above_upper is not None:
+            below_lower_more_recent = False
+            above_upper_more_recent = True
+        
+        # Current position within bands
+        bb_width = upper_band[-1] - lower_band[-1]
+        
+        # Calculate position within the bands (0% at lower, 100% at upper)
+        if bb_width > 0:
+            position_pct = ((current_price - lower_band[-1]) / bb_width) * 100
+        else:
+            position_pct = 50.0  # Middle if no width
+        
+        # Check if price is in the lower portion of the bands
+        in_lower_portion = position_pct < 40.0
+        
+        # Check if price is currently below the lower band
+        currently_below_lower = current_price < lower_band[-1]
+        
+        # NEW LOGIC: Handle cyclical patterns properly
+        # If no crossings have occurred, determine which phase we're in based on price position
+        if most_recent_below_lower is None and most_recent_above_upper is None:
+            # No crossings detected, determine phase based on position
+            # If price is in lower portion, assume we're in a dip phase
+            # If price is in upper portion, assume we're in a peak phase
+            below_lower_more_recent = in_lower_portion
+            above_upper_more_recent = not in_lower_portion
+        
+        # NEW CONDITION: 
+        # 1. The most recent crossing was below the lower band (dip phase)
+        # OR
+        # 2. No crossings detected AND price is in lower portion (dip phase)
+        # AND
+        # 3. Price is in the lower portion of the bands or currently below the lower band
+        
+        condition_met = (below_lower_more_recent or (most_recent_below_lower is None and most_recent_above_upper is None and in_lower_portion)) and (in_lower_portion or currently_below_lower)
+        
+        details = {
+            "most_recent_below_lower": most_recent_below_lower,
+            "most_recent_above_upper": most_recent_above_upper,
+            "below_lower_more_recent": below_lower_more_recent,
+            "above_upper_more_recent": above_upper_more_recent,
+            "current_price": current_price,
+            "bb_upper": upper_band[-1],
+            "bb_lower": lower_band[-1],
+            "bb_width": bb_width,
+            "position_pct": position_pct,
+            "in_lower_portion": in_lower_portion,
+            "currently_below_lower": currently_below_lower,
+            "condition_met": condition_met
+        }
+        
+        return condition_met, False, details
+        
+    except Exception as e:
+        print(f"analyze_bollinger_bands_condition error: {e}")
+        return False, False, {"error": str(e)}
+
+def analyze_momentum_extrema_condition(client, symbol, timeframe='1m', lookback=500):
+    """
+    MOMENTUM EXTREMA ANALYSIS
+    → Analyzes last 500 values to find most recent negative or positive momentum
+    → If most negative is most recent, signal for UP = TRUE
+    → Provides symmetrical comparison between most negative and most positive
+    """
+    try:
+        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
+        if not klines or len(klines) < MOMENTUM_LOOKBACK:
+            return False, 0.0, 0.0, {"error": "Insufficient data"}
+
+        df = pd.DataFrame(klines, columns=[
+            'timestamp','open','high','low','close','volume','close_time',
+            'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
+            'taker_buy_quote_asset_volume','ignore'])
+
+        for c in ['open','high','low','close','volume']:
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+
+        df = df[df['close'] > 0].copy()
+        if len(df) < MOMENTUM_LOOKBACK:
+            return False, 0.0, 0.0, {"error": "Not enough clean candles"}
+
+        close = df['close']
+        
+        # Calculate momentum for the entire lookback period
+        momentum_values = []
+        for i in range(MOMENTUM_PERIOD, len(close)):
+            momentum = close.iloc[i] - close.iloc[i - MOMENTUM_PERIOD]
+            momentum_values.append(momentum)
+        
+        if len(momentum_values) == 0:
+            return False, 0.0, 0.0, {"error": "No momentum values calculated"}
+        
+        # Find most negative and most positive momentum values
+        most_negative_momentum = min(momentum_values)
+        most_positive_momentum = max(momentum_values)
+        
+        # Find indices of these values
+        most_negative_idx = momentum_values.index(most_negative_momentum)
+        most_positive_idx = momentum_values.index(most_positive_momentum)
+        
+        # Determine which is more recent
+        most_negative_more_recent = most_negative_idx > most_positive_idx
+        most_positive_more_recent = most_positive_idx > most_negative_idx
+        
+        # Signal for UP if most negative is most recent
+        signal_for_up = most_negative_more_recent
+        
+        # Calculate symmetrical percentages
+        # We want to show how close current momentum is to each extreme
+        current_momentum = momentum_values[-1] if momentum_values else 0
+        
+        # Calculate distance from each extreme
+        dist_to_negative = abs(current_momentum - most_negative_momentum)
+        dist_to_positive = abs(current_momentum - most_positive_momentum)
+        
+        # Calculate symmetrical percentages
+        total_dist = dist_to_negative + dist_to_positive
+        if total_dist > 0:
+            pct_to_negative = (dist_to_positive / total_dist) * 100
+            pct_to_positive = (dist_to_negative / total_dist) * 100
+        else:
+            pct_to_negative = 50.0
+            pct_to_positive = 50.0
+        
+        # Ensure they sum to exactly 100%
+        total_pct = pct_to_negative + pct_to_positive
+        if total_pct > 0:
+            pct_to_negative = (pct_to_negative / total_pct) * 100
+            pct_to_positive = (pct_to_positive / total_pct) * 100
+        
+        # Validate percentages
+        validate_percentage_calculations(pct_to_negative, pct_to_positive, "Momentum Extrema percentages")
+        
+        details = {
+            "most_negative_momentum": round(most_negative_momentum, 2),
+            "most_positive_momentum": round(most_positive_momentum, 2),
+            "most_negative_idx": most_negative_idx,
+            "most_positive_idx": most_positive_idx,
+            "most_negative_more_recent": most_negative_more_recent,
+            "most_positive_more_recent": most_positive_more_recent,
+            "signal_for_up": signal_for_up,
+            "current_momentum": round(current_momentum, 2),
+            "pct_to_negative": round(pct_to_negative, 2),
+            "pct_to_positive": round(pct_to_positive, 2),
+            "momentum_values_count": len(momentum_values)
+        }
+        
+        return signal_for_up, current_momentum, 0.0, details
+
+    except Exception as e:
+        print(f"analyze_momentum_extrema_condition error: {e}")
+        return False, 0.0, 0.0, {"error": str(e)}
+
+# ------------------ Trade Execution Functions ------------------
+
+def execute_buy_order(client, symbol, usdc_amount):
+    """Execute a market buy order using a percentage of available USDC."""
+    try:
+        # Use webhook price if available for more accurate execution
+        current_price = get_current_price_from_webhook()
+        if current_price is None:
+            ticker = client.get_symbol_ticker(symbol=symbol)
+            current_price = float(ticker['price'])
+        
+        # Use only a percentage of available balance for risk management
+        max_usdc = usdc_amount * (MAX_POSITION_PERCENT / 100)
+        quantity = max_usdc / current_price * 0.99  # 1% buffer for fees
+        
+        symbol_info = client.get_symbol_info(symbol)
+        lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+        if lot_size_filter:
+            step_size = float(lot_size_filter['step_size'])
+            quantity = round(quantity - (quantity % step_size), 8)
+        
+        order = client.order_market_buy(
+            symbol=symbol,
+            quantity=quantity
+        )
+        
+        return {
+            'success': True,
+            'order_id': order['orderId'],
+            'symbol': symbol,
+            'quantity': quantity,
+            'price': current_price,
+            'cost': quantity * current_price,
+            'timestamp': datetime.now(),
+            'order': order
+        }
+    except BinanceAPIException as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+def execute_sell_order(client, symbol, quantity):
+    """Execute a market sell order."""
+    try:
+        symbol_info = client.get_symbol_info(symbol)
+        lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
+        if lot_size_filter:
+            step_size = float(lot_size_filter['step_size'])
+            quantity = round(quantity - (quantity % step_size), 8)
+        
+        order = client.order_market_sell(
+            symbol=symbol,
+            quantity=quantity
+        )
+        
+        return {
+            'success': True,
+            'order_id': order['orderId'],
+            'symbol': symbol,
+            'quantity': quantity,
+            'timestamp': datetime.now(),
+            'order': order
+        }
+    except BinanceAPIException as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+def get_current_price(client, symbol):
+    """Get current price for a symbol."""
+    # Try webhook first
+    price = get_current_price_from_webhook()
+    if price is not None:
+        return price
+    
+    # Fallback to API
+    try:
+        ticker = client.get_symbol_ticker(symbol=symbol)
+        return float(ticker['price'])
+    except Exception as e:
+        print(f"Error getting current price: {e}")
+        return None
+
+def get_account_balance(client, asset):
+    """Get balance of a specific asset in the account."""
+    try:
+        account_info = client.get_account()
+        for balance in account_info['balances']:
+            if balance['asset'] == asset:
+                return float(balance['free'])
+        return 0.0
+    except Exception as e:
+        print(f"Error getting account balance: {e}")
+        return 0.0
+
+def check_trade_status(client):
+    """Check if profit target or stop loss is reached for active trade."""
+    global trade_active, trade_info
+    
+    if not trade_active:
+        return False
+    
+    try:
+        # Use webhook price for more accurate monitoring
+        current_price = get_current_price(client, SYMBOL)
+        if current_price is None:
+            return False
+        
+        entry_price = trade_info['entry_price']
+        quantity = trade_info['quantity']
+        
+        target_price = entry_price * (1 + (PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT) / 100)
+        stop_loss_price = entry_price * (1 - STOP_LOSS_PERCENT / 100)
+        
+        price_diff = current_price - entry_price
+        price_diff_pct = (price_diff / entry_price) * 100
+        time_elapsed = datetime.now() - trade_info['entry_time']
+        
+        target_diff = target_price - current_price
+        target_diff_pct = (target_diff / current_price) * 100
+        
+        stop_loss_diff = current_price - stop_loss_price
+        stop_loss_diff_pct = (stop_loss_diff / current_price) * 100
+        
+        # Update trade info
+        trade_info.update({
+            'current_price': current_price,
+            'price_diff': price_diff,
+            'price_diff_pct': price_diff_pct,
+            'time_elapsed': time_elapsed,
+            'target_price': target_price,
+            'target_diff': target_diff,
+            'target_diff_pct': target_diff_pct,
+            'stop_loss_price': stop_loss_price,
+            'stop_loss_diff': stop_loss_diff,
+            'stop_loss_diff_pct': stop_loss_diff_pct
+        })
+        
+        # Check for profit target
+        if current_price >= target_price:
+            print(f"\nPROFIT TARGET REACHED! Selling at {current_price:.6f}")
+            sell_result = execute_sell_order(client, SYMBOL, quantity)
+            
+            if sell_result['success']:
+                print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
+                print(f"Order ID: {sell_result['order_id']}")
+                print(f"Quantity Sold: {sell_result['quantity']}")
+                print(f"Estimated Profit: {(current_price - entry_price) * quantity:.6f} USDC")
+                trade_active = False
+                trade_info = {}
+                return True
+            else:
+                print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
+        
+        # Check for stop loss
+        if current_price <= stop_loss_price:
+            print(f"\nSTOP LOSS TRIGGERED! Selling at {current_price:.6f}")
+            sell_result = execute_sell_order(client, SYMBOL, quantity)
+            
+            if sell_result['success']:
+                print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
+                print(f"Order ID: {sell_result['order_id']}")
+                print(f"Quantity Sold: {sell_result['quantity']}")
+                print(f"Estimated Loss: {(current_price - entry_price) * quantity:.6f} USDC")
+                trade_active = False
+                trade_info = {}
+                return True
+            else:
+                print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
+        
+        return False
+        
+    except Exception as e:
+        print(f"Error checking trade status: {e}")
+        return False
+
+def display_trade_status():
+    """Display current trade status if active."""
+    global trade_active, trade_info
+    
+    if not trade_active:
+        return
+    
+    print("\n" + "="*80)
+    print("TRADE MONITOR - ACTIVE POSITION")
+    print("="*80)
+    print(f"{'Symbol:':<20}{trade_info['symbol']}")
+    print(f"{'Entry Price:':<20}{trade_info['entry_price']:.6f}")
+    print(f"{'Entry Time:':<20}{trade_info['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'Current Price:':<20}{trade_info['current_price']:.6f}")
+    print(f"{'Price Difference:':<20}{trade_info['price_diff']:+.6f} ({trade_info['price_diff_pct']:+.2f}%)")
+    print(f"{'Time Elapsed:':<20}{trade_info['time_elapsed']}")
+    print(f"{'Target Price:':<20}{trade_info['target_price']:.6f}")
+    print(f"{'Distance to Target:':<20}{trade_info['target_diff']:.6f} ({trade_info['target_diff_pct']:.2f}%)")
+    print(f"{'Stop Loss Price:':<20}{trade_info['stop_loss_price']:.6f}")
+    print(f"{'Distance to Stop Loss:':<20}{trade_info['stop_loss_diff']:.6f} ({trade_info['stop_loss_diff_pct']:.2f}%)")
+    print(f"{'Quantity:':<20}{trade_info['quantity']}")
+    print("="*80)
+
+# ------------------ Main Analysis Function ------------------
+
+def perform_single_iteration_analysis(client):
+    """Perform single iteration analysis with all conditions."""
+    global trade_active, trade_info
+    
+    # Clear screen for fresh iteration
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
+    print("="*80)
+    print(f"BTCUSDC TRADING BOT - MOMENTUM EXTREMA ANALYSIS")
+    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Webhook Status: {'Connected' if webhook_data['current_price'] else 'Waiting for data'}")
+    if webhook_data['current_price']:
+        print(f"Webhook Price: {webhook_data['current_price']:.2f}")
+    print("="*80)
+    
+    # If trade is active, check status and display
+    if trade_active:
+        print("\n>>> TRADE ACTIVE - CHECKING STATUS <<<")
+        trade_closed = check_trade_status(client)
+        display_trade_status()
+        
+        if trade_closed:
+            print("\nTrade closed. Resuming normal analysis...")
+        else:
+            print("\nTrade still active. Waiting for next iteration...")
+            return
+    
+    # Step 1: Check and convert BTC dust (only when no active trade)
+    print("\n1. Checking for BTC dust...")
+    dust_success = convert_btc_dust_to_usdc(client)
+    if not dust_success:
+        print("Dust conversion failed or not needed")
+    
+    # Step 2: Get current balance
+    usdc_balance = get_account_balance(client, 'USDC')
+    print(f"USDC Balance: {usdc_balance:.2f}")
+    
+    if usdc_balance < MIN_TRADE_AMOUNT:
+        print(f"!!! INSUFFICIENT USDC BALANCE - MINIMUM REQUIRED: {MIN_TRADE_AMOUNT} !!!")
+        return
+    
+    # Step 3: Perform all condition analyses
+    print("\n2. Performing technical analysis...")
+    
+    conditions_met = 0
+    total_conditions = 4  # Reduced to 4 conditions
+    condition_details = {}
+    condition_results = {}  # Store individual condition results
+    
+    # Condition 1: ArgMin vs ArgMax for 1m timeframe only
+    print("\n--- Condition 1: ArgMin vs ArgMax Analysis ---")
+    argmin_met, pct_min, pct_max, details = analyze_argmin_argmax_condition(client, SYMBOL, '1m', 500)
+    condition_details['argmin'] = {
+        'met': argmin_met,
+        'pct_min': pct_min,
+        'pct_max': pct_max,
+        'details': details
+    }
+    condition_results['ArgMin vs ArgMax'] = argmin_met
+    
+    # Print details for this condition - ONLY FOR ARGMIN VS ARGMAX (with threshold labels)
+    min_threshold = details.get('min_threshold', 0)
+    middle_threshold = details.get('middle_threshold', 0)
+    max_threshold = details.get('max_threshold', 0)
+    current_price = details.get('current_price', 0)
+    
+    print(f"\nTimeframe: 1m")
+    print(f"Most recent extrema was found at argmin: {details.get('min_more_recent', False)}")
+    print(f"Most recent extrema was found at argmax: {details.get('max_more_recent', False)}")
+    print(f"Pct from Min: {pct_min:.2f}%")
+    print(f"Pct from Max: {pct_max:.2f}%")
+    print(f"Min threshold: {min_threshold:.2f}")
+    print(f"Middle threshold: {middle_threshold:.2f}")
+    print(f"Max threshold: {max_threshold:.2f}")
+    print(f"Current Price: {current_price:.2f}")  # Print current price only for argmin vs argmax
+    print(f"Close below middle threshold: {current_price < middle_threshold}")
+    print(f"Close above middle threshold: {current_price > middle_threshold}")
+    print(f"Condition Met: {argmin_met}")
+    
+    if argmin_met:
+        conditions_met += 1
+        print("\nTRUE - ArgMin condition MET")
+    else:
+        print("\nFALSE - ArgMin condition NOT met")
+    
+    # Condition 2: Volume Bullish vs Bearish
+    print("\n--- Condition 2: Volume Analysis ---")
+    volume_met, bull_pct, bear_pct, vol_details = analyze_volume_condition(client, SYMBOL, '1m', 50)
+    condition_details['volume'] = {
+        'met': volume_met,
+        'bull_pct': bull_pct,
+        'bear_pct': bear_pct,
+        'details': vol_details
+    }
+    condition_results['Volume Bullish > Bearish'] = volume_met
+    
+    # Print details for this condition - WITHOUT threshold labels
+    print(f"\nBullish Volume: {bull_pct:.2f}%")
+    print(f"Bearish Volume: {bear_pct:.2f}%")
+    print(f"Condition Met: {volume_met}")
+    
+    if volume_met:
+        conditions_met += 1
+        print("\nTRUE - Volume condition MET")
+    else:
+        print("\nFALSE - Volume condition NOT met")
+    
+    # Condition 3: RSI Condition
+    print("\n--- Condition 3: RSI Analysis ---")
+    rsi_oversold_recent, rsi_overbought_recent, current_rsi, rsi_details = analyze_rsi_condition(client, SYMBOL, '1m', 500)
+    condition_details['rsi'] = {
+        'oversold_most_recent': rsi_oversold_recent,
+        'overbought_most_recent': rsi_overbought_recent,
+        'current_rsi': current_rsi,
+        'details': rsi_details
+    }
+    condition_results['RSI Oversold Most Recent'] = rsi_oversold_recent and not rsi_overbought_recent
+    
+    # Print details for this condition - WITHOUT threshold labels
+    print(f"\nCurrent RSI: {current_rsi:.2f}")
+    print(f"Oversold Most Recent: {rsi_oversold_recent}")
+    print(f"Overbought Most Recent: {rsi_overbought_recent}")
+    print(f"Condition Met: {rsi_oversold_recent and not rsi_overbought_recent}")
+    
+    if rsi_oversold_recent and not rsi_overbought_recent:
+        conditions_met += 1
+        print("\nTRUE - RSI condition MET")
+    else:
+        print("\nFALSE - RSI condition NOT met")
+    
+    # Condition 4: Momentum Extrema Analysis (replaces Nuclear Pump Engine and Volatility Rules)
+    print("\n--- Condition 4: Momentum Extrema Analysis ---")
+    momentum_met, current_momentum, vol_ratio, mom_details = analyze_momentum_extrema_condition(client, SYMBOL, '1m', 500)
+    condition_details['momentum'] = {
+        'met': momentum_met,
+        'current_momentum': current_momentum,
+        'vol_ratio': vol_ratio,
+        'details': mom_details
+    }
+    condition_results['Momentum Extrema'] = momentum_met
+    
+    # Print details for this condition - with detailed momentum extrema information
+    print(f"\n--- Condition 4: Momentum Extrema Analysis ---")
+    print(f"┌─ Momentum Extrema (Last 500 values)")
+    print(f"│  → Most Negative Momentum: {mom_details['most_negative_momentum']}")
+    print(f"│  → Most Positive Momentum: {mom_details['most_positive_momentum']}")
+    print(f"│  → Current Momentum: {mom_details['current_momentum']}")
+    print(f"├─ Recent Occurrence Analysis")
+    print(f"│  → Signal for UP: {'TRUE' if mom_details['signal_for_up'] else 'FALSE'}")
+    print(f"├─ Symmetrical Comparison")
+    print(f"│  → Pct to Negative: {mom_details['pct_to_negative']:.2f}%")
+    print(f"│  → Pct to Positive: {mom_details['pct_to_positive']:.2f}%")
+    print(f"│  → Most Recent Extrema was found at Most Negative: {'TRUE' if mom_details['most_negative_more_recent'] else 'FALSE'}")
+    print(f"│  → Most Recent Extrema was found at Most Positive: {'TRUE' if mom_details['most_positive_more_recent'] else 'FALSE'}")
+    print(f"└─ FINAL MOMENTUM SIGNAL: {'UP SIGNAL' if momentum_met else 'NO SIGNAL'}")
+
+    if momentum_met:
+        conditions_met += 1
+        print("\nMOMENTUM EXTREMA CONFIRMED — MOST NEGATIVE MOST RECENT — UP SIGNAL DETECTED")
+    else:
+        print("\nNo momentum extrema signal — waiting for clearer pattern")
+    
+    # Step 4: Trading Decision
+    print("\n" + "="*80)
+    print("TRADING DECISION")
+    print("="*80)
+    print(f"Conditions Met: {conditions_met}/{total_conditions}")
+    
+    # Print individual condition results
+    print("\nCondition Summary:")
+    print("-" * 65)
+    for condition_name, result in condition_results.items():
+        status = "TRUE" if result else "FALSE"
+        print(f"{condition_name:<50}{status}")
+    print("-" * 65)
+    
+    # All conditions must be met for trade entry
+    if conditions_met == total_conditions:
+        print("\n!!! ALL CONDITIONS MET - EXECUTING TRADE !!!")
+        
+        # Execute buy order with a percentage of USDC balance
+        buy_result = execute_buy_order(client, SYMBOL, usdc_balance)
+        
+        if buy_result['success']:
+            print(f"\nBUY ORDER EXECUTED SUCCESSFULLY!")
+            print(f"Order ID: {buy_result['order_id']}")
+            print(f"Quantity: {buy_result['quantity']:.6f}")
+            print(f"Price: {buy_result['price']:.6f}")
+            print(f"Cost: {buy_result['cost']:.2f} USDC ({MAX_POSITION_PERCENT}% of balance)")
+            
+            # Set trade active and store trade info
+            trade_active = True
+            trade_info = {
+                'symbol': buy_result['symbol'],
+                'entry_price': buy_result['price'],
+                'entry_time': buy_result['timestamp'],
+                'quantity': buy_result['quantity'],
+                'order_id': buy_result['order_id']
+            }
+            
+            # Initialize trade info with current price
+            current_price = get_current_price(client, SYMBOL)
+            if current_price:
+                trade_info.update({
+                    'current_price': current_price,
+                    'price_diff': current_price - buy_result['price'],
+                    'price_diff_pct': ((current_price - buy_result['price']) / buy_result['price']) * 100,
+                    'time_elapsed': datetime.now() - buy_result['timestamp']
+                })
+        else:
+            print(f"\nERROR EXECUTING BUY ORDER: {buy_result['error']}")
+    else:
+        print("\n!!! CONDITIONS NOT MET - NO TRADE EXECUTED !!!")
+        print("Waiting for next iteration...")
+    
+    # Step 5: Cleanup for next iteration
+    print("\nCleaning up for next iteration...")
+    gc.collect()
+
+# ------------------ Main Loop ------------------
+
+def get_binance_client():
+    if not os.path.exists(API_FILE):
+        print(f"API file '{API_FILE}' not found. Create with key then secret on two lines.")
+        return None
+    try:
+        with open(API_FILE, 'r') as f:
+            api_key = f.readline().strip()
+            api_secret = f.readline().strip()
+        return Client(api_key, api_secret)
+    except Exception as e:
+        print(f"Error reading API file: {e}")
+        return None
+
+def main():
+    client = get_binance_client()
+    if not client:
+        print("No client available. Exiting.")
+        return
+    
+    # Start webhook server in a separate thread
+    webhook_thread = threading.Thread(target=start_webhook_server, daemon=True)
+    webhook_thread.start()
+    print(f"Webhook server started on port {WEBHOOK_PORT}")
+    
+    print("=== BTCUSDC TRADING BOT - MOMENTUM EXTREMA ANALYSIS ===")
+    print("Press Ctrl+C to stop monitoring.")
+    print("Webhook endpoint: http://localhost:5000/webhook/price")
+    print("Health check: http://localhost:5000/health")
+    print("\nEach iteration will:")
+    print("1. Check and convert BTC dust")
+    print("2. Use webhook data for real-time price updates")
+    print("3. Analyze all 4 trading conditions") 
+    print("4. Execute trade if ALL conditions met")
+    print("5. Use a percentage of USDC balance for entry")
+    print("6. Monitor for profit target or stop loss every 5 seconds")
+    print("7. Clean up for next iteration")
+    print("\nMomentum Extrema Analysis:")
+    print("- Analyzes last 500 momentum values")
+    print("- Identifies most negative and most positive momentum")
+    print("- Signals UP if most negative momentum is most recent")
+    print("- Provides symmetrical comparison between extremes")
+    print("="*60)
+    
+    iteration_count = 0
+    
+    while not stop_event.is_set():
+        iteration_count += 1
+        print(f"\n>>> Starting Iteration #{iteration_count} <<<")
+        
+        try:
+            perform_single_iteration_analysis(client)
+        except Exception as e:
+            print(f"Error in iteration #{iteration_count}: {e}")
+        
+        # Always wait 5 seconds between iterations, regardless of trade status
+        wait_time = MIN_ITERATION_INTERVAL
+        print(f"\nWaiting {wait_time} seconds before next iteration...")
+        for i in range(wait_time, 0, -1):
+            if stop_event.is_set():
+                break
+            print(f"\rNext iteration in: {i:2d} seconds", end="")
+            time.sleep(1)
+        print("\r" + " " * 30 + "\r")
+    
+    print("\nTrading bot stopped.")
+
+if __name__ == "__main__":
+    main()
