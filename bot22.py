@@ -72,7 +72,7 @@ BB_STD = 2
 MOMENTUM_PERIOD = 10
 
 # API Rate Limiting
-MIN_ITERATION_INTERVAL = 15  # Minimum 15 seconds between iterations
+MIN_ITERATION_INTERVAL = 5  # 5 seconds between iterations
 
 # Global stop event
 stop_event = threading.Event()
@@ -980,109 +980,114 @@ def get_account_balance(client, asset):
         print(f"Error getting account balance: {e}")
         return 0.0
 
-def monitor_trade(client, symbol, entry_price, entry_time, quantity):
-    """Monitor the trade and sell when profit target or stop loss is reached."""
+def check_trade_status(client):
+    """Check if profit target or stop loss is reached for active trade."""
     global trade_active, trade_info
     
-    target_price = entry_price * (1 + (PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT) / 100)
-    stop_loss_price = entry_price * (1 - STOP_LOSS_PERCENT / 100)
+    if not trade_active:
+        return False
     
-    while trade_active and not stop_event.is_set():
-        try:
-            current_price = get_current_price(client, symbol)
-            if current_price is None:
-                time.sleep(5)
-                continue
+    try:
+        current_price = get_current_price(client, SYMBOL)
+        if current_price is None:
+            return False
+        
+        entry_price = trade_info['entry_price']
+        quantity = trade_info['quantity']
+        
+        target_price = entry_price * (1 + (PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT) / 100)
+        stop_loss_price = entry_price * (1 - STOP_LOSS_PERCENT / 100)
+        
+        price_diff = current_price - entry_price
+        price_diff_pct = (price_diff / entry_price) * 100
+        time_elapsed = datetime.now() - trade_info['entry_time']
+        
+        target_diff = target_price - current_price
+        target_diff_pct = (target_diff / current_price) * 100
+        
+        stop_loss_diff = current_price - stop_loss_price
+        stop_loss_diff_pct = (stop_loss_diff / current_price) * 100
+        
+        # Update trade info
+        trade_info.update({
+            'current_price': current_price,
+            'price_diff': price_diff,
+            'price_diff_pct': price_diff_pct,
+            'time_elapsed': time_elapsed,
+            'target_price': target_price,
+            'target_diff': target_diff,
+            'target_diff_pct': target_diff_pct,
+            'stop_loss_price': stop_loss_price,
+            'stop_loss_diff': stop_loss_diff,
+            'stop_loss_diff_pct': stop_loss_diff_pct
+        })
+        
+        # Check for profit target
+        if current_price >= target_price:
+            print(f"\nPROFIT TARGET REACHED! Selling at {current_price:.6f}")
+            sell_result = execute_sell_order(client, SYMBOL, quantity)
             
-            price_diff = current_price - entry_price
-            price_diff_pct = (price_diff / entry_price) * 100
-            time_elapsed = datetime.now() - entry_time
+            if sell_result['success']:
+                print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
+                print(f"Order ID: {sell_result['order_id']}")
+                print(f"Quantity Sold: {sell_result['quantity']}")
+                print(f"Estimated Profit: {(current_price - entry_price) * quantity:.6f} USDC")
+                trade_active = False
+                trade_info = {}
+                return True
+            else:
+                print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
+        
+        # Check for stop loss
+        if current_price <= stop_loss_price:
+            print(f"\nSTOP LOSS TRIGGERED! Selling at {current_price:.6f}")
+            sell_result = execute_sell_order(client, SYMBOL, quantity)
             
-            target_diff = target_price - current_price
-            target_diff_pct = (target_diff / current_price) * 100
-            
-            stop_loss_diff = current_price - stop_loss_price
-            stop_loss_diff_pct = (stop_loss_diff / current_price) * 100
-            
-            trade_info = {
-                'symbol': symbol,
-                'entry_price': entry_price,
-                'current_price': current_price,
-                'price_diff': price_diff,
-                'price_diff_pct': price_diff_pct,
-                'time_elapsed': time_elapsed,
-                'target_price': target_price,
-                'target_diff': target_diff,
-                'target_diff_pct': target_diff_pct,
-                'stop_loss_price': stop_loss_price,
-                'stop_loss_diff': stop_loss_diff,
-                'stop_loss_diff_pct': stop_loss_diff_pct,
-                'quantity': quantity
-            }
-            
-            os.system('cls' if os.name == 'nt' else 'clear')
-            print("="*80)
-            print("TRADE MONITOR - ACTIVE POSITION")
-            print("="*80)
-            print(f"{'Symbol:':<20}{symbol}")
-            print(f"{'Entry Price:':<20}{entry_price:.6f}")
-            print(f"{'Entry Time:':<20}{entry_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            print(f"{'Current Price:':<20}{current_price:.6f}")
-            print(f"{'Price Difference:':<20}{price_diff:+.6f} ({price_diff_pct:+.2f}%)")
-            print(f"{'Time Elapsed:':<20}{time_elapsed}")
-            print(f"{'Target Price:':<20}{target_price:.6f}")
-            print(f"{'Distance to Target:':<20}{target_diff:.6f} ({target_diff_pct:.2f}%)")
-            print(f"{'Stop Loss Price:':<20}{stop_loss_price:.6f}")
-            print(f"{'Distance to Stop Loss:':<20}{stop_loss_diff:.6f} ({stop_loss_diff_pct:.2f}%)")
-            print(f"{'Quantity:':<20}{quantity}")
-            print("="*80)
-            
-            # Check for profit target
-            if current_price >= target_price:
-                print(f"PROFIT TARGET REACHED! Selling at {current_price:.6f}")
-                sell_result = execute_sell_order(client, symbol, quantity)
-                
-                if sell_result['success']:
-                    print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
-                    print(f"Order ID: {sell_result['order_id']}")
-                    print(f"Quantity Sold: {sell_result['quantity']}")
-                    print(f"Estimated Profit: {(current_price - entry_price) * quantity:.6f} USDC")
-                    trade_active = False
-                    return True
-                else:
-                    print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
-            
-            # Check for stop loss
-            if current_price <= stop_loss_price:
-                print(f"STOP LOSS TRIGGERED! Selling at {current_price:.6f}")
-                sell_result = execute_sell_order(client, symbol, quantity)
-                
-                if sell_result['success']:
-                    print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
-                    print(f"Order ID: {sell_result['order_id']}")
-                    print(f"Quantity Sold: {sell_result['quantity']}")
-                    print(f"Estimated Loss: {(current_price - entry_price) * quantity:.6f} USDC")
-                    trade_active = False
-                    return True
-                else:
-                    print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
-            
-            time.sleep(5)
-        except Exception as e:
-            print(f"Error in trade monitoring: {e}")
-            time.sleep(5)
+            if sell_result['success']:
+                print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
+                print(f"Order ID: {sell_result['order_id']}")
+                print(f"Quantity Sold: {sell_result['quantity']}")
+                print(f"Estimated Loss: {(current_price - entry_price) * quantity:.6f} USDC")
+                trade_active = False
+                trade_info = {}
+                return True
+            else:
+                print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
+        
+        return False
+        
+    except Exception as e:
+        print(f"Error checking trade status: {e}")
+        return False
+
+def display_trade_status():
+    """Display current trade status if active."""
+    global trade_active, trade_info
     
-    return False
+    if not trade_active:
+        return
+    
+    print("\n" + "="*80)
+    print("TRADE MONITOR - ACTIVE POSITION")
+    print("="*80)
+    print(f"{'Symbol:':<20}{trade_info['symbol']}")
+    print(f"{'Entry Price:':<20}{trade_info['entry_price']:.6f}")
+    print(f"{'Entry Time:':<20}{trade_info['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"{'Current Price:':<20}{trade_info['current_price']:.6f}")
+    print(f"{'Price Difference:':<20}{trade_info['price_diff']:+.6f} ({trade_info['price_diff_pct']:+.2f}%)")
+    print(f"{'Time Elapsed:':<20}{trade_info['time_elapsed']}")
+    print(f"{'Target Price:':<20}{trade_info['target_price']:.6f}")
+    print(f"{'Distance to Target:':<20}{trade_info['target_diff']:.6f} ({trade_info['target_diff_pct']:.2f}%)")
+    print(f"{'Stop Loss Price:':<20}{trade_info['stop_loss_price']:.6f}")
+    print(f"{'Distance to Stop Loss:':<20}{trade_info['stop_loss_diff']:.6f} ({trade_info['stop_loss_diff_pct']:.2f}%)")
+    print(f"{'Quantity:':<20}{trade_info['quantity']}")
+    print("="*80)
 
 # ------------------ Main Analysis Function ------------------
 
 def perform_single_iteration_analysis(client):
     """Perform single iteration analysis with all conditions."""
-    global trade_active
-    
-    if trade_active:
-        print("Trade already active, skipping analysis...")
-        return
+    global trade_active, trade_info
     
     # Clear screen for fresh iteration
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -1092,7 +1097,19 @@ def perform_single_iteration_analysis(client):
     print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("="*80)
     
-    # Step 1: Check and convert BTC dust
+    # If trade is active, check status and display
+    if trade_active:
+        print("\n>>> TRADE ACTIVE - CHECKING STATUS <<<")
+        trade_closed = check_trade_status(client)
+        display_trade_status()
+        
+        if trade_closed:
+            print("\nTrade closed. Resuming normal analysis...")
+        else:
+            print("\nTrade still active. Waiting for next iteration...")
+            return
+    
+    # Step 1: Check and convert BTC dust (only when no active trade)
     print("\n1. Checking for BTC dust...")
     dust_success = convert_btc_dust_to_usdc(client)
     if not dust_success:
@@ -1342,9 +1359,25 @@ def perform_single_iteration_analysis(client):
             print(f"Price: {buy_result['price']:.6f}")
             print(f"Cost: {buy_result['cost']:.2f} USDC ({MAX_POSITION_PERCENT}% of balance)")
             
-            # Start trade monitoring
+            # Set trade active and store trade info
             trade_active = True
-            monitor_trade(client, SYMBOL, buy_result['price'], buy_result['timestamp'], buy_result['quantity'])
+            trade_info = {
+                'symbol': buy_result['symbol'],
+                'entry_price': buy_result['price'],
+                'entry_time': buy_result['timestamp'],
+                'quantity': buy_result['quantity'],
+                'order_id': buy_result['order_id']
+            }
+            
+            # Initialize trade info with current price
+            current_price = get_current_price(client, SYMBOL)
+            if current_price:
+                trade_info.update({
+                    'current_price': current_price,
+                    'price_diff': current_price - buy_result['price'],
+                    'price_diff_pct': ((current_price - buy_result['price']) / buy_result['price']) * 100,
+                    'time_elapsed': datetime.now() - buy_result['timestamp']
+                })
         else:
             print(f"\nERROR EXECUTING BUY ORDER: {buy_result['error']}")
     else:
@@ -1383,7 +1416,7 @@ def main():
     print("2. Analyze all 7 trading conditions with symmetrical percentages") 
     print("3. Execute trade if ALL conditions met")
     print("4. Use a percentage of USDC balance for entry")
-    print("5. Monitor for profit target or stop loss")
+    print("5. Monitor for profit target or stop loss every 5 seconds")
     print("6. Clean up for next iteration")
     print("="*60)
     
@@ -1398,20 +1431,15 @@ def main():
         except Exception as e:
             print(f"Error in iteration #{iteration_count}: {e}")
         
-        # Wait before next iteration with improved rate limiting
-        if not trade_active:
-            wait_time = max(MIN_ITERATION_INTERVAL, 5)
-            print(f"\nWaiting {wait_time} seconds before next iteration...")
-            for i in range(wait_time, 0, -1):
-                if stop_event.is_set():
-                    break
-                print(f"\rNext iteration in: {i:2d} seconds", end="")
-                time.sleep(1)
-            print("\r" + " " * 30 + "\r")
-        else:
-            # If trade is active, wait longer
-            print("Trade active, waiting 5 minutes before next analysis...")
-            time.sleep(300)
+        # Always wait 5 seconds between iterations, regardless of trade status
+        wait_time = MIN_ITERATION_INTERVAL
+        print(f"\nWaiting {wait_time} seconds before next iteration...")
+        for i in range(wait_time, 0, -1):
+            if stop_event.is_set():
+                break
+            print(f"\rNext iteration in: {i:2d} seconds", end="")
+            time.sleep(1)
+        print("\r" + " " * 30 + "\r")
     
     print("\nTrading bot stopped.")
 
