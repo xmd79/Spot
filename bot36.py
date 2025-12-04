@@ -3,7 +3,7 @@
 ENHANCED BTCUSDC TRADING BOT - DMI AND FAST SCALP ANALYSIS
 → Creates artificial 15-second timeframe from 1-minute data
 → Uses TA-Lib HT Sine for wave analysis
-→ Implements Argmin/Argmax detection on 15-second timeframe
+→ Implements Local Dip/Top detection on 1-minute timeframe
 → Uses DMI (Directional Movement Index) for fast scalping
 → Adds ML linear regression forecasting
 → RSI now also uses 15-second timeframe for consistency
@@ -66,6 +66,9 @@ RSI_OVERBOUGHT = 70
 
 # Artificial 15-second timeframe configuration
 SEC15_FACTOR = 4  # 1-minute / 15 seconds = 4
+
+# Local Dip/Top Detection Configuration
+LOCAL_DIP_WINDOW = 5  # Window size for local dip/top detection
 
 # API Rate Limiting
 MIN_ITERATION_INTERVAL = 5  # 5 seconds between iterations
@@ -534,71 +537,112 @@ def ml_linear_regression_forecast(df, forecast_periods=4):
         print(f"ml_linear_regression_forecast error: {e}")
         return None
 
-# ------------------ Argmin/Argmax Analysis Function ------------------
+# ------------------ Local Dip/Top Detection ------------------
 
-def analyze_argmin_argmax_15sec(client, symbol, limit=56):
-    """Analyze the last 'limit' values of the 15-second timeframe for argmin/argmax."""
+def detect_local_dips_tops(df, window=5):
+    """Detect local dips and tops in price data."""
     try:
-        # Get 1-minute data first
-        lookback = math.ceil(limit / SEC15_FACTOR) + 10  # Get more 1-minute candles to ensure enough 15-second data
+        if df is None or len(df) < window * 2 + 1:
+            return None
+        
+        df = df.copy()
+        close_prices = df['close'].values.astype(float)
+        
+        # Initialize arrays for dips and tops
+        is_dip = np.zeros(len(close_prices), dtype=bool)
+        is_top = np.zeros(len(close_prices), dtype=bool)
+        
+        # Detect local dips and tops
+        for i in range(window, len(close_prices) - window):
+            # Check if current point is a local dip
+            is_dip[i] = all(close_prices[i] <= close_prices[j] for j in range(i - window, i + window + 1) if j != i)
+            
+            # Check if current point is a local top
+            is_top[i] = all(close_prices[i] >= close_prices[j] for j in range(i - window, i + window + 1) if j != i)
+        
+        df['is_dip'] = is_dip
+        df['is_top'] = is_top
+        
+        return df
+    except Exception as e:
+        print(f"detect_local_dips_tops error: {e}")
+        return None
+
+def analyze_local_dip_condition(client, symbol, lookback=100):
+    """Analyze local dip condition on 1-minute timeframe."""
+    try:
+        # Get 1-minute data
         klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
         if not klines or len(klines) < 1:
-            print("No 1-minute data available for 15-second timeframe creation")
+            print("No 1-minute data available for local dip analysis")
             return False, {"error": "No data available"}
             
-        df_1m = pd.DataFrame(klines, columns=[
+        df = pd.DataFrame(klines, columns=[
             'timestamp','open','high','low','close','volume','close_time',
             'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
             'taker_buy_quote_asset_volume','ignore'])
         
         # Convert timestamp to datetime
-        df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
         # Clean OHLC data
-        df_1m = clean_ohlc_data(df_1m)
+        df = clean_ohlc_data(df)
         
-        # Create artificial 15-second timeframe
-        df_15sec = create_15sec_timeframe(df_1m)
+        # Detect local dips and tops
+        df = detect_local_dips_tops(df, LOCAL_DIP_WINDOW)
         
-        # Get the last 'limit' values
-        if len(df_15sec) > limit:
-            df_15sec = df_15sec.tail(limit).reset_index(drop=True)
+        if df is None or 'is_dip' not in df.columns:
+            return False, {"error": "Failed to detect local dips and tops"}
         
-        # Convert OHLCV to float
-        for col in ['open', 'high', 'low', 'close', 'volume']:
-            df_15sec[col] = pd.to_numeric(df_15sec[col], errors='coerce')
+        # Find the most recent dip and top
+        dip_indices = df[df['is_dip']].index.tolist()
+        top_indices = df[df['is_top']].index.tolist()
         
-        # Find the lowest low and highest high
-        lowest_low_idx = df_15sec['low'].idxmin()
-        highest_high_idx = df_15sec['high'].idxmax()
-        lowest_low_value = df_15sec.loc[lowest_low_idx, 'low']
-        highest_high_value = df_15sec.loc[highest_high_idx, 'high']
+        # Get the most recent dip and top
+        last_dip_idx = dip_indices[-1] if dip_indices else None
+        last_top_idx = top_indices[-1] if top_indices else None
         
         # Determine which occurred more recently
-        argmin_more_recent = lowest_low_idx > highest_high_idx
+        dip_more_recent = False
+        
+        if last_dip_idx is not None and last_top_idx is not None:
+            dip_more_recent = last_dip_idx > last_top_idx
+        elif last_dip_idx is not None:
+            dip_more_recent = True
         
         # Print the analysis
         print("\n" + "="*80)
-        print(f"ARGMIN/ARGMAX ANALYSIS - LAST {len(df_15sec)} VALUES OF 15-SECOND TIMEFRAME")
+        print(f"LOCAL DIP/TOP ANALYSIS - 1-MINUTE TIMEFRAME (WINDOW={LOCAL_DIP_WINDOW})")
         print("="*80)
-        print(f"Lowest Low: {lowest_low_value:.2f} at index {lowest_low_idx} ({df_15sec.loc[lowest_low_idx, 'timestamp'].strftime('%Y-%m-%d %H:%M:%S')})")
-        print(f"Highest High: {highest_high_value:.2f} at index {highest_high_idx} ({df_15sec.loc[highest_high_idx, 'timestamp'].strftime('%Y-%m-%d %H:%M:%S')})")
-        print(f"Most Recent: {'Lowest Low' if argmin_more_recent else 'Highest High'}")
-        print(f"Condition: {'TRUE' if argmin_more_recent else 'FALSE'}")
+        
+        if last_dip_idx is not None:
+            dip_price = df.loc[last_dip_idx, 'close']
+            dip_time = df.loc[last_dip_idx, 'timestamp']
+            print(f"Last Local Dip: {dip_price:.2f} at index {last_dip_idx} ({dip_time.strftime('%Y-%m-%d %H:%M:%S')})")
+        else:
+            print("No local dips detected")
+        
+        if last_top_idx is not None:
+            top_price = df.loc[last_top_idx, 'close']
+            top_time = df.loc[last_top_idx, 'timestamp']
+            print(f"Last Local Top: {top_price:.2f} at index {last_top_idx} ({top_time.strftime('%Y-%m-%d %H:%M:%S')})")
+        else:
+            print("No local tops detected")
+        
+        print(f"Most Recent: {'Local Dip' if dip_more_recent else 'Local Top'}")
+        print(f"Condition: {'TRUE' if dip_more_recent else 'FALSE'}")
         print("="*80)
         
         details = {
-            "lowest_low_idx": lowest_low_idx,
-            "highest_high_idx": highest_high_idx,
-            "lowest_low_value": lowest_low_value,
-            "highest_high_value": highest_high_value,
-            "argmin_more_recent": argmin_more_recent
+            "last_dip_idx": last_dip_idx,
+            "last_top_idx": last_top_idx,
+            "dip_more_recent": dip_more_recent
         }
         
-        return argmin_more_recent, details
+        return dip_more_recent, details
         
     except Exception as e:
-        print(f"Error analyzing argmin/argmax: {e}")
+        print(f"Error analyzing local dip condition: {e}")
         return False, {"error": str(e)}
 
 # ------------------ Enhanced Analysis Functions ------------------
@@ -1173,20 +1217,20 @@ def perform_single_iteration_analysis(client):
     condition_details = {}
     condition_results = {}  # Store individual condition results
     
-    # Condition 1: Argmin/Argmax Analysis on 15-second timeframe
-    print("\n--- Condition 1: Argmin/Argmax Analysis ---")
-    argmin_condition, argmin_details = analyze_argmin_argmax_15sec(client, SYMBOL, 56)
-    condition_details['argmin'] = {
-        'met': argmin_condition,
-        'details': argmin_details
+    # Condition 1: Local Dip Detection on 1-minute timeframe
+    print("\n--- Condition 1: Local Dip Detection ---")
+    local_dip_condition, local_dip_details = analyze_local_dip_condition(client, SYMBOL, 100)
+    condition_details['local_dip'] = {
+        'met': local_dip_condition,
+        'details': local_dip_details
     }
-    condition_results['Argmin More Recent (56x15s)'] = argmin_condition
+    condition_results['Local Dip Most Recent (1m TF)'] = local_dip_condition
     
-    if argmin_condition:
+    if local_dip_condition:
         conditions_met += 1
-        print("\nTRUE - Argmin/Argmax condition MET")
+        print("\nTRUE - Local Dip condition MET")
     else:
-        print("\nFALSE - Argmin/Argmax condition NOT met")
+        print("\nFALSE - Local Dip condition NOT met")
     
     # Condition 2: DMI Analysis on 15-second timeframe
     print("\n--- Condition 2: DMI Analysis ---")
@@ -1348,7 +1392,7 @@ def main():
     print("\nEach iteration will:")
     print("1. Check and convert BTC to USDC")
     print("2. Use webhook data for real-time price updates")
-    print("3. Analyze last 56 values of 15-second timeframe for argmin/argmax")
+    print("3. Analyze local dip detection on 1-minute timeframe")
     print("4. Analyze all 4 trading conditions (RSI now uses 15s TF)") 
     print("5. Execute trade if ALL conditions met")
     print("6. Use 100% of USDC balance for entry")
@@ -1357,7 +1401,7 @@ def main():
     print("\nDMI and Fast Scalp Analysis:")
     print("- Creates artificial 15-second timeframe from 1-minute data")
     print("- Uses TA-Lib HT Sine for wave analysis")
-    print("- Implements Argmin/Argmax detection on 15-second timeframe")
+    print("- Implements Local Dip detection on 1-minute timeframe")
     print("- Uses DMI (Directional Movement Index) for fast scalping")
     print("- Adds ML linear regression forecasting")
     print("- RSI now also uses 15-second timeframe for consistency")
