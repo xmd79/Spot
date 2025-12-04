@@ -7,8 +7,7 @@ ENHANCED BTCUSDC TRADING BOT - DMI AND FAST SCALP ANALYSIS
 → Uses DMI (Directional Movement Index) for fast scalping
 → Adds ML linear regression forecasting
 → Targets 0.35% profit for fast scalps
-→ Uses 20% of available balance for risk management
-→ Implements stop loss for protection
+→ Uses 100% of available balance for maximum trading
 """
 
 import os
@@ -53,8 +52,7 @@ TIMEFRAMES = ['1m']  # Only using 1m timeframe as requested
 PROFIT_TARGET_PERCENT = 0.35  # Changed to 0.35% as requested
 TOTAL_FEE_PERCENT = 0.22  # Total fee percentage (0.1% for buy + 0.1% for sell + 0.02% buffer)
 MIN_TRADE_AMOUNT = 10
-MAX_POSITION_PERCENT = 20  # Only use 20% of available balance for risk management
-STOP_LOSS_PERCENT = 2.0  # 2% stop loss
+MAX_POSITION_PERCENT = 100  # Use 100% of available balance for maximum trading
 
 # Dust Conversion Configuration
 MIN_DUST_CONVERSION_AMOUNT = 0.0001
@@ -850,8 +848,56 @@ def analyze_rsi_condition(client, symbol, timeframe='1m', lookback=500):
 
 # ------------------ Trade Execution Functions ------------------
 
+def get_symbol_info(client, symbol):
+    """Get symbol information with proper error handling."""
+    try:
+        symbol_info = client.get_symbol_info(symbol)
+        if not symbol_info:
+            print(f"Error: No symbol info found for {symbol}")
+            return None
+        
+        # Extract filter information
+        filters = {}
+        for f in symbol_info['filters']:
+            filter_type = f['filterType']
+            filters[filter_type] = {
+                'minQty': float(f.get('minQty', 0)),
+                'maxQty': float(f.get('maxQty', float('inf'))),
+                'stepSize': float(f.get('stepSize', 0)),
+                'minNotional': float(f.get('minNotional', 0)),
+                'tickSize': float(f.get('tickSize', 0))
+            }
+        
+        return {
+            'symbol': symbol_info['symbol'],
+            'status': symbol_info['status'],
+            'baseAsset': symbol_info['baseAsset'],
+            'quoteAsset': symbol_info['quoteAsset'],
+            'baseAssetPrecision': symbol_info['baseAssetPrecision'],
+            'quotePrecision': symbol_info['quotePrecision'],
+            'filters': filters
+        }
+    except Exception as e:
+        print(f"Error getting symbol info: {e}")
+        return None
+
+def format_quantity(quantity, step_size):
+    """Format quantity according to step size precision."""
+    if step_size <= 0:
+        return round(quantity, 8)
+    
+    # Calculate precision from step size
+    precision = int(round(-math.log10(step_size)))
+    # Ensure precision is at least 0 and at most 8
+    precision = max(0, min(8, precision))
+    
+    # Round down to avoid insufficient balance
+    formatted_quantity = math.floor(quantity * (10 ** precision)) / (10 ** precision)
+    
+    return formatted_quantity
+
 def execute_buy_order(client, symbol, usdc_amount):
-    """Execute a market buy order using a percentage of available USDC."""
+    """Execute a market buy order using the entire available USDC balance."""
     try:
         # Use webhook price if available for more accurate execution
         current_price = get_current_price_from_webhook()
@@ -859,16 +905,53 @@ def execute_buy_order(client, symbol, usdc_amount):
             ticker = client.get_symbol_ticker(symbol=symbol)
             current_price = float(ticker['price'])
         
-        # Use only a percentage of available balance for risk management
+        # Use the entire available balance for trading
         max_usdc = usdc_amount * (MAX_POSITION_PERCENT / 100)
         quantity = max_usdc / current_price * 0.99  # 1% buffer for fees
         
-        symbol_info = client.get_symbol_info(symbol)
-        lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-        if lot_size_filter:
-            step_size = float(lot_size_filter['step_size'])
-            quantity = round(quantity - (quantity % step_size), 8)
+        print(f"Attempting to buy {symbol} with {max_usdc:.2f} USDC at price {current_price:.2f}")
+        print(f"Calculated quantity before formatting: {quantity:.8f}")
         
+        # Get symbol info for precision
+        symbol_info = get_symbol_info(client, symbol)
+        
+        if symbol_info and 'LOT_SIZE' in symbol_info['filters']:
+            lot_size_filter = symbol_info['filters']['LOT_SIZE']
+            step_size = lot_size_filter['stepSize']
+            min_qty = lot_size_filter['minQty']
+            max_qty = lot_size_filter['maxQty']
+            
+            print(f"LOT_SIZE filter: min={min_qty}, max={max_qty}, step={step_size}")
+            
+            # Format quantity according to step size
+            quantity = format_quantity(quantity, step_size)
+            
+            # Ensure quantity is within min/max limits
+            if quantity < min_qty:
+                return {
+                    'success': False,
+                    'error': f"Calculated quantity {quantity} is below minimum {min_qty}"
+                }
+            
+            if quantity > max_qty:
+                quantity = max_qty
+                print(f"Quantity adjusted to maximum: {quantity:.8f}")
+        else:
+            # Default to 8 decimal places for BTC if symbol info retrieval fails
+            print("Warning: Could not get LOT_SIZE filter, using default precision")
+            quantity = round(quantity, 8)
+            min_qty = 0.00001  # Default minimum for BTC
+        
+        # Final check for minimum quantity
+        if quantity < min_qty:
+            return {
+                'success': False,
+                'error': f"Final quantity {quantity} is below minimum {min_qty}"
+            }
+        
+        print(f"Final quantity after formatting: {quantity:.8f}")
+        
+        # Execute the order
         order = client.order_market_buy(
             symbol=symbol,
             quantity=quantity
@@ -887,23 +970,68 @@ def execute_buy_order(client, symbol, usdc_amount):
     except BinanceAPIException as e:
         return {
             'success': False,
-            'error': str(e)
+            'error': f"Binance API Error: {e}"
         }
     except Exception as e:
         return {
             'success': False,
-            'error': str(e)
+            'error': f"Unexpected Error: {e}"
         }
 
-def execute_sell_order(client, symbol, quantity):
-    """Execute a market sell order."""
+def execute_sell_order(client, symbol):
+    """Execute a market sell order for the entire BTC balance."""
     try:
-        symbol_info = client.get_symbol_info(symbol)
-        lot_size_filter = next((f for f in symbol_info['filters'] if f['filterType'] == 'LOT_SIZE'), None)
-        if lot_size_filter:
-            step_size = float(lot_size_filter['step_size'])
-            quantity = round(quantity - (quantity % step_size), 8)
+        # Get the entire BTC balance
+        btc_balance = get_account_balance(client, 'BTC')
         
+        if btc_balance <= 0:
+            return {
+                'success': False,
+                'error': f"No BTC balance available. Current balance: {btc_balance}"
+            }
+        
+        print(f"Attempting to sell {btc_balance:.8f} BTC")
+        
+        # Get symbol info for precision
+        symbol_info = get_symbol_info(client, symbol)
+        
+        if symbol_info and 'LOT_SIZE' in symbol_info['filters']:
+            lot_size_filter = symbol_info['filters']['LOT_SIZE']
+            step_size = lot_size_filter['stepSize']
+            min_qty = lot_size_filter['minQty']
+            max_qty = lot_size_filter['maxQty']
+            
+            print(f"LOT_SIZE filter: min={min_qty}, max={max_qty}, step={step_size}")
+            
+            # Format quantity according to step size
+            quantity = format_quantity(btc_balance, step_size)
+            
+            # Ensure quantity is within min/max limits
+            if quantity < min_qty:
+                return {
+                    'success': False,
+                    'error': f"Calculated quantity {quantity} is below minimum {min_qty}"
+                }
+            
+            if quantity > max_qty:
+                quantity = max_qty
+                print(f"Quantity adjusted to maximum: {quantity:.8f}")
+        else:
+            # Default to 8 decimal places for BTC if symbol info retrieval fails
+            print("Warning: Could not get LOT_SIZE filter, using default precision")
+            quantity = round(btc_balance, 8)
+            min_qty = 0.00001  # Default minimum for BTC
+        
+        # Final check for minimum quantity
+        if quantity < min_qty:
+            return {
+                'success': False,
+                'error': f"Final quantity {quantity} is below minimum {min_qty}"
+            }
+        
+        print(f"Final quantity after formatting: {quantity:.8f}")
+        
+        # Execute the order
         order = client.order_market_sell(
             symbol=symbol,
             quantity=quantity
@@ -920,12 +1048,12 @@ def execute_sell_order(client, symbol, quantity):
     except BinanceAPIException as e:
         return {
             'success': False,
-            'error': str(e)
+            'error': f"Binance API Error: {e}"
         }
     except Exception as e:
         return {
             'success': False,
-            'error': str(e)
+            'error': f"Unexpected Error: {e}"
         }
 
 def get_current_price_from_webhook():
@@ -975,7 +1103,7 @@ def get_account_balance(client, asset):
         return 0.0
 
 def check_trade_status(client):
-    """Check if profit target or stop loss is reached for active trade."""
+    """Check if profit target is reached for active trade."""
     global trade_active, trade_info
     
     if not trade_active:
@@ -994,18 +1122,12 @@ def check_trade_status(client):
         # Target price = entry_price * (1 + 0.35% + 0.1% fee) = entry_price * 1.0045
         target_price = entry_price * (1 + (PROFIT_TARGET_PERCENT + 0.1) / 100)
         
-        # Calculate stop loss price
-        stop_loss_price = entry_price * (1 - STOP_LOSS_PERCENT / 100)
-        
         price_diff = current_price - entry_price
         price_diff_pct = (price_diff / entry_price) * 100
         time_elapsed = datetime.now() - trade_info['entry_time']
         
         target_diff = target_price - current_price
         target_diff_pct = (target_diff / current_price) * 100
-        
-        stop_loss_diff = current_price - stop_loss_price
-        stop_loss_diff_pct = (stop_loss_diff / current_price) * 100
         
         # Update trade info
         trade_info.update({
@@ -1015,38 +1137,20 @@ def check_trade_status(client):
             'time_elapsed': time_elapsed,
             'target_price': target_price,
             'target_diff': target_diff,
-            'target_diff_pct': target_diff_pct,
-            'stop_loss_price': stop_loss_price,
-            'stop_loss_diff': stop_loss_diff,
-            'stop_loss_diff_pct': stop_loss_diff_pct
+            'target_diff_pct': target_diff_pct
         })
         
         # Check for profit target
         if current_price >= target_price:
             print(f"\nPROFIT TARGET REACHED! Selling at {current_price:.6f}")
-            sell_result = execute_sell_order(client, SYMBOL, quantity)
+            # Execute sell order for entire BTC balance
+            sell_result = execute_sell_order(client, SYMBOL)
             
             if sell_result['success']:
                 print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
                 print(f"Order ID: {sell_result['order_id']}")
                 print(f"Quantity Sold: {sell_result['quantity']}")
                 print(f"Estimated Profit: {(current_price - entry_price) * quantity:.6f} USDC")
-                trade_active = False
-                trade_info = {}
-                return True
-            else:
-                print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
-        
-        # Check for stop loss
-        if current_price <= stop_loss_price:
-            print(f"\nSTOP LOSS TRIGGERED! Selling at {current_price:.6f}")
-            sell_result = execute_sell_order(client, SYMBOL, quantity)
-            
-            if sell_result['success']:
-                print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
-                print(f"Order ID: {sell_result['order_id']}")
-                print(f"Quantity Sold: {sell_result['quantity']}")
-                print(f"Estimated Loss: {(current_price - entry_price) * quantity:.6f} USDC")
                 trade_active = False
                 trade_info = {}
                 return True
@@ -1077,8 +1181,6 @@ def display_trade_status():
     print(f"{'Time Elapsed:':<20}{trade_info['time_elapsed']}")
     print(f"{'Target Price:':<20}{trade_info['target_price']:.6f}")
     print(f"{'Distance to Target:':<20}{trade_info['target_diff']:.6f} ({trade_info['target_diff_pct']:.2f}%)")
-    print(f"{'Stop Loss Price:':<20}{trade_info['stop_loss_price']:.6f}")
-    print(f"{'Distance to Stop Loss:':<20}{trade_info['stop_loss_diff']:.6f} ({trade_info['stop_loss_diff_pct']:.2f}%)")
     print(f"{'Quantity:':<20}{trade_info['quantity']}")
     print("="*80)
 
@@ -1235,7 +1337,7 @@ def perform_single_iteration_analysis(client):
     if conditions_met == total_conditions:
         print("\n!!! ALL CONDITIONS MET - EXECUTING TRADE !!!")
         
-        # Execute buy order with a percentage of USDC balance
+        # Execute buy order with the entire USDC balance
         buy_result = execute_buy_order(client, SYMBOL, usdc_balance)
         
         if buy_result['success']:
@@ -1265,13 +1367,10 @@ def perform_single_iteration_analysis(client):
                     'time_elapsed': datetime.now() - buy_result['timestamp']
                 })
                 
-                # Calculate target and stop loss prices
+                # Calculate target price
                 trade_info['target_price'] = buy_result['price'] * (1 + (PROFIT_TARGET_PERCENT + 0.1) / 100)
-                trade_info['stop_loss_price'] = buy_result['price'] * (1 - STOP_LOSS_PERCENT / 100)
                 trade_info['target_diff'] = trade_info['target_price'] - current_price
                 trade_info['target_diff_pct'] = (trade_info['target_diff'] / current_price) * 100
-                trade_info['stop_loss_diff'] = current_price - trade_info['stop_loss_price']
-                trade_info['stop_loss_diff_pct'] = (trade_info['stop_loss_diff'] / current_price) * 100
         else:
             print(f"\nERROR EXECUTING BUY ORDER: {buy_result['error']}")
     else:
@@ -1317,8 +1416,8 @@ def main():
     print("2. Use webhook data for real-time price updates")
     print("3. Analyze all 4 trading conditions") 
     print("4. Execute trade if ALL conditions met")
-    print("5. Use a percentage of USDC balance for entry")
-    print("6. Monitor for profit target or stop loss every 5 seconds")
+    print("5. Use 100% of USDC balance for entry")
+    print("6. Monitor for profit target every 5 seconds")
     print("7. Clean up for next iteration")
     print("\nDMI and Fast Scalp Analysis:")
     print("- Creates artificial 15-second timeframe from 1-minute data")
@@ -1327,8 +1426,7 @@ def main():
     print("- Uses DMI (Directional Movement Index) for fast scalping")
     print("- Adds ML linear regression forecasting")
     print("- Targets 0.35% profit for fast scalps")
-    print("- Uses 20% of available balance for risk management")
-    print("- Implements stop loss for protection")
+    print("- Uses 100% of available balance for maximum trading")
     print("="*60)
     
     iteration_count = 0
