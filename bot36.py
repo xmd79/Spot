@@ -6,6 +6,7 @@ ENHANCED BTCUSDC TRADING BOT - DMI AND FAST SCALP ANALYSIS
 → Implements Argmin/Argmax detection on 15-second timeframe
 → Uses DMI (Directional Movement Index) for fast scalping
 → Adds ML linear regression forecasting
+→ RSI now also uses 15-second timeframe for consistency
 → Targets 0.35% profit for fast scalps
 → Uses 100% of available balance for maximum trading
 → Uses 25 decimal places for BTC precision
@@ -602,7 +603,7 @@ def analyze_argmin_argmax_15sec(client, symbol, limit=56):
 
 # ------------------ Enhanced Analysis Functions ------------------
 
-def analyze_dmi_condition(client, symbol, timeframe='15s', lookback=500):
+def analyze_dmi_condition(client, symbol, lookback=500):
     """Analyze DMI condition on 15-second timeframe for fast scalping."""
     try:
         klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
@@ -650,66 +651,10 @@ def analyze_dmi_condition(client, symbol, timeframe='15s', lookback=500):
         print(f"analyze_dmi_condition error: {e}")
         return False, {"error": str(e)}
 
-def analyze_ht_sine_condition(client, symbol, timeframe='1m', lookback=500):
-    """Analyze HT Sine wave for cycle detection."""
-    try:
-        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
-        if not klines or len(klines) < 100:
-            return False, {"error": "Insufficient data"}
-            
-        df = pd.DataFrame(klines, columns=[
-            'timestamp','open','high','low','close','volume','close_time',
-            'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
-            'taker_buy_quote_asset_volume','ignore'])
-        
-        # Convert timestamp to datetime
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        
-        # Clean OHLC data
-        df = clean_ohlc_data(df)
-        
-        # Calculate HT Sine
-        df = calculate_ht_sine(df)
-        
-        if df is None or 'HT_SINE' not in df.columns:
-            return False, {"error": "Failed to calculate HT Sine"}
-        
-        # Get the last sine and leadsine values
-        last_sine = float(df['HT_SINE'].iloc[-1])
-        last_leadsine = float(df['HT_LEADSINE'].iloc[-1])
-        
-        # Check if sine is crossing leadsine from below (indicating start of up cycle)
-        if len(df) >= 2:
-            prev_sine = float(df['HT_SINE'].iloc[-2])
-            prev_leadsine = float(df['HT_LEADSINE'].iloc[-2])
-            
-            # Check for crossing from below
-            crossing_up = (prev_sine < prev_leadsine) and (last_sine >= last_leadsine)
-            
-            # Also check if sine is currently below leadsine (in down cycle)
-            in_down_cycle = last_sine < last_leadsine
-            
-            # Condition: either crossing up from below or in down cycle (waiting for dip)
-            condition_met = crossing_up or in_down_cycle
-        else:
-            condition_met = False
-        
-        details = {
-            "last_sine": last_sine,
-            "last_leadsine": last_leadsine,
-            "condition_met": condition_met
-        }
-        
-        return condition_met, details
-        
-    except Exception as e:
-        print(f"analyze_ht_sine_condition error: {e}")
-        return False, {"error": str(e)}
-
-def analyze_ml_forecast_condition(client, symbol, timeframe='1m', lookback=500):
+def analyze_ml_forecast_condition(client, symbol, lookback=500):
     """Analyze ML linear regression forecast for up cycle."""
     try:
-        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
+        klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
         if not klines or len(klines) < 100:
             return False, {"error": "Insufficient data"}
             
@@ -758,26 +703,29 @@ def analyze_ml_forecast_condition(client, symbol, timeframe='1m', lookback=500):
         print(f"analyze_ml_forecast_condition error: {e}")
         return False, {"error": str(e)}
 
-def analyze_rsi_condition(client, symbol, timeframe='1m', lookback=500):
-    """Analyze RSI oversold/overbought most recent condition using TA-Lib."""
+def analyze_rsi_condition(client, symbol, lookback=500):
+    """Analyze RSI oversold/overbought most recent condition using 15-second timeframe."""
     try:
-        klines = client.get_klines(symbol=symbol, interval=timeframe, limit=lookback)
+        klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
         if not klines or len(klines) < 100:
             return False, False, 0.0, {"error": "Insufficient data"}
             
-        df = pd.DataFrame(klines, columns=[
+        df_1m = pd.DataFrame(klines, columns=[
             'timestamp','open','high','low','close','volume','close_time',
             'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
             'taker_buy_quote_asset_volume','ignore'])
         
         # Convert timestamp to datetime
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
         
         # Clean OHLC data
-        df = clean_ohlc_data(df)
+        df_1m = clean_ohlc_data(df_1m)
         
-        # Calculate RSI using TA-Lib
-        df_rsi = calculate_rsi(df, RSI_PERIOD)
+        # Create artificial 15-second timeframe
+        df_15sec = create_15sec_timeframe(df_1m)
+        
+        # Calculate RSI using TA-Lib on 15-second timeframe
+        df_rsi = calculate_rsi(df_15sec, RSI_PERIOD)
         if df_rsi is None or f'RSI_{RSI_PERIOD}' not in df_rsi.columns:
             return False, False, 0.0, {"error": "RSI calculation failed"}
         
@@ -1242,7 +1190,7 @@ def perform_single_iteration_analysis(client):
     
     # Condition 2: DMI Analysis on 15-second timeframe
     print("\n--- Condition 2: DMI Analysis ---")
-    dmi_met, dmi_details = analyze_dmi_condition(client, SYMBOL, '15s', 500)
+    dmi_met, dmi_details = analyze_dmi_condition(client, SYMBOL, 500)
     condition_details['dmi'] = {
         'met': dmi_met,
         'details': dmi_details
@@ -1262,7 +1210,7 @@ def perform_single_iteration_analysis(client):
     
     # Condition 3: ML Linear Regression Forecast
     print("\n--- Condition 3: ML Linear Regression Forecast ---")
-    ml_forecast_met, ml_details = analyze_ml_forecast_condition(client, SYMBOL, '1m', 500)
+    ml_forecast_met, ml_details = analyze_ml_forecast_condition(client, SYMBOL, 500)
     condition_details['ml_forecast'] = {
         'met': ml_forecast_met,
         'details': ml_details
@@ -1281,9 +1229,9 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - ML Forecast condition NOT met")
     
-    # Condition 4: RSI Condition
-    print("\n--- Condition 4: RSI Analysis ---")
-    rsi_oversold_recent, rsi_overbought_recent, current_rsi, rsi_details = analyze_rsi_condition(client, SYMBOL, '1m', 500)
+    # Condition 4: RSI Condition on 15-second timeframe
+    print("\n--- Condition 4: RSI Analysis (15-sec TF) ---")
+    rsi_oversold_recent, rsi_overbought_recent, current_rsi, rsi_details = analyze_rsi_condition(client, SYMBOL, 500)
     condition_details['rsi'] = {
         'oversold_most_recent': rsi_oversold_recent,
         'overbought_most_recent': rsi_overbought_recent,
@@ -1401,7 +1349,7 @@ def main():
     print("1. Check and convert BTC to USDC")
     print("2. Use webhook data for real-time price updates")
     print("3. Analyze last 56 values of 15-second timeframe for argmin/argmax")
-    print("4. Analyze all 4 trading conditions") 
+    print("4. Analyze all 4 trading conditions (RSI now uses 15s TF)") 
     print("5. Execute trade if ALL conditions met")
     print("6. Use 100% of USDC balance for entry")
     print("7. Monitor for profit target every 5 seconds")
@@ -1412,6 +1360,7 @@ def main():
     print("- Implements Argmin/Argmax detection on 15-second timeframe")
     print("- Uses DMI (Directional Movement Index) for fast scalping")
     print("- Adds ML linear regression forecasting")
+    print("- RSI now also uses 15-second timeframe for consistency")
     print("- Targets 0.35% profit for fast scalps")
     print("- Uses 100% of available balance for maximum trading")
     print("- Uses 25 decimal places for BTC precision")
