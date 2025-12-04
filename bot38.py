@@ -11,6 +11,7 @@ ENHANCED BTCUSDC TRADING BOT - DMI AND FAST SCALP ANALYSIS
 → Uses 100% of available balance for maximum trading
 → Uses 25 decimal places for BTC precision
 → Improved dust conversion using Binance Pay API
+→ Fixed timezone handling to use GMT+2
 """
 
 import os
@@ -28,7 +29,7 @@ import requests
 from flask import Flask, request, jsonify
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from scipy.signal import hilbert
 from scipy.fft import fft, fftfreq
 from sklearn.linear_model import LinearRegression
@@ -47,6 +48,9 @@ except ImportError:
 # ------------------ Configuration ------------------
 API_FILE = 'api.txt'
 SYMBOL = 'BTCUSDC'
+
+# Timezone Configuration
+LOCAL_TIMEZONE = timezone(timedelta(hours=2))  # GMT+2
 
 # Timeframes for analysis
 TIMEFRAMES = ['1m']  # Only using 1m timeframe as requested
@@ -115,7 +119,7 @@ def receive_price_webhook():
         # Extract price data
         if 'price' in data:
             price = float(data['price'])
-            timestamp = data.get('timestamp', datetime.now(timezone.utc).isoformat())
+            timestamp = data.get('timestamp', datetime.now(LOCAL_TIMEZONE).isoformat())
             
             # Update webhook data
             webhook_data['current_price'] = price
@@ -545,6 +549,7 @@ def analyze_local_dip_condition(client, symbol, lookback=500):
     Analyze local dip condition on 1-minute timeframe using argmin/argmax.
     Checks the last 500 candles to find the absolute lowest low and highest high.
     Only considers it valid if the lowest low occurred more recently than the highest high.
+    All timestamps are displayed in GMT+2 timezone.
     """
     try:
         # Get 1-minute data
@@ -558,8 +563,9 @@ def analyze_local_dip_condition(client, symbol, lookback=500):
             'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
             'taker_buy_quote_asset_volume','ignore'])
         
-        # Convert timestamp to datetime (ensure proper timezone handling)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(None)
+        # Convert timestamp to datetime in GMT+2 timezone
+        # First convert to UTC, then to GMT+2
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
         
         # Clean OHLC data
         df = clean_ohlc_data(df)
@@ -568,7 +574,7 @@ def analyze_local_dip_condition(client, symbol, lookback=500):
         lowest_low_idx = df['low'].idxmin()
         highest_high_idx = df['high'].idxmax()
         
-        # Get the values and timestamps
+        # Get the values and timestamps (already in GMT+2)
         lowest_low_price = df.loc[lowest_low_idx, 'low']
         lowest_low_time = df.loc[lowest_low_idx, 'timestamp']
         
@@ -581,6 +587,7 @@ def analyze_local_dip_condition(client, symbol, lookback=500):
         # Print the analysis
         print("\n" + "="*80)
         print(f"LOCAL DIP/TOP ANALYSIS - 1-MINUTE TIMEFRAME (LAST {lookback} CANDLES)")
+        print(f"TIMEZONE: GMT+2")
         print("="*80)
         print(f"Lowest Low: {lowest_low_price:.2f} at index {lowest_low_idx} ({lowest_low_time.strftime('%Y-%m-%d %H:%M:%S')})")
         print(f"Highest High: {highest_high_price:.2f} at index {highest_high_idx} ({highest_high_time.strftime('%Y-%m-%d %H:%M:%S')})")
@@ -618,8 +625,8 @@ def analyze_dmi_condition(client, symbol, lookback=500):
             'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
             'taker_buy_quote_asset_volume','ignore'])
         
-        # Convert timestamp to datetime (ensure proper timezone handling)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(None)
+        # Convert timestamp to datetime in GMT+2 timezone
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
         
         # Clean OHLC data
         df = clean_ohlc_data(df)
@@ -666,8 +673,8 @@ def analyze_ml_forecast_condition(client, symbol, lookback=500):
             'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
             'taker_buy_quote_asset_volume','ignore'])
         
-        # Convert timestamp to datetime (ensure proper timezone handling)
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(None)
+        # Convert timestamp to datetime in GMT+2 timezone
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
         
         # Clean OHLC data
         df = clean_ohlc_data(df)
@@ -718,8 +725,8 @@ def analyze_rsi_condition(client, symbol, lookback=500):
             'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
             'taker_buy_quote_asset_volume','ignore'])
         
-        # Convert timestamp to datetime (ensure proper timezone handling)
-        df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(None)
+        # Convert timestamp to datetime in GMT+2 timezone
+        df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
         
         # Clean OHLC data
         df_1m = clean_ohlc_data(df_1m)
@@ -891,7 +898,7 @@ def execute_buy_order(client, symbol, usdc_amount):
             'quantity': quantity,
             'price': current_price,
             'cost': quantity * current_price,
-            'timestamp': datetime.now(),
+            'timestamp': datetime.now(LOCAL_TIMEZONE),
             'order': order
         }
     except BinanceAPIException as e:
@@ -970,7 +977,7 @@ def execute_sell_order(client, symbol):
             'order_id': order['orderId'],
             'symbol': symbol,
             'quantity': quantity,
-            'timestamp': datetime.now(),
+            'timestamp': datetime.now(LOCAL_TIMEZONE),
             'order': order
         }
     except BinanceAPIException as e:
@@ -994,7 +1001,7 @@ def get_current_price_from_webhook():
         if webhook_data['last_update']:
             try:
                 last_update = datetime.fromisoformat(webhook_data['last_update'].replace('Z', '+00:00'))
-                time_diff = (datetime.now() - last_update).total_seconds()
+                time_diff = (datetime.now(LOCAL_TIMEZONE) - last_update).total_seconds()
                 if time_diff < 10:
                     return webhook_data['current_price']
             except:
@@ -1052,7 +1059,7 @@ def check_trade_status(client):
         
         price_diff = current_price - entry_price
         price_diff_pct = (price_diff / entry_price) * 100
-        time_elapsed = datetime.now() - trade_info['entry_time']
+        time_elapsed = datetime.now(LOCAL_TIMEZONE) - trade_info['entry_time']
         
         target_diff = target_price - current_price
         target_diff_pct = (target_diff / current_price) * 100
@@ -1128,7 +1135,7 @@ def perform_single_iteration_analysis(client):
     
     print("="*80)
     print(f"BTCUSDC TRADING BOT - DMI AND FAST SCALP ANALYSIS")
-    print(f"Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Time: {datetime.now(LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} (GMT+2)")
     print(f"Webhook Status: {'Connected' if webhook_data['current_price'] else 'Waiting for data'}")
     if webhook_data['current_price']:
         print(f"Webhook Price: {webhook_data['current_price']:.2f}")
@@ -1300,7 +1307,7 @@ def perform_single_iteration_analysis(client):
                     'current_price': current_price,
                     'price_diff': current_price - buy_result['price'],
                     'price_diff_pct': ((current_price - buy_result['price']) / buy_result['price']) * 100,
-                    'time_elapsed': datetime.now() - buy_result['timestamp']
+                    'time_elapsed': datetime.now(LOCAL_TIMEZONE) - buy_result['timestamp']
                 })
                 
                 # Calculate target price
@@ -1368,6 +1375,7 @@ def main():
     print("- Uses 100% of available balance for maximum trading")
     print("- Uses 25 decimal places for BTC precision")
     print("- Improved dust conversion using Binance Pay API")
+    print("- All timestamps displayed in GMT+2 timezone")
     print("="*60)
     
     iteration_count = 0
