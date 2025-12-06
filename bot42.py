@@ -7,7 +7,7 @@ ENHANCED BTCUSDC TRADING BOT - DMI AND FAST SCALP ANALYSIS WITH HARMONIC OSCILLA
 → Uses DMI (Directional Movement Index) for fast scalping
 → Adds ML linear regression forecasting
 → RSI now also uses 15-second timeframe for consistency
-→ Targets 0.35% profit for fast scalps
+→ Targets 0.75% profit for fast scalps
 → Uses 100% of available balance for maximum trading
 → Uses 25 decimal places for BTC precision
 → Improved dust conversion using Binance Pay API
@@ -78,7 +78,7 @@ LOCAL_TIMEZONE = timezone(timedelta(hours=2))  # GMT+2
 TIMEFRAMES = ['1m']  # Only using 1m timeframe as requested
 
 # Trading Configuration
-PROFIT_TARGET_PERCENT = 0.35  # Changed to 0.35% as requested
+PROFIT_TARGET_PERCENT = 0.75  # Profits at 0.75% exit trades 
 TOTAL_FEE_PERCENT = 0.22  # Total fee percentage (0.1% for buy + 0.1% for sell + 0.02% buffer)
 MIN_TRADE_AMOUNT = 10
 MAX_POSITION_PERCENT = 100  # Use 100% of available balance for maximum trading
@@ -172,7 +172,7 @@ def receive_price_webhook():
             if len(webhook_data['price_history']) > 1000:
                 webhook_data['price_history'].pop(0)
             
-            print(f"Webhook received: {price} at {timestamp}")
+            print(f"Webhook received: {price:.25f} at {timestamp}")
             return jsonify({'status': 'success', 'price': price})
         
         return jsonify({'error': 'Invalid data format'}), 400
@@ -307,7 +307,7 @@ def convert_btc_to_usdc(client):
             quantity=quantity
         )
         
-        print(f"BTC conversion successful! Sold {quantity:.25f} BTC at {current_price:.2f} USDC")
+        print(f"BTC conversion successful! Sold {quantity:.25f} BTC at {current_price:.25f} USDC")
         return True
         
     except BinanceAPIException as e:
@@ -329,10 +329,10 @@ def convert_usdc_to_btc(client):
         
         # Distinguish between zero and very small balance
         if usdc_balance <= MIN_USDC_THRESHOLD:
-            print(f"USDC balance is effectively zero: {usdc_balance:.2f}")
+            print(f"USDC balance is effectively zero: {usdc_balance:.25f}")
             return True
         
-        print(f"Converting {usdc_balance:.2f} USDC to BTC...")
+        print(f"Converting {usdc_balance:.25f} USDC to BTC...")
         
         # Get current price for information
         ticker = client.get_symbol_ticker(symbol='BTCUSDC')
@@ -386,7 +386,7 @@ def convert_usdc_to_btc(client):
             quantity=quantity
         )
         
-        print(f"USDC conversion successful! Bought {quantity:.25f} BTC at {current_price:.2f} USDC")
+        print(f"USDC conversion successful! Bought {quantity:.25f} BTC at {current_price:.25f} USDC")
         return True
         
     except BinanceAPIException as e:
@@ -420,7 +420,7 @@ def check_and_convert_dust(client, in_trade=None, force_conversion=False):
         btc_balance = get_account_balance(client, 'BTC')
         usdc_balance = get_account_balance(client, 'USDC')
         
-        print(f"Current balances - BTC: {btc_balance:.25f}, USDC: {usdc_balance:.2f}")
+        print(f"Current balances - BTC: {btc_balance:.25f}, USDC: {usdc_balance:.25f}")
         
         if in_trade:
             # If in trade, convert any USDC dust to BTC
@@ -565,7 +565,7 @@ def resume_active_trade(client):
             # Calculate actual profit after fees
             trade_info['actual_profit_pct'] = ((current_price - entry_price) / entry_price) * 100 - TOTAL_FEE_PERCENT
         
-        print(f"Resumed active trade: Entry at {entry_price:.6f}, Quantity: {quantity:.25f}")
+        print(f"Resumed active trade: Entry at {entry_price:.25f}, Quantity: {quantity:.25f}")
         return True
     except Exception as e:
         print(f"Error resuming active trade: {e}")
@@ -585,16 +585,13 @@ def clean_ohlc_data(df):
     # Replace 0 values in OHLC with previous non-zero values
     for col in ['open', 'high', 'low', 'close']:
         df[col] = df[col].replace(0, np.nan)
-        df[col] = df[col].fillna(method='ffill')
-        df[col] = df[col].fillna(method='bfill')
+        df[col] = df[col].ffill().bfill()
         df[col] = df[col].replace(0, np.nan)
-        df[col] = df[col].fillna(method='ffill')
-        df[col] = df[col].fillna(method='bfill')
+        df[col] = df[col].ffill().bfill()
     
     # Replace 0 volume with previous non-zero values
     df['volume'] = df['volume'].replace(0, np.nan)
-    df['volume'] = df['volume'].fillna(method='ffill')
-    df['volume'] = df['volume'].fillna(method='bfill')
+    df['volume'] = df['volume'].ffill().bfill()
     
     # Final check - ensure no NaN or 0 values remain
     for col in ['open', 'high', 'low', 'close', 'volume']:
@@ -978,10 +975,7 @@ def analyze_linear_regression_channel_condition(client, symbol, lookback=500, ti
             klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
         else:  # 15s timeframe
             # Get 1m data and convert to 15s
-            # FIX: Ensure we have enough 1-minute data for the 15s timeframe
-            # For 15s 200 oscillator, we need at least 50 1-minute candles (200/4)
-            # But we'll request more to ensure we have enough data after cleaning
-            min_1m_candles = max(100, lookback // 4 + 20)  # Add buffer for data cleaning
+            min_1m_candles = max(100, lookback // 4 + 20)
             klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
             
             if not klines_1m or len(klines_1m) < 100:
@@ -1197,10 +1191,7 @@ def analyze_harmonic_oscillator(client, symbol, lookback=1200, timeframe='1m', o
             klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
         else:  # 15s timeframe
             # Get 1m data and convert to 15s
-            # FIX: Ensure we have enough 1-minute data for the 15s timeframe
-            # For 15s 200 oscillator, we need at least 50 1-minute candles (200/4)
-            # But we'll request more to ensure we have enough data after cleaning
-            min_1m_candles = max(100, lookback // 4 + 20)  # Add buffer for data cleaning
+            min_1m_candles = max(100, lookback // 4 + 20)
             klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
             
             if not klines_1m or len(klines_1m) < 50:
@@ -1283,29 +1274,44 @@ def analyze_harmonic_oscillator(client, symbol, lookback=1200, timeframe='1m', o
         # Calculate frequency power
         power = np.abs(fft_values) ** 2
         
-        # Separate positive and negative frequencies
-        positive_freq_mask = fft_freq > 0
-        negative_freq_mask = fft_freq < 0
+        # Find dominant frequencies by power
+        dominant_freq_indices = np.argsort(power)[-10:]  # Top 10 frequencies by power
+        dominant_freqs = fft_freq[dominant_freq_indices]
+        dominant_powers = power[dominant_freq_indices]
         
-        # Calculate power for positive and negative frequencies
-        positive_power = np.sum(power[positive_freq_mask])
-        negative_power = np.sum(power[negative_freq_mask])
-        total_power = positive_power + negative_power
+        # Separate positive and negative dominant frequencies
+        positive_dominant_freqs = dominant_freqs[dominant_freqs > 0]
+        negative_dominant_freqs = dominant_freqs[dominant_freqs < 0]
         
-        # Calculate dominance
-        positive_dominance = positive_power / total_power if total_power > 0 else 0.5
-        negative_dominance = negative_power / total_power if total_power > 0 else 0.5
+        # Calculate power for positive and negative dominant frequencies
+        positive_dominant_power = np.sum(power[fft_freq > 0])
+        negative_dominant_power = np.sum(power[fft_freq < 0])
+        total_dominant_power = positive_dominant_power + negative_dominant_power
         
-        # Find dominant frequencies
-        dominant_positive_freq_idx = np.argmax(power[positive_freq_mask]) if np.any(positive_freq_mask) else 0
-        dominant_negative_freq_idx = np.argmax(power[negative_freq_mask]) if np.any(negative_freq_mask) else 0
+        # Calculate dominance based on power
+        if total_dominant_power > 0:
+            positive_dominance = positive_dominant_power / total_dominant_power
+            negative_dominance = negative_dominant_power / total_dominant_power
+        else:
+            positive_dominance = 0.5
+            negative_dominance = 0.5
         
-        # Get the actual frequency values
-        positive_freqs = fft_freq[positive_freq_mask]
-        negative_freqs = fft_freq[negative_freq_mask]
-        
-        dominant_positive_freq = positive_freqs[dominant_positive_freq_idx] if len(positive_freqs) > 0 else 0
-        dominant_negative_freq = negative_freqs[dominant_negative_freq_idx] if len(negative_freqs) > 0 else 0
+        # Get the most powerful positive and negative frequencies
+        if len(positive_dominant_freqs) > 0:
+            most_powerful_positive_idx = np.argmax(power[fft_freq > 0])
+            most_powerful_positive_freq = fft_freq[fft_freq > 0][most_powerful_positive_idx]
+            most_powerful_positive_power = power[fft_freq > 0][most_powerful_positive_idx]
+        else:
+            most_powerful_positive_freq = 0
+            most_powerful_positive_power = 0
+            
+        if len(negative_dominant_freqs) > 0:
+            most_powerful_negative_idx = np.argmax(power[fft_freq < 0])
+            most_powerful_negative_freq = fft_freq[fft_freq < 0][most_powerful_negative_idx]
+            most_powerful_negative_power = power[fft_freq < 0][most_powerful_negative_idx]
+        else:
+            most_powerful_negative_freq = 0
+            most_powerful_negative_power = 0
         
         # Determine cycle direction based on frequency dominance
         # If positive frequencies dominate, it's an up cycle (from dip to top)
@@ -1322,7 +1328,7 @@ def analyze_harmonic_oscillator(client, symbol, lookback=1200, timeframe='1m', o
             for i, freq in enumerate(fft_freq):
                 if freq > 0 and i < len(power):
                     # Use the power ratio to determine amplification
-                    power_ratio = power[i] / positive_power if positive_power > 0 else 1
+                    power_ratio = power[i] / positive_dominant_power if positive_dominant_power > 0 else 1
                     # Amplify based on power contribution
                     forecast_fft[i] = fft_values[i] * (1 + 0.5 * power_ratio)
         else:
@@ -1330,7 +1336,7 @@ def analyze_harmonic_oscillator(client, symbol, lookback=1200, timeframe='1m', o
             for i, freq in enumerate(fft_freq):
                 if freq < 0 and i < len(power):
                     # Use the power ratio to determine amplification
-                    power_ratio = power[i] / negative_power if negative_power > 0 else 1
+                    power_ratio = power[i] / negative_dominant_power if negative_dominant_power > 0 else 1
                     # Amplify based on power contribution
                     forecast_fft[i] = fft_values[i] * (1 + 0.5 * power_ratio)
         
@@ -1357,27 +1363,31 @@ def analyze_harmonic_oscillator(client, symbol, lookback=1200, timeframe='1m', o
         # Calculate percentage difference to forecast target
         forecast_diff_pct = ((forecast_target - current_price) / current_price) * 100
         
-        # Analyze volume for bullish/bearish sentiment
-        volume_bullish_pct = 0.0
-        volume_bearish_pct = 0.0
-        volume_sentiment = "neutral"
+        # Calculate volume sentiment for 15-second timeframe
+        bullish_volume = 0.0
+        bearish_volume = 0.0
         
-        if timeframe == '1m':
-            # Calculate volume sentiment for 1-minute timeframe
-            bullish_volume = 0.0
-            bearish_volume = 0.0
-            
-            for i in range(1, len(df)):
-                if df.iloc[i]['close'] > df.iloc[i-1]['close']:
-                    bullish_volume += df.iloc[i]['volume']
-                else:
-                    bearish_volume += df.iloc[i]['volume']
-            
-            total_volume = bullish_volume + bearish_volume
-            if total_volume > 0:
-                volume_bullish_pct = (bullish_volume / total_volume) * 100
-                volume_bearish_pct = (bearish_volume / total_volume) * 100
-                volume_sentiment = "bullish" if volume_bullish_pct > volume_bearish_pct else "bearish"
+        for i in range(1, len(df)):
+            if df.iloc[i]['close'] > df.iloc[i-1]['close']:
+                bullish_volume += df.iloc[i]['volume']
+            else:
+                bearish_volume += df.iloc[i]['volume']
+        
+        total_volume = bullish_volume + bearish_volume
+        if total_volume > 0:
+            volume_bullish_pct = (bullish_volume / total_volume) * 100
+            volume_bearish_pct = (bearish_volume / total_volume) * 100
+            volume_sentiment = "bullish" if volume_bullish_pct > volume_bearish_pct else "bearish"
+        else:
+            volume_bullish_pct = 0.0
+            volume_bearish_pct = 0.0
+            volume_sentiment = "neutral"
+        
+        # Determine dominant frequency based on cycle direction
+        if cycle_direction == "up":
+            dominant_frequency = most_powerful_positive_freq
+        else:
+            dominant_frequency = most_powerful_negative_freq
         
         # Prepare results
         results = {
@@ -1393,13 +1403,16 @@ def analyze_harmonic_oscillator(client, symbol, lookback=1200, timeframe='1m', o
             "highest_high_price": highest_high_price,
             "highest_high_time": highest_high_time,
             "dip_more_recent": dip_more_recent,
+            "dominant_frequency": dominant_frequency,
             "frequency_analysis": {
-                "dominant_frequency": "positive" if positive_dominance > negative_dominance else "negative",
-                "dominant_frequency_value": dominant_positive_freq if positive_dominance > negative_dominance else dominant_negative_freq,
+                "most_powerful_positive_freq": most_powerful_positive_freq,
+                "most_powerful_positive_power": float(most_powerful_positive_power),
+                "most_powerful_negative_freq": most_powerful_negative_freq,
+                "most_powerful_negative_power": float(most_powerful_negative_power),
                 "positive_dominance_pct": positive_dominance * 100,
                 "negative_dominance_pct": negative_dominance * 100,
-                "positive_power": float(positive_power),
-                "negative_power": float(negative_power)
+                "positive_power": float(positive_dominant_power),
+                "negative_power": float(negative_dominant_power)
             },
             "volume_analysis": {
                 "bullish_pct": volume_bullish_pct,
@@ -1429,8 +1442,7 @@ def analyze_local_dip_condition(client, symbol, lookback=1200):
     """
     try:
         # Get 1m data and convert to 15s timeframe
-        # FIX: Ensure we have enough 1-minute data for the 15s timeframe
-        min_1m_candles = max(100, lookback // 4 + 20)  # Add buffer for data cleaning
+        min_1m_candles = max(100, lookback // 4 + 20)
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
         
         if not klines_1m or len(klines_1m) < 50:
@@ -1513,16 +1525,16 @@ def analyze_local_dip_condition(client, symbol, lookback=1200):
         print(f"TIMEZONE: GMT+2")
         print("="*80)
         print(f"--- STEP 1: LAST 1200 CANDLES ---")
-        print(f"Lowest Low: {lowest_low_price_1200:.2f} at index {lowest_low_idx_1200} ({lowest_low_time_1200.strftime('%Y-%m-%d %H:%M:%S')})")
-        print(f"Highest High: {highest_high_price_1200:.2f} at index {highest_high_idx_1200} ({highest_high_time_1200.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"Lowest Low: {lowest_low_price_1200:.25f} at index {lowest_low_idx_1200} ({lowest_low_time_1200.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"Highest High: {highest_high_price_1200:.25f} at index {highest_high_idx_1200} ({highest_high_time_1200.strftime('%Y-%m-%d %H:%M:%S')})")
         print(f"Most Recent: {'Lowest Low (Dip)' if dip_more_recent_1200 else 'Highest High (Top)'}")
         print(f"--- STEP 2: LAST 500 CANDLES ---")
-        print(f"Lowest Low: {lowest_low_price_500:.2f} at index {lowest_low_idx_500} ({lowest_low_time_500.strftime('%Y-%m-%d %H:%M:%S')})")
-        print(f"Highest High: {highest_high_price_500:.2f} at index {highest_high_idx_500} ({highest_high_time_500.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"Lowest Low: {lowest_low_price_500:.25f} at index {lowest_low_idx_500} ({lowest_low_time_500.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"Highest High: {highest_high_price_500:.25f} at index {highest_high_idx_500} ({highest_high_time_500.strftime('%Y-%m-%d %H:%M:%S')})")
         print(f"Most Recent: {'Lowest Low (Dip)' if dip_more_recent_500 else 'Highest High (Top)'}")
         print(f"--- STEP 3: LAST 200 CANDLES ---")
-        print(f"Lowest Low: {lowest_low_price_200:.2f} at index {lowest_low_idx_200} ({lowest_low_time_200.strftime('%Y-%m-%d %H:%M:%S')})")
-        print(f"Highest High: {highest_high_price_200:.2f} at index {highest_high_idx_200} ({highest_high_time_200.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"Lowest Low: {lowest_low_price_200:.25f} at index {lowest_low_idx_200} ({lowest_low_time_200.strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"Highest High: {highest_high_price_200:.25f} at index {highest_high_idx_200} ({highest_high_time_200.strftime('%Y-%m-%d %H:%M:%S')})")
         print(f"Most Recent: {'Lowest Low (Dip)' if dip_more_recent_200 else 'Highest High (Top)'}")
         print(f"--- STEP 4: CONFIRMATION ---")
         print(f"1200 Candles: {'Dip' if dip_more_recent_1200 else 'Top'}")
@@ -1568,8 +1580,7 @@ def analyze_local_dip_condition(client, symbol, lookback=1200):
 def analyze_dmi_condition(client, symbol, lookback=500):
     """Analyze DMI condition on 15-second timeframe for fast scalping."""
     try:
-        # FIX: Ensure we have enough 1-minute data for the 15s timeframe
-        min_1m_candles = max(100, lookback // 4 + 20)  # Add buffer for data cleaning
+        min_1m_candles = max(100, lookback // 4 + 20)
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
         
         if not klines_1m or len(klines_1m) < 50:
@@ -1619,8 +1630,7 @@ def analyze_dmi_condition(client, symbol, lookback=500):
 def analyze_momentum_condition(client, symbol, lookback=500):
     """Analyze Momentum condition on 15-second timeframe."""
     try:
-        # FIX: Ensure we have enough 1-minute data for the 15s timeframe
-        min_1m_candles = max(100, lookback // 4 + 20)  # Add buffer for data cleaning
+        min_1m_candles = max(100, lookback // 4 + 20)
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
         
         if not klines_1m or len(klines_1m) < 50:
@@ -1666,8 +1676,7 @@ def analyze_momentum_condition(client, symbol, lookback=500):
 def analyze_ml_forecast_condition(client, symbol, lookback=500):
     """Analyze ML linear regression forecast for up cycle."""
     try:
-        # FIX: Ensure we have enough 1-minute data for the 15s timeframe
-        min_1m_candles = max(100, lookback // 4 + 20)  # Add buffer for data cleaning
+        min_1m_candles = max(100, lookback // 4 + 20)
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
         
         if not klines_1m or len(klines_1m) < 50:
@@ -1721,8 +1730,7 @@ def analyze_ml_forecast_condition(client, symbol, lookback=500):
 def analyze_rsi_condition(client, symbol, lookback=500):
     """Analyze RSI oversold/overbought most recent condition using 15-second timeframe."""
     try:
-        # FIX: Ensure we have enough 1-minute data for the 15s timeframe
-        min_1m_candles = max(100, lookback // 4 + 20)  # Add buffer for data cleaning
+        min_1m_candles = max(100, lookback // 4 + 20)
         klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
         
         if not klines_1m or len(klines_1m) < 50:
@@ -1862,7 +1870,7 @@ def execute_buy_order(client, symbol, usdc_amount):
         quantity_decimal = (usdc_decimal / price_decimal) * Decimal('0.99')
         quantity = float(quantity_decimal)
         
-        print(f"Attempting to buy {symbol} with {max_usdc:.2f} USDC at price {current_price:.2f}")
+        print(f"Attempting to buy {symbol} with {max_usdc:.25f} USDC at price {current_price:.25f}")
         print(f"Calculated quantity before formatting: {quantity:.25f}")
         
         # Get symbol info for precision
@@ -2086,8 +2094,8 @@ def check_trade_status(client):
         entry_price = trade_info['entry_price']
         quantity = trade_info['quantity']
         
-        # Calculate target price for 0.35% clean profit after fees
-        # Target price = entry_price * (1 + 0.35% + 0.22% fee) = entry_price * 1.0057
+        # Calculate target price for 0.75% clean profit after fees
+        # Target price = entry_price * (1 + 0.75% + 0.22% fee) = entry_price * 1.0097
         target_price = entry_price * (1 + (PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT) / 100)
         
         price_diff = current_price - entry_price
@@ -2114,7 +2122,7 @@ def check_trade_status(client):
         
         # Check for profit target
         if current_price >= target_price:
-            print(f"\nPROFIT TARGET REACHED! Selling at {current_price:.6f}")
+            print(f"\nPROFIT TARGET REACHED! Selling at {current_price:.25f}")
             # Execute sell order for entire BTC balance
             sell_result = execute_sell_order(client, SYMBOL)
             
@@ -2122,8 +2130,8 @@ def check_trade_status(client):
                 print(f"SELL ORDER EXECUTED SUCCESSFULLY!")
                 print(f"Order ID: {sell_result['order_id']}")
                 print(f"Quantity Sold: {sell_result['quantity']:.25f}")
-                print(f"Estimated Profit: {(current_price - entry_price) * quantity:.6f} USDC")
-                print(f"Actual Profit After Fees: {actual_profit_pct:.2f}%")
+                print(f"Estimated Profit: {(current_price - entry_price) * quantity:.25f} USDC")
+                print(f"Actual Profit After Fees: {actual_profit_pct:.25f}%")
                 trade_active = False
                 trade_info = {}
                 
@@ -2152,14 +2160,14 @@ def display_trade_status():
     print("TRADE MONITOR - ACTIVE POSITION")
     print("="*80)
     print(f"{'Symbol:':<20}{trade_info['symbol']}")
-    print(f"{'Entry Price:':<20}{trade_info['entry_price']:.6f}")
+    print(f"{'Entry Price:':<20}{trade_info['entry_price']:.25f}")
     print(f"{'Entry Time:':<20}{trade_info['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"{'Current Price:':<20}{trade_info['current_price']:.6f}")
-    print(f"{'Price Difference:':<20}{trade_info['price_diff']:+.6f} ({trade_info['price_diff_pct']:+.2f}%)")
-    print(f"{'Actual Profit After Fees:':<20}{trade_info['actual_profit_pct']:+.2f}%")
+    print(f"{'Current Price:':<20}{trade_info['current_price']:.25f}")
+    print(f"{'Price Difference:':<20}{trade_info['price_diff']:+.25f} ({trade_info['price_diff_pct']:+.25f}%)")
+    print(f"{'Actual Profit After Fees:':<20}{trade_info['actual_profit_pct']:+.25f}%")
     print(f"{'Time Elapsed:':<20}{trade_info['time_elapsed']}")
-    print(f"{'Target Price:':<20}{trade_info['target_price']:.6f}")
-    print(f"{'Distance to Target:':<20}{trade_info['target_diff']:.6f} ({trade_info['target_diff_pct']:.2f}%)")
+    print(f"{'Target Price:':<20}{trade_info['target_price']:.25f}")
+    print(f"{'Distance to Target:':<20}{trade_info['target_diff']:+.25f} ({trade_info['target_diff_pct']:+.25f}%)")
     print(f"{'Quantity:':<20}{trade_info['quantity']:.25f}")
     print("="*80)
 
@@ -2177,7 +2185,7 @@ def perform_single_iteration_analysis(client):
     print(f"Time: {datetime.now(LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} (GMT+2)")
     print(f"Webhook Status: {'Connected' if webhook_data['current_price'] else 'Waiting for data'}")
     if webhook_data['current_price']:
-        print(f"Webhook Price: {webhook_data['current_price']:.2f}")
+        print(f"Webhook Price: {webhook_data['current_price']:.25f}")
     print("="*80)
     
     # Step 0: Check for active trade and resume if necessary
@@ -2200,7 +2208,7 @@ def perform_single_iteration_analysis(client):
     usdc_balance = get_account_balance(client, 'USDC')
     btc_balance = get_account_balance(client, 'BTC')
     
-    print(f"Current balances - BTC: {btc_balance:.25f}, USDC: {usdc_balance:.2f}")
+    print(f"Current balances - BTC: {btc_balance:.25f}, USDC: {usdc_balance:.25f}")
     
     # If trade is active, check status and display
     if trade_active:
@@ -2230,25 +2238,29 @@ def perform_single_iteration_analysis(client):
         print(f"Cycle Direction: {osc_15s_1200['cycle_direction']}")
         print(f"Current Price: {osc_15s_1200['current_price']:.25f}")
         print(f"Forecast Target: {osc_15s_1200['forecast_target']:.25f}")
-        print(f"Forecast Difference: {osc_15s_1200['forecast_diff_pct']:.2f}%")
+        print(f"Forecast Difference: {osc_15s_1200['forecast_diff_pct']:.25f}%")
         print(f"Lowest Low: {osc_15s_1200['lowest_low_price']:.25f} at {osc_15s_1200['lowest_low_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Highest High: {osc_15s_1200['highest_high_price']:.25f} at {osc_15s_1200['highest_high_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Most Recent: {'Lowest Low (Dip)' if osc_15s_1200['dip_more_recent'] else 'Highest High (Top)'}")
+        print(f"Dominant Frequency: {osc_15s_1200['dominant_frequency']:.25f}")
         
         # Display frequency analysis
         freq_analysis = osc_15s_1200.get('frequency_analysis', {})
         print(f"\nFrequency Analysis:")
-        print(f"  Most Predominant Frequency: {freq_analysis.get('dominant_frequency', 'unknown')}")
-        print(f"  Dominant Frequency Value: {freq_analysis.get('dominant_frequency_value', 0):.25f}")
-        print(f"  Positive Dominance: {freq_analysis.get('positive_dominance_pct', 0):.2f}%")
-        print(f"  Negative Dominance: {freq_analysis.get('negative_dominance_pct', 0):.2f}%")
+        print(f"  Most Powerful Positive Frequency: {freq_analysis.get('most_powerful_positive_freq', 0):.25f}")
+        print(f"  Most Powerful Positive Power: {freq_analysis.get('most_powerful_positive_power', 0):.25f}")
+        print(f"  Most Powerful Negative Frequency: {freq_analysis.get('most_powerful_negative_freq', 0):.25f}")
+        print(f"  Most Powerful Negative Power: {freq_analysis.get('most_powerful_negative_power', 0):.25f}")
+        print(f"  Positive Dominance: {freq_analysis.get('positive_dominance_pct', 0):.25f}%")
+        print(f"  Negative Dominance: {freq_analysis.get('negative_dominance_pct', 0):.25f}%")
         
         # Display volume analysis
         vol_analysis = osc_15s_1200.get('volume_analysis', {})
         print(f"\nVolume Analysis:")
-        print(f"  Bullish Volume: {vol_analysis.get('bullish_pct', 0):.2f}%")
-        print(f"  Bearish Volume: {vol_analysis.get('bearish_pct', 0):.2f}%")
+        print(f"  Bullish Volume: {vol_analysis.get('bullish_pct', 0):.25f}%")
+        print(f"  Bearish Volume: {vol_analysis.get('bearish_pct', 0):.25f}%")
         print(f"  Volume Sentiment: {vol_analysis.get('sentiment', 'neutral')}")
+        print(f"  Dominant Volume: {'Bullish' if vol_analysis.get('sentiment', 'neutral') == 'bullish' else 'Bearish'}")
     else:
         print(f"Error analyzing 15s 1200 oscillator: {osc_15s_1200['error']}")
     
@@ -2260,25 +2272,29 @@ def perform_single_iteration_analysis(client):
         print(f"Cycle Direction: {osc_15s_500['cycle_direction']}")
         print(f"Current Price: {osc_15s_500['current_price']:.25f}")
         print(f"Forecast Target: {osc_15s_500['forecast_target']:.25f}")
-        print(f"Forecast Difference: {osc_15s_500['forecast_diff_pct']:.2f}%")
+        print(f"Forecast Difference: {osc_15s_500['forecast_diff_pct']:.25f}%")
         print(f"Lowest Low: {osc_15s_500['lowest_low_price']:.25f} at {osc_15s_500['lowest_low_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Highest High: {osc_15s_500['highest_high_price']:.25f} at {osc_15s_500['highest_high_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Most Recent: {'Lowest Low (Dip)' if osc_15s_500['dip_more_recent'] else 'Highest High (Top)'}")
+        print(f"Dominant Frequency: {osc_15s_500['dominant_frequency']:.25f}")
         
         # Display frequency analysis
         freq_analysis = osc_15s_500.get('frequency_analysis', {})
         print(f"\nFrequency Analysis:")
-        print(f"  Most Predominant Frequency: {freq_analysis.get('dominant_frequency', 'unknown')}")
-        print(f"  Dominant Frequency Value: {freq_analysis.get('dominant_frequency_value', 0):.25f}")
-        print(f"  Positive Dominance: {freq_analysis.get('positive_dominance_pct', 0):.2f}%")
-        print(f"  Negative Dominance: {freq_analysis.get('negative_dominance_pct', 0):.2f}%")
+        print(f"  Most Powerful Positive Frequency: {freq_analysis.get('most_powerful_positive_freq', 0):.25f}")
+        print(f"  Most Powerful Positive Power: {freq_analysis.get('most_powerful_positive_power', 0):.25f}")
+        print(f"  Most Powerful Negative Frequency: {freq_analysis.get('most_powerful_negative_freq', 0):.25f}")
+        print(f"  Most Powerful Negative Power: {freq_analysis.get('most_powerful_negative_power', 0):.25f}")
+        print(f"  Positive Dominance: {freq_analysis.get('positive_dominance_pct', 0):.25f}%")
+        print(f"  Negative Dominance: {freq_analysis.get('negative_dominance_pct', 0):.25f}%")
         
         # Display volume analysis
         vol_analysis = osc_15s_500.get('volume_analysis', {})
         print(f"\nVolume Analysis:")
-        print(f"  Bullish Volume: {vol_analysis.get('bullish_pct', 0):.2f}%")
-        print(f"  Bearish Volume: {vol_analysis.get('bearish_pct', 0):.2f}%")
+        print(f"  Bullish Volume: {vol_analysis.get('bullish_pct', 0):.25f}%")
+        print(f"  Bearish Volume: {vol_analysis.get('bearish_pct', 0):.25f}%")
         print(f"  Volume Sentiment: {vol_analysis.get('sentiment', 'neutral')}")
+        print(f"  Dominant Volume: {'Bullish' if vol_analysis.get('sentiment', 'neutral') == 'bullish' else 'Bearish'}")
     else:
         print(f"Error analyzing 15s 500 oscillator: {osc_15s_500['error']}")
     
@@ -2290,18 +2306,21 @@ def perform_single_iteration_analysis(client):
         print(f"Cycle Direction: {osc_15s_200['cycle_direction']}")
         print(f"Current Price: {osc_15s_200['current_price']:.25f}")
         print(f"Forecast Target: {osc_15s_200['forecast_target']:.25f}")
-        print(f"Forecast Difference: {osc_15s_200['forecast_diff_pct']:.2f}%")
+        print(f"Forecast Difference: {osc_15s_200['forecast_diff_pct']:.25f}%")
         print(f"Lowest Low: {osc_15s_200['lowest_low_price']:.25f} at {osc_15s_200['lowest_low_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Highest High: {osc_15s_200['highest_high_price']:.25f} at {osc_15s_200['highest_high_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"Most Recent: {'Lowest Low (Dip)' if osc_15s_200['dip_more_recent'] else 'Highest High (Top)'}")
+        print(f"Dominant Frequency: {osc_15s_200['dominant_frequency']:.25f}")
         
         # Display frequency analysis
         freq_analysis = osc_15s_200.get('frequency_analysis', {})
         print(f"\nFrequency Analysis:")
-        print(f"  Most Predominant Frequency: {freq_analysis.get('dominant_frequency', 'unknown')}")
-        print(f"  Dominant Frequency Value: {freq_analysis.get('dominant_frequency_value', 0):.25f}")
-        print(f"  Positive Dominance: {freq_analysis.get('positive_dominance_pct', 0):.2f}%")
-        print(f"  Negative Dominance: {freq_analysis.get('negative_dominance_pct', 0):.2f}%")
+        print(f"  Most Powerful Positive Frequency: {freq_analysis.get('most_powerful_positive_freq', 0):.25f}")
+        print(f"  Most Powerful Positive Power: {freq_analysis.get('most_powerful_positive_power', 0):.25f}")
+        print(f"  Most Powerful Negative Frequency: {freq_analysis.get('most_powerful_negative_freq', 0):.25f}")
+        print(f"  Most Powerful Negative Power: {freq_analysis.get('most_powerful_negative_power', 0):.25f}")
+        print(f"  Positive Dominance: {freq_analysis.get('positive_dominance_pct', 0):.25f}%")
+        print(f"  Negative Dominance: {freq_analysis.get('negative_dominance_pct', 0):.25f}%")
     else:
         print(f"Error analyzing 15s 200 oscillator: {osc_15s_200['error']}")
     
@@ -2319,7 +2338,7 @@ def perform_single_iteration_analysis(client):
         print(f"Upper Band: {lrc_1m_details['upper_band']:.25f}")
         print(f"Lower Band: {lrc_1m_details['lower_band']:.25f}")
         print(f"Forecast Target: {lrc_1m_details['forecast_target']:.25f}")
-        print(f"Forecast Difference: {lrc_1m_details['forecast_diff_pct']:.2f}%")
+        print(f"Forecast Difference: {lrc_1m_details['forecast_diff_pct']:.25f}%")
         print(f"Forecast Above Current: {lrc_1m_details['forecast_above_current']}")
         print(f"Forecast Above Upper: {lrc_1m_details.get('forecast_above_upper', False)}")
         print(f"Forecast Below Lower: {lrc_1m_details.get('forecast_below_lower', False)}")
@@ -2327,14 +2346,14 @@ def perform_single_iteration_analysis(client):
         
         # Display trend strength
         trend_strength = lrc_1m_details.get('trend_strength', 0)
-        print(f"Trend Strength: {trend_strength:.2f}%")
+        print(f"Trend Strength: {trend_strength:.25f}%")
         
         # Additional trend info
         if 'regression_distance' in lrc_1m_details:
             regression_distance = lrc_1m_details['regression_distance']
             channel_width = lrc_1m_details['channel_width']
-            print(f"Regression Distance: {regression_distance:.6f}")
-            print(f"Channel Width: {channel_width:.6f}")
+            print(f"Regression Distance: {regression_distance:.25f}")
+            print(f"Channel Width: {channel_width:.25f}")
             
             # Display last occurrence information
             last_below_lower_idx = lrc_1m_details.get('last_below_lower_idx')
@@ -2361,7 +2380,7 @@ def perform_single_iteration_analysis(client):
         print(f"Upper Band: {lrc_15s_details['upper_band']:.25f}")
         print(f"Lower Band: {lrc_15s_details['lower_band']:.25f}")
         print(f"Forecast Target: {lrc_15s_details['forecast_target']:.25f}")
-        print(f"Forecast Difference: {lrc_15s_details['forecast_diff_pct']:.2f}%")
+        print(f"Forecast Difference: {lrc_15s_details['forecast_diff_pct']:.25f}%")
         print(f"Forecast Above Current: {lrc_15s_details['forecast_above_current']}")
         print(f"Forecast Above Upper: {lrc_15s_details.get('forecast_above_upper', False)}")
         print(f"Forecast Below Lower: {lrc_15s_details.get('forecast_below_lower', False)}")
@@ -2369,14 +2388,14 @@ def perform_single_iteration_analysis(client):
         
         # Display trend strength
         trend_strength = lrc_15s_details.get('trend_strength', 0)
-        print(f"Trend Strength: {trend_strength:.2f}%")
+        print(f"Trend Strength: {trend_strength:.25f}%")
         
         # Additional trend info
         if 'regression_distance' in lrc_15s_details:
             regression_distance = lrc_15s_details['regression_distance']
             channel_width = lrc_15s_details['channel_width']
-            print(f"Regression Distance: {regression_distance:.6f}")
-            print(f"Channel Width: {channel_width:.6f}")
+            print(f"Regression Distance: {regression_distance:.25f}")
+            print(f"Channel Width: {channel_width:.25f}")
             print(f"Forecast Target: {lrc_15s_details.get('forecast_target', 0):.25f}")
             
             # Display last occurrence information
@@ -2400,9 +2419,10 @@ def perform_single_iteration_analysis(client):
     volume_condition, volume_details = analyze_volume_condition(client, SYMBOL, lookback=500)
     
     if 'error' not in volume_details:
-        print(f"Bullish Volume: {volume_details['bullish_pct']:.2f}%")
-        print(f"Bearish Volume: {volume_details['bearish_pct']:.2f}%")
+        print(f"Bullish Volume: {volume_details['bullish_pct']:.25f}%")
+        print(f"Bearish Volume: {volume_details['bearish_pct']:.25f}%")
         print(f"Volume Sentiment: {volume_details['sentiment']}")
+        print(f"Dominant Volume: {'Bullish' if volume_details['sentiment'] == 'bullish' else 'Bearish'}")
         print(f"Volume Predominant: {volume_details['predominant']}")
         print(f"Condition Met: {volume_condition}")
     else:
@@ -2441,8 +2461,8 @@ def perform_single_iteration_analysis(client):
     condition_results['DMI Up Trend'] = dmi_met
     
     # Print details for this condition
-    print(f"\nLast DMI: {dmi_details.get('last_dmi', 0):.4f}")
-    print(f"Last ADX: {dmi_details.get('last_adx', 0):.4f}")
+    print(f"\nLast DMI: {dmi_details.get('last_dmi', 0):.25f}")
+    print(f"Last ADX: {dmi_details.get('last_adx', 0):.25f}")
     print(f"Condition Met: {dmi_met}")
     
     if dmi_met:
@@ -2463,7 +2483,7 @@ def perform_single_iteration_analysis(client):
     # Print details for this condition
     print(f"\nLast Price: {ml_details.get('last_price', 0):.25f}")
     print(f"Forecast Price: {ml_details.get('forecast_1', 0):.25f}")
-    print(f"Difference: {ml_details.get('diff', 0):.25f} ({ml_details.get('diff_pct', 0):.2f}%)")
+    print(f"Difference: {ml_details.get('diff', 0):.25f} ({ml_details.get('diff_pct', 0):.25f}%)")
     print(f"Condition Met: {ml_forecast_met}")
     
     if ml_forecast_met:
@@ -2484,7 +2504,7 @@ def perform_single_iteration_analysis(client):
     condition_results['RSI Oversold Most Recent'] = rsi_oversold_recent and not rsi_overbought_recent
     
     # Print details for this condition
-    print(f"\nCurrent RSI: {current_rsi:.2f}")
+    print(f"\nCurrent RSI: {current_rsi:.25f}")
     print(f"Oversold Most Recent: {rsi_oversold_recent}")
     print(f"Overbought Most Recent: {rsi_overbought_recent}")
     print(f"Condition Met: {rsi_oversold_recent and not rsi_overbought_recent}")
@@ -2571,9 +2591,9 @@ def perform_single_iteration_analysis(client):
         
         # Display additional LRC details
         if 'trend_strength' in lrc_1m_details:
-            print(f"Trend Strength: {lrc_1m_details['trend_strength']:.2f}%")
-            print(f"Regression Distance: {lrc_1m_details.get('regression_distance', 0):.6f}")
-            print(f"Channel Width: {lrc_1m_details.get('channel_width', 0):.6f}")
+            print(f"Trend Strength: {lrc_1m_details['trend_strength']:.25f}%")
+            print(f"Regression Distance: {lrc_1m_details.get('regression_distance', 0):.25f}")
+            print(f"Channel Width: {lrc_1m_details.get('channel_width', 0):.25f}")
             
             # Display last occurrence information
             last_below_lower_idx = lrc_1m_details.get('last_below_lower_idx')
@@ -2591,9 +2611,9 @@ def perform_single_iteration_analysis(client):
         
         # Display additional LRC details even when condition is not met
         if 'trend_strength' in lrc_1m_details:
-            print(f"Trend Strength: {lrc_1m_details['trend_strength']:.2f}%")
-            print(f"Regression Distance: {lrc_1m_details.get('regression_distance', 0):.6f}")
-            print(f"Channel Width: {lrc_1m_details.get('channel_width', 0):.6f}")
+            print(f"Trend Strength: {lrc_1m_details['trend_strength']:.25f}%")
+            print(f"Regression Distance: {lrc_1m_details.get('regression_distance', 0):.25f}")
+            print(f"Channel Width: {lrc_1m_details.get('channel_width', 0):.25f}")
             print(f"Forecast Target: {lrc_1m_details.get('forecast_target', 0):.25f}")
             
             # Display last occurrence information
@@ -2618,9 +2638,9 @@ def perform_single_iteration_analysis(client):
         
         # Display additional LRC details
         if 'trend_strength' in lrc_15s_details:
-            print(f"Trend Strength: {lrc_15s_details['trend_strength']:.2f}%")
-            print(f"Regression Distance: {lrc_15s_details.get('regression_distance', 0):.6f}")
-            print(f"Channel Width: {lrc_15s_details.get('channel_width', 0):.6f}")
+            print(f"Trend Strength: {lrc_15s_details['trend_strength']:.25f}%")
+            print(f"Regression Distance: {lrc_15s_details.get('regression_distance', 0):.25f}")
+            print(f"Channel Width: {lrc_15s_details.get('channel_width', 0):.25f}")
             print(f"Forecast Target: {lrc_15s_details.get('forecast_target', 0):.25f}")
             
             # Display last occurrence information
@@ -2639,9 +2659,9 @@ def perform_single_iteration_analysis(client):
         
         # Display additional LRC details even when condition is not met
         if 'trend_strength' in lrc_15s_details:
-            print(f"Trend Strength: {lrc_15s_details['trend_strength']:.2f}%")
-            print(f"Regression Distance: {lrc_15s_details.get('regression_distance', 0):.6f}")
-            print(f"Channel Width: {lrc_15s_details.get('channel_width', 0):.6f}")
+            print(f"Trend Strength: {lrc_15s_details['trend_strength']:.25f}%")
+            print(f"Regression Distance: {lrc_15s_details.get('regression_distance', 0):.25f}")
+            print(f"Channel Width: {lrc_15s_details.get('channel_width', 0):.25f}")
             print(f"Forecast Target: {lrc_15s_details.get('forecast_target', 0):.25f}")
             
             # Display last occurrence information
@@ -2668,9 +2688,10 @@ def perform_single_iteration_analysis(client):
         
         # Display additional volume details even when condition is not met
         if 'bullish_pct' in volume_details:
-            print(f"Bullish Volume: {volume_details['bullish_pct']:.2f}%")
-            print(f"Bearish Volume: {volume_details['bearish_pct']:.2f}%")
+            print(f"Bullish Volume: {volume_details['bullish_pct']:.25f}%")
+            print(f"Bearish Volume: {volume_details['bearish_pct']:.25f}%")
             print(f"Volume Sentiment: {volume_details['sentiment']}")
+            print(f"Dominant Volume: {'Bullish' if volume_details['sentiment'] == 'bullish' else 'Bearish'}")
     
     # Condition 11: Momentum Analysis (NEW)
     print("\n--- Condition 11: Momentum Analysis ---")
@@ -2682,7 +2703,7 @@ def perform_single_iteration_analysis(client):
     condition_results['Momentum > 0'] = momentum_met
     
     # Print details for this condition
-    print(f"\nLast Momentum: {momentum_details.get('last_momentum', 0):.6f}")
+    print(f"\nLast Momentum: {momentum_details.get('last_momentum', 0):.25f}")
     print(f"Condition Met: {momentum_met}")
     
     if momentum_met:
@@ -2716,8 +2737,8 @@ def perform_single_iteration_analysis(client):
             print(f"\nBUY ORDER EXECUTED SUCCESSFULLY!")
             print(f"Order ID: {buy_result['order_id']}")
             print(f"Quantity: {buy_result['quantity']:.25f}")
-            print(f"Price: {buy_result['price']:.6f}")
-            print(f"Cost: {buy_result['cost']:.2f} USDC (100% of balance)")
+            print(f"Price: {buy_result['price']:.25f}")
+            print(f"Cost: {buy_result['cost']:.25f} USDC (100% of balance)")
             
             # Set trade active and store trade info
             trade_active = True
@@ -2847,6 +2868,7 @@ def main():
     print("- Added Momentum > 0 condition from TA-Lib")
     print("- Enhanced dust conversion after entry (USDC to BTC)")
     print("- All TA-Lib functions now use cleaned data (no NaN or 0 values)")
+    print("- Added volume percentage and dominant volume prints")
     print("="*60)
     
     iteration_count = 0
