@@ -1943,7 +1943,15 @@ def analyze_fft_cycle(client, symbol, timeframe='1m', lookback=500):
         forecast_prices = improved_fft_forecast(close_prices, forecast_periods=4)
         forecast_target = forecast_prices[-1]
         
-        # Ensure forecast target is realistic
+        # Ensure forecast target is consistent with cycle direction
+        if cycle_direction == "up" and forecast_target <= current_price:
+            # If cycle is up but forecast is not above current price, adjust it
+            forecast_target = current_price * 1.01  # Small upward adjustment
+        elif cycle_direction == "down" and forecast_target >= current_price:
+            # If cycle is down but forecast is not below current price, adjust it
+            forecast_target = current_price * 0.99  # Small downward adjustment
+        
+        # Also ensure forecast target is realistic
         if forecast_target <= 0 or abs(forecast_target - current_price) > current_price * 0.05:
             # If forecast is unrealistic, use trend-adjusted current price
             if cycle_direction == "up":
