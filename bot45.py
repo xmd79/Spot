@@ -17,6 +17,8 @@ from datetime import datetime, timezone, timedelta
 from scipy.signal import hilbert, argrelextrema, find_peaks
 from scipy.fft import fft, fftfreq, ifft
 from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import MinMaxScaler
 from decimal import Decimal, getcontext
 
 # Suppress warnings for clean output
@@ -83,13 +85,20 @@ MIN_ITERATION_INTERVAL = 5  # 5 seconds between iterations
 WEBHOOK_PORT = 5000
 WEBHOOK_HOST = '0.0.0.0'
 
+# ML Configuration
+MIN_FORECAST_THRESHOLD = 0.1  # Minimum forecast percentage to consider significant
+MIN_FORECAST_CONFIDENCE = 0.6  # Minimum confidence level for ML forecasts
+ML_FORECAST_PERIODS = 4  # Number of periods to forecast
+
 # New configurable conditions - ALL must be met to trigger entry
 CONFIG = {
     "conditions": {
         "dmi_up_trend": True,
+        "dmi_up_trend_15s": True,  # New condition
         "ml_forecast_up_cycle": True,
         "ml_forecast_up_cycle_15s": True,
         "rsi_oversold_most_recent": True,
+        "rsi_oversold_most_recent_15s": True,  # New condition
         "volume_bullish_1m": True,
         "volume_bullish_15s": True,
         "momentum_positive": True,
@@ -97,7 +106,7 @@ CONFIG = {
         "fft_forecast_up_1m": True,  # Replaced HT_SINE FFT with FFT forecast
         "fft_forecast_up_15s": True   # Replaced HT_SINE FFT with FFT forecast
     },
-    "min_conditions_met": 10  # ALL 10 conditions must be met to trigger a trade
+    "min_conditions_met": 12  # ALL 12 conditions must be met to trigger a trade
 }
 
 # Global stop event
@@ -1032,48 +1041,233 @@ def calculate_momentum(df, period=10):
         print(f"calculate_momentum error: {e}")
         return None
 
-# ------------------ ML Linear Regression Forecast ------------------
+# ------------------ Enhanced ML Linear Regression Forecast ------------------
 
-def ml_linear_regression_forecast(df, forecast_periods=4):
-    """Forecast prices using linear regression with cleaned data."""
+def ensemble_ml_forecast(df, forecast_periods=4):
+    """
+    Ensemble ML forecast using multiple models.
+    Returns prediction, confidence, and details.
+    """
     try:
-        if df is None or len(df) < 20:
-            return None
+        if df is None or len(df) < 50:
+            return None, 0.0, {"error": "Insufficient data"}
         
-        # Clean data before analysis
+        # Clean data
         df_clean = clean_ohlc_data(df.copy())
         close_prices = validate_and_clean_data(df_clean['close'].values.astype(float))
         
-        if close_prices is None or len(close_prices) < 20:
-            return None
+        if close_prices is None or len(close_prices) < 50:
+            return None, 0.0, {"error": "Invalid price data"}
         
-        # Prepare data for linear regression
-        X = np.arange(len(close_prices)).reshape(-1, 1)
-        y = close_prices
+        # Create a pandas Series for shift operations
+        price_series = pd.Series(close_prices)
         
-        # Fit linear regression model
-        model = LinearRegression()
-        model.fit(X, y)
+        # Prepare features
+        df_features = pd.DataFrame()
+        df_features['price'] = price_series
         
-        # Forecast future values
-        future_X = np.arange(len(close_prices), len(close_prices) + forecast_periods).reshape(-1, 1)
-        forecast = model.predict(future_X)
+        # Add technical indicators as features
+        df_features['sma_5'] = talib.SMA(close_prices, timeperiod=5)
+        df_features['sma_10'] = talib.SMA(close_prices, timeperiod=10)
+        df_features['sma_20'] = talib.SMA(close_prices, timeperiod=20)
+        df_features['ema_5'] = talib.EMA(close_prices, timeperiod=5)
+        df_features['ema_10'] = talib.EMA(close_prices, timeperiod=10)
+        df_features['rsi'] = talib.RSI(close_prices, timeperiod=14)
+        df_features['macd'], df_features['macd_signal'], _ = talib.MACD(close_prices)
         
-        # Clean forecast values
-        forecast = validate_and_clean_data(forecast, default_value=close_prices[-1])
+        # Add lag features using pandas Series (FIXED)
+        for i in range(1, 6):
+            df_features[f'lag_{i}'] = price_series.shift(i)
         
-        if forecast is None:
-            return None
+        # Clean features
+        df_features = df_features.fillna(method='ffill').fillna(method='bfill')
         
-        # Add forecast to dataframe
-        df_result = df.copy()
-        for i, price in enumerate(forecast):
-            df_result[f'forecast_{i+1}'] = price
+        # Prepare X and y for training
+        X = df_features.iloc[:-forecast_periods].values
+        y = close_prices[forecast_periods:]
         
-        return df_result
+        # Scale features
+        scaler = MinMaxScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # Train multiple models
+        models = {
+            'linear': LinearRegression(),
+            'rf': RandomForestRegressor(n_estimators=50, random_state=42)
+        }
+        
+        predictions = {}
+        
+        for name, model in models.items():
+            try:
+                model.fit(X_scaled, y)
+                
+                # Prepare the last data for prediction
+                last_data = df_features.iloc[-1:].values
+                last_data_scaled = scaler.transform(last_data)
+                
+                # Make prediction
+                pred = model.predict(last_data_scaled)[0]
+                predictions[name] = pred
+            except Exception as e:
+                print(f"Error in {name} model: {e}")
+                continue
+        
+        if not predictions:
+            return None, 0.0, {"error": "All models failed"}
+        
+        # Ensemble prediction (simple average)
+        ensemble_pred = np.mean(list(predictions.values()))
+        
+        # Calculate confidence based on model agreement
+        pred_values = list(predictions.values())
+        confidence = 1.0 - (np.std(pred_values) / np.mean(pred_values))
+        confidence = max(0.0, min(1.0, confidence))
+        
+        # Ensure prediction is realistic (FIXED)
+        last_price = close_prices[-1]
+        if ensemble_pred <= 0:
+            ensemble_pred = last_price
+        elif abs(ensemble_pred - last_price) > last_price * 0.05:  # Limit to 5% change
+            ensemble_pred = last_price * (1 + 0.05 if ensemble_pred > last_price else -0.05)
+        
+        details = {
+            "predictions": predictions,
+            "ensemble_prediction": ensemble_pred,
+            "confidence": confidence,
+            "last_price": last_price,
+            "features_used": list(df_features.columns)
+        }
+        
+        return ensemble_pred, confidence, details
+        
     except Exception as e:
-        print(f"ml_linear_regression_forecast error: {e}")
-        return None
+        print(f"Error in ensemble ML forecast: {e}")
+        return None, 0.0, {"error": str(e)}
+
+def analyze_ml_forecast_condition(client, symbol, timeframe='1m', lookback=500):
+    """Analyze multi-model ML forecast for significant price reversal."""
+    try:
+        # Always get 1m data first (FIXED)
+        klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
+        
+        if not klines or len(klines) < 100:
+            return False, {"error": "Insufficient data"}
+            
+        df = pd.DataFrame(klines, columns=[
+            'timestamp','open','high','low','close','volume','close_time',
+            'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
+            'taker_buy_quote_asset_volume','ignore'])
+        
+        # Convert timestamp to datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # Clean OHLC data
+        df = clean_ohlc_data(df)
+        
+        # Create artificial 15-second timeframe if needed (FIXED)
+        if timeframe == '15s':
+            df_15sec = create_15sec_timeframe(df)
+            df = df_15sec
+        
+        # Apply ensemble ML forecast
+        ensemble_prediction, ensemble_confidence, ml_details = ensemble_ml_forecast(df, ML_FORECAST_PERIODS)
+        
+        if ensemble_prediction is None:
+            return False, {"error": "Failed to apply ensemble ML forecast"}
+        
+        # Get the last price
+        last_price = float(df['close'].iloc[-1])
+        
+        # Calculate the difference
+        diff = ensemble_prediction - last_price
+        diff_pct = (diff / last_price) * 100 if last_price > 0 else 0
+        
+        # Condition: forecast suggests a significant up cycle
+        condition_met = (diff > 0 and 
+                      diff_pct >= MIN_FORECAST_THRESHOLD and 
+                      ensemble_confidence >= MIN_FORECAST_CONFIDENCE)
+        
+        # Update details with additional info
+        ml_details.update({
+            "last_price": last_price,
+            "ensemble_prediction": ensemble_prediction,
+            "diff": diff,
+            "diff_pct": diff_pct,
+            "condition_met": condition_met,
+            "threshold_met": diff_pct >= MIN_FORECAST_THRESHOLD,
+            "confidence_met": ensemble_confidence >= MIN_FORECAST_CONFIDENCE
+        })
+        
+        return condition_met, ml_details
+        
+    except Exception as e:
+        print(f"analyze_ml_forecast_condition error: {e}")
+        return False, {"error": str(e)}
+
+def analyze_ml_forecast_condition(client, symbol, timeframe='1m', lookback=500):
+    """Analyze multi-model ML forecast for significant price reversal."""
+    try:
+        # Get data based on timeframe - FIXED: Always get 1m data first
+        if timeframe == '1m':
+            klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
+        else:  # 15s timeframe - get 1m data and convert to 15s
+            min_1m_candles = max(100, lookback // 4 + 20)
+            klines = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
+            
+        if not klines or len(klines) < 100:
+            return False, {"error": "Insufficient data"}
+            
+        df = pd.DataFrame(klines, columns=[
+            'timestamp','open','high','low','close','volume','close_time',
+            'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
+            'taker_buy_quote_asset_volume','ignore'])
+        
+        # Convert timestamp to datetime
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        
+        # Clean OHLC data
+        df = clean_ohlc_data(df)
+        
+        # Create artificial 15-second timeframe if needed
+        if timeframe == '15s':
+            df_15sec = create_15sec_timeframe(df)
+            df = df_15sec
+        
+        # Apply ensemble ML forecast
+        ensemble_prediction, ensemble_confidence, ml_details = ensemble_ml_forecast(df, ML_FORECAST_PERIODS)
+        
+        if ensemble_prediction is None:
+            return False, {"error": "Failed to apply ensemble ML forecast"}
+        
+        # Get the last price
+        last_price = float(df['close'].iloc[-1])
+        
+        # Calculate the difference
+        diff = ensemble_prediction - last_price
+        diff_pct = (diff / last_price) * 100 if last_price > 0 else 0
+        
+        # Condition: forecast suggests a significant up cycle
+        condition_met = (diff > 0 and 
+                      diff_pct >= MIN_FORECAST_THRESHOLD and 
+                      ensemble_confidence >= MIN_FORECAST_CONFIDENCE)
+        
+        # Update details with additional info
+        ml_details.update({
+            "last_price": last_price,
+            "ensemble_prediction": ensemble_prediction,
+            "diff": diff,
+            "diff_pct": diff_pct,
+            "condition_met": condition_met,
+            "threshold_met": diff_pct >= MIN_FORECAST_THRESHOLD,
+            "confidence_met": ensemble_confidence >= MIN_FORECAST_CONFIDENCE
+        })
+        
+        return condition_met, ml_details
+        
+    except Exception as e:
+        print(f"analyze_ml_forecast_condition error: {e}")
+        return False, {"error": str(e)}
 
 # ------------------ Enhanced FFT Analysis with Proper Frequency Gradients ------------------
 
@@ -1537,105 +1731,6 @@ def analyze_momentum_condition(client, symbol, lookback=500, timeframe='1m'):
         
     except Exception as e:
         print(f"analyze_momentum_condition error: {e}")
-        return False, {"error": str(e)}
-
-def analyze_ml_forecast_condition(client, symbol, lookback=500, timeframe='1m'):
-    """Analyze ML linear regression forecast for up cycle."""
-    try:
-        # Get data based on timeframe
-        if timeframe == '1m':
-            klines = client.get_klines(symbol=symbol, interval='1m', limit=lookback)
-        else:  # 15s timeframe
-            # Get 1m data and convert to 15s
-            min_1m_candles = max(100, lookback // 4 + 20)
-            klines_1m = client.get_klines(symbol=symbol, interval='1m', limit=min_1m_candles)
-            
-            if not klines_1m or len(klines_1m) < 50:
-                return False, {"error": "Insufficient data for 15s ML forecast analysis"}
-                
-            df_1m = pd.DataFrame(klines_1m, columns=[
-                'timestamp','open','high','low','close','volume','close_time',
-                'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
-                'taker_buy_quote_asset_volume','ignore'])
-            
-            # Convert timestamp to datetime in GMT+2 timezone
-            df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
-            
-            # Clean OHLC data
-            df_1m = clean_ohlc_data(df_1m)
-            
-            # Create artificial 15-second timeframe
-            df_15sec = create_15sec_timeframe(df_1m)
-            
-            # Ensure we have enough 15-second data
-            if len(df_15sec) < lookback:
-                return False, {"error": f"Insufficient 15s data: got {len(df_15sec)}, needed {lookback}"}
-            
-            # Trim to the requested lookback
-            df_15sec = df_15sec.tail(lookback)
-            
-            # Convert back to klines format for consistent processing
-            klines = []
-            for idx, row in df_15sec.iterrows():
-                klines.append([
-                    int(row['timestamp'].timestamp() * 1000),  # timestamp
-                    row['open'],  # open
-                    row['high'],  # high
-                    row['low'],  # low
-                    row['close'],  # close
-                    row['volume'],  # volume
-                    int(row['timestamp'].timestamp() * 1000),  # close_time
-                    0,  # quote_asset_volume
-                    0,  # number_of_trades
-                    0,  # taker_buy_base_asset_volume
-                    0,  # taker_buy_quote_asset_volume
-                    0   # ignore
-                ])
-        
-        if not klines or len(klines) < 50:
-            return False, {"error": "Insufficient data for ML forecast analysis"}
-            
-        df = pd.DataFrame(klines, columns=[
-            'timestamp','open','high','low','close','volume','close_time',
-            'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
-            'taker_buy_quote_asset_volume','ignore'])
-        
-        # Convert timestamp to datetime in GMT+2 timezone
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
-        
-        # Clean OHLC data
-        df = clean_ohlc_data(df)
-        
-        # Apply ML linear regression forecast
-        df = ml_linear_regression_forecast(df)
-        
-        if df is None or 'forecast_1' not in df.columns:
-            return False, {"error": "Failed to apply ML linear regression forecast"}
-        
-        # Get the last price and forecast
-        last_price = float(df['close'].iloc[-1])
-        forecast_1 = float(df['forecast_1'].iloc[-1])
-        
-        # Calculate the difference
-        diff = forecast_1 - last_price
-        diff_pct = (diff / last_price) * 100 if last_price > 0 else 0
-        
-        # Condition: forecast suggests an up cycle (positive difference)
-        condition_met = diff > 0
-        
-        details = {
-            "timeframe": timeframe,
-            "last_price": last_price,
-            "forecast_1": forecast_1,
-            "diff": diff,
-            "diff_pct": diff_pct,
-            "condition_met": condition_met
-        }
-        
-        return condition_met, details
-        
-    except Exception as e:
-        print(f"analyze_ml_forecast_condition error: {e}")
         return False, {"error": str(e)}
 
 def analyze_rsi_condition(client, symbol, lookback=500, timeframe='1m'):
@@ -2379,7 +2474,7 @@ def perform_single_iteration_analysis(client):
     print("\n3. Analyzing trading conditions...")
     
     conditions_met = 0
-    total_conditions = 10  # Total number of conditions
+    total_conditions = 12  # Total number of conditions
     condition_results = {}  # Store individual condition results
     
     # Condition 1: DMI Up Trend (1m)
@@ -2398,15 +2493,32 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - DMI Up Trend (1m) condition NOT met")
     
-    # Condition 2: ML Forecast Up Cycle (1m)
-    print("\n--- Condition 2: ML Forecast Up Cycle (1m) ---")
-    ml_1m_met, ml_1m_details = analyze_ml_forecast_condition(client, SYMBOL, 500, '1m')
+    # Condition 2: DMI Up Trend (15s) - NEW
+    print("\n--- Condition 2: DMI Up Trend (15s) ---")
+    dmi_15s_met, dmi_15s_details = analyze_dmi_condition(client, SYMBOL, 500, '15s')
+    condition_results['DMI Up Trend (15s)'] = dmi_15s_met
+    
+    # Print details for this condition
+    print(f"\nLast DMI: {dmi_15s_details.get('last_dmi', 0):.25f}")
+    print(f"Last ADX: {dmi_15s_details.get('last_adx', 0):.25f}")
+    print(f"Condition Met: {dmi_15s_met}")
+    
+    if dmi_15s_met:
+        conditions_met += 1
+        print("\nTRUE - DMI Up Trend (15s) condition MET")
+    else:
+        print("\nFALSE - DMI Up Trend (15s) condition NOT met")
+    
+    # Condition 3: ML Forecast Up Cycle (1m)
+    print("\n--- Condition 3: ML Forecast Up Cycle (1m) ---")
+    ml_1m_met, ml_1m_details = analyze_ml_forecast_condition(client, SYMBOL, '1m', 500)
     condition_results['ML Forecast Up Cycle (1m)'] = ml_1m_met
     
     # Print details for this condition
     print(f"\nLast Price: {ml_1m_details.get('last_price', 0):.25f}")
-    print(f"Forecast Price: {ml_1m_details.get('forecast_1', 0):.25f}")
+    print(f"Forecast Price: {ml_1m_details.get('ensemble_prediction', 0):.25f}")
     print(f"Difference: {ml_1m_details.get('diff', 0):.25f} ({ml_1m_details.get('diff_pct', 0):.25f}%)")
+    print(f"Confidence: {ml_1m_details.get('confidence', 0):.25f}")
     print(f"Condition Met: {ml_1m_met}")
     
     if ml_1m_met:
@@ -2415,15 +2527,16 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - ML Forecast Up Cycle (1m) condition NOT met")
     
-    # Condition 3: ML Forecast Up Cycle (15s)
-    print("\n--- Condition 3: ML Forecast Up Cycle (15s) ---")
-    ml_15s_met, ml_15s_details = analyze_ml_forecast_condition(client, SYMBOL, 500, '15s')
+    # Condition 4: ML Forecast Up Cycle (15s)
+    print("\n--- Condition 4: ML Forecast Up Cycle (15s) ---")
+    ml_15s_met, ml_15s_details = analyze_ml_forecast_condition(client, SYMBOL, '15s', 500)
     condition_results['ML Forecast Up Cycle (15s)'] = ml_15s_met
     
     # Print details for this condition
     print(f"\nLast Price: {ml_15s_details.get('last_price', 0):.25f}")
-    print(f"Forecast Price: {ml_15s_details.get('forecast_1', 0):.25f}")
+    print(f"Forecast Price: {ml_15s_details.get('ensemble_prediction', 0):.25f}")
     print(f"Difference: {ml_15s_details.get('diff', 0):.25f} ({ml_15s_details.get('diff_pct', 0):.25f}%)")
+    print(f"Confidence: {ml_15s_details.get('confidence', 0):.25f}")
     print(f"Condition Met: {ml_15s_met}")
     
     if ml_15s_met:
@@ -2432,8 +2545,8 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - ML Forecast Up Cycle (15s) condition NOT met")
     
-    # Condition 4: RSI Oversold Most Recent (1m)
-    print("\n--- Condition 4: RSI Oversold Most Recent (1m) ---")
+    # Condition 5: RSI Oversold Most Recent (1m)
+    print("\n--- Condition 5: RSI Oversold Most Recent (1m) ---")
     rsi_1m_oversold, rsi_1m_overbought, rsi_1m_value, rsi_1m_details = analyze_rsi_condition(client, SYMBOL, 500, '1m')
     rsi_1m_met = rsi_1m_oversold and not rsi_1m_overbought
     condition_results['RSI Oversold Most Recent (1m)'] = rsi_1m_met
@@ -2450,8 +2563,26 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - RSI Oversold Most Recent (1m) condition NOT met")
     
-    # Condition 5: Volume Bullish Predominant (1m)
-    print("\n--- Condition 5: Volume Bullish Predominant (1m) ---")
+    # Condition 6: RSI Oversold Most Recent (15s) - NEW
+    print("\n--- Condition 6: RSI Oversold Most Recent (15s) ---")
+    rsi_15s_oversold, rsi_15s_overbought, rsi_15s_value, rsi_15s_details = analyze_rsi_condition(client, SYMBOL, 500, '15s')
+    rsi_15s_met = rsi_15s_oversold and not rsi_15s_overbought
+    condition_results['RSI Oversold Most Recent (15s)'] = rsi_15s_met
+    
+    # Print details for this condition
+    print(f"\nCurrent RSI: {rsi_15s_value:.25f}")
+    print(f"Oversold Most Recent: {rsi_15s_oversold}")
+    print(f"Overbought Most Recent: {rsi_15s_overbought}")
+    print(f"Condition Met: {rsi_15s_met}")
+    
+    if rsi_15s_met:
+        conditions_met += 1
+        print("\nTRUE - RSI Oversold Most Recent (15s) condition MET")
+    else:
+        print("\nFALSE - RSI Oversold Most Recent (15s) condition NOT met")
+    
+    # Condition 7: Volume Bullish Predominant (1m)
+    print("\n--- Condition 7: Volume Bullish Predominant (1m) ---")
     volume_1m_met, volume_1m_details = analyze_volume_condition(client, SYMBOL, 500, '1m')
     condition_results['Volume Bullish Predominant (1m)'] = volume_1m_met
     
@@ -2468,8 +2599,8 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - Volume Bullish Predominant (1m) condition NOT met")
     
-    # Condition 6: Volume Bullish Predominant (15s)
-    print("\n--- Condition 6: Volume Bullish Predominant (15s) ---")
+    # Condition 8: Volume Bullish Predominant (15s)
+    print("\n--- Condition 8: Volume Bullish Predominant (15s) ---")
     volume_15s_met, volume_15s_details = analyze_volume_condition(client, SYMBOL, 500, '15s')
     condition_results['Volume Bullish Predominant (15s)'] = volume_15s_met
     
@@ -2486,8 +2617,8 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - Volume Bullish Predominant (15s) condition NOT met")
     
-    # Condition 7: Momentum > 0 (1m)
-    print("\n--- Condition 7: Momentum > 0 (1m) ---")
+    # Condition 9: Momentum > 0 (1m)
+    print("\n--- Condition 9: Momentum > 0 (1m) ---")
     momentum_1m_met, momentum_1m_details = analyze_momentum_condition(client, SYMBOL, 500, '1m')
     condition_results['Momentum > 0 (1m)'] = momentum_1m_met
     
@@ -2501,8 +2632,8 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - Momentum > 0 (1m) condition NOT met")
     
-    # Condition 8: Momentum > 0 (15s)
-    print("\n--- Condition 8: Momentum > 0 (15s) ---")
+    # Condition 10: Momentum > 0 (15s)
+    print("\n--- Condition 10: Momentum > 0 (15s) ---")
     momentum_15s_met, momentum_15s_details = analyze_momentum_condition(client, SYMBOL, 500, '15s')
     condition_results['Momentum > 0 (15s)'] = momentum_15s_met
     
@@ -2516,14 +2647,13 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - Momentum > 0 (15s) condition NOT met")
     
-    # Condition 9: FFT Forecast Up (1m) - REPLACED HT_SINE FFT
-    print("\n--- Condition 9: FFT Forecast Up (1m) ---")
+    # Condition 11: FFT Forecast Up (1m) - REPLACED HT_SINE FFT
+    print("\n--- Condition 11: FFT Forecast Up (1m) ---")
     fft_1m_forecast_met = False
     if 'error' not in fft_1m:
         # Check if forecast target is higher than current price
         fft_1m_forecast_met = fft_1m['forecast_target'] > fft_1m['current_price']
         condition_results['FFT Forecast Up (1m)'] = fft_1m_forecast_met
-        
         # Print details for this condition
         print(f"\nCurrent Price: {fft_1m['current_price']:.25f}")
         print(f"Forecast Target: {fft_1m['forecast_target']:.25f}")
@@ -2540,8 +2670,8 @@ def perform_single_iteration_analysis(client):
         print(f"\nError analyzing 1m FFT cycle: {fft_1m['error']}")
         print("\nFALSE - FFT Forecast Up (1m) condition NOT met")
     
-    # Condition 10: FFT Forecast Up (15s) - REPLACED HT_SINE FFT
-    print("\n--- Condition 10: FFT Forecast Up (15s) ---")
+    # Condition 12: FFT Forecast Up (15s) - REPLACED HT_SINE FFT
+    print("\n--- Condition 12: FFT Forecast Up (15s) ---")
     fft_15s_forecast_met = False
     if 'error' not in fft_15s:
         # Check if forecast target is higher than current price
@@ -2673,11 +2803,13 @@ def main():
     print("1. Check and convert dust only once when needed")
     print("2. Use webhook data for real-time price updates")
     print("3. Analyze FFT cycles for both 1m and 15s timeframes")
-    print("4. Analyze 10 configurable trading conditions including:")
+    print("4. Analyze 12 configurable trading conditions including:")
     print("   - DMI Up Trend (1m)")
+    print("   - DMI Up Trend (15s) - NEW")
     print("   - ML Forecast Up Cycle (1m)")
     print("   - ML Forecast Up Cycle (15s)")
     print("   - RSI Oversold Most Recent (1m)")
+    print("   - RSI Oversold Most Recent (15s) - NEW")
     print("   - Volume Bullish Predominant (1m)")
     print("   - Volume Bullish Predominant (15s)")
     print("   - Momentum > 0 (1m)")
@@ -2691,7 +2823,8 @@ def main():
     print("9. Convert any remaining BTC to USDC after exiting trade")
     print("10. Clean up for next iteration")
     print("\nEnhanced Features:")
-    print("- Improved FFT analysis with robust frequency filtering")
+    print("- Improved ML ensemble forecasting with confidence scoring")
+    print("- Fixed 0-value issues in ML forecasts")
     print("- More realistic 15-second timeframe creation")
     print("- Configurable conditions instead of requiring all conditions")
     print("- FFT analysis between argmin and argmax for both timeframes")
