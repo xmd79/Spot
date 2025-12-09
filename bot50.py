@@ -97,7 +97,7 @@ PYTHAGOREAN_TRIPLES = [
     (28, 45, 53), (33, 56, 65), (36, 77, 85), (39, 80, 89), (48, 55, 73)
 ]
 
-# New configurable conditions - ONLY the 8 specified conditions
+# New configurable conditions - ONLY the 9 specified conditions
 CONFIG = {
     "conditions": {
         "rsi_oversold_most_recent": True,
@@ -2329,7 +2329,11 @@ def perform_single_iteration_analysis(client):
         
         closest_triple = pythagorean_values.get('closest_triple', None)
         if closest_triple:
-            print(f"  Closest Triple: {closest_triple}")
+            # Fixed: Convert numpy float64 values to regular floats for clean display
+            a_val = float(closest_triple[0])
+            b_val = float(closest_triple[1])
+            c_val = float(closest_triple[2])
+            print(f"  Closest Triple: ({a_val:.25f}, {b_val:.25f}, {c_val:.25f})")
     else:
         print(f"Error analyzing 1m Pythagorean Harmonics: {pythagorean_1m['error']}")
     
@@ -2355,7 +2359,11 @@ def perform_single_iteration_analysis(client):
         
         closest_triple = pythagorean_values.get('closest_triple', None)
         if closest_triple:
-            print(f"  Closest Triple: {closest_triple}")
+            # Fixed: Convert numpy float64 values to regular floats for clean display
+            a_val = float(closest_triple[0])
+            b_val = float(closest_triple[1])
+            c_val = float(closest_triple[2])
+            print(f"  Closest Triple: ({a_val:.25f}, {b_val:.25f}, {c_val:.25f})")
     else:
         print(f"Error analyzing 15s Pythagorean Harmonics: {pythagorean_15s['error']}")
     
@@ -2529,7 +2537,7 @@ def perform_single_iteration_analysis(client):
     
     if momentum_15s_met:
         conditions_met += 1
-        print("\nTRUE - Momentum > 0 (15s) condition MET")
+        print("\nTRUE - Momentum > 0 (15s) condition NOT met")
     else:
         print("\nFALSE - Momentum > 0 (15s) condition NOT met")
     
