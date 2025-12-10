@@ -119,7 +119,6 @@ stop_event = threading.Event()
 # Trade state variables
 trade_active = False
 trade_info = {}
-dust_converted_this_session = False  # Track if dust conversion was done this session
 
 # Webhook data storage
 webhook_data = {
@@ -563,200 +562,6 @@ def start_webhook_server():
     except Exception as e:
         print(f"Error starting webhook server: {e}")
         app.run(host=WEBHOOK_HOST, port=WEBHOOK_PORT, debug=False, use_reloader=False)
-
-# ------------------ Enhanced Dust Conversion Functions ------------------
-
-def convert_btc_to_usdc(client):
-    """
-    Convert all available BTC to USDC using market orders.
-    This ensures no BTC remains after a trade exit.
-    """
-    try:
-        print("Checking for BTC to convert...")
-        btc_balance = get_account_balance(client, 'BTC')
-        
-        # Distinguish between zero and very small balance
-        if btc_balance <= MIN_BTC_THRESHOLD:
-            print(f"BTC balance is effectively zero: {btc_balance:.25f}")
-            return True
-        
-        print(f"Converting {btc_balance:.25f} BTC to USDC...")
-        
-        # Get current price for information
-        ticker = client.get_symbol_ticker(symbol='BTCUSDC')
-        current_price = float(ticker['price'])
-        
-        # Calculate quantity to sell (all available BTC)
-        quantity = btc_balance
-        
-        # Get symbol info for precision
-        symbol_info = get_symbol_info(client, 'BTCUSDC')
-        
-        if symbol_info and 'LOT_SIZE' in symbol_info['filters']:
-            lot_size_filter = symbol_info['filters']['LOT_SIZE']
-            step_size = lot_size_filter['stepSize']
-            min_qty = lot_size_filter['minQty']
-            
-            # Format quantity according to step size
-            quantity = format_quantity(quantity, step_size)
-            
-            # Ensure quantity is within min/max limits
-            if quantity < min_qty:
-                print(f"Quantity {quantity:.25f} is below minimum {min_qty}, cannot convert")
-                return False
-        else:
-            # Default to BTC_PRECISION decimal places if symbol info retrieval fails
-            print("Warning: Could not get LOT_SIZE filter, using default precision")
-            quantity = round(quantity, BTC_PRECISION)
-        
-        # Execute market sell order
-        order = client.order_market_sell(
-            symbol='BTCUSDC',
-            quantity=quantity
-        )
-        
-        print(f"BTC conversion successful! Sold {quantity:.25f} BTC at {current_price:.25f} USDC")
-        return True
-        
-    except BinanceAPIException as e:
-        print(f"Binance API error during BTC conversion: {e}")
-        return False
-    except Exception as e:
-        print(f"Unexpected error during BTC conversion: {e}")
-        return False
-
-def convert_usdc_to_btc(client):
-    """
-    Convert all available USDC to BTC using market orders.
-    This ensures no USDC remains after a trade entry.
-    Fixed to handle small quantities properly.
-    """
-    try:
-        print("Checking for USDC to convert...")
-        usdc_balance = get_account_balance(client, 'USDC')
-        
-        # Distinguish between zero and very small balance
-        if usdc_balance <= MIN_USDC_THRESHOLD:
-            print(f"USDC balance is effectively zero: {usdc_balance:.25f}")
-            return True
-        
-        print(f"Converting {usdc_balance:.25f} USDC to BTC...")
-        
-        # Get current price for information
-        ticker = client.get_symbol_ticker(symbol='BTCUSDC')
-        current_price = float(ticker['price'])
-        
-        # Calculate quantity to buy (all available USDC)
-        # Use Decimal for more precise calculation with small amounts
-        usdc_decimal = Decimal(str(usdc_balance))
-        price_decimal = Decimal(str(current_price))
-        
-        # Calculate quantity with 0.99 factor for fees (1% buffer)
-        quantity_decimal = (usdc_decimal / price_decimal) * Decimal('0.99')
-        quantity = float(quantity_decimal)
-        
-        print(f"Calculated quantity before formatting: {quantity:.25f}")
-        
-        # Get symbol info for precision
-        symbol_info = get_symbol_info(client, 'BTCUSDC')
-        
-        if symbol_info and 'LOT_SIZE' in symbol_info['filters']:
-            lot_size_filter = symbol_info['filters']['LOT_SIZE']
-            step_size = lot_size_filter['stepSize']
-            min_qty = lot_size_filter['minQty']
-            
-            print(f"LOT_SIZE filter: min={min_qty}, max={lot_size_filter.get('maxQty', 'inf')}, step={step_size}")
-            
-            # For very small quantities, use rounding instead of floor to avoid zero
-            if quantity < min_qty * 10:
-                # Use regular rounding for small quantities
-                precision = int(round(-math.log10(step_size)))
-                precision = max(0, min(BTC_PRECISION, precision))
-                quantity = round(quantity, precision)
-            else:
-                # Format quantity according to step size for larger quantities
-                quantity = format_quantity(quantity, step_size)
-            
-            # Ensure quantity is within min/max limits
-            if quantity < min_qty:
-                print(f"Quantity {quantity:.25f} is below minimum {min_qty}, cannot convert")
-                return False
-        else:
-            # Default to BTC_PRECISION decimal places if symbol info retrieval fails
-            print("Warning: Could not get LOT_SIZE filter, using default precision")
-            quantity = round(quantity, BTC_PRECISION)
-        
-        print(f"Final quantity after formatting: {quantity:.25f}")
-        
-        # Execute market buy order
-        order = client.order_market_buy(
-            symbol='BTCUSDC',
-            quantity=quantity
-        )
-        
-        print(f"USDC conversion successful! Bought {quantity:.25f} BTC at {current_price:.25f} USDC")
-        return True
-        
-    except BinanceAPIException as e:
-        print(f"Binance API error during USDC conversion: {e}")
-        return False
-    except Exception as e:
-        print(f"Unexpected error during USDC conversion: {e}")
-        return False
-
-def check_and_convert_dust(client, in_trade=None, force_conversion=False):
-    """
-    Check and convert dust at the beginning of each iteration.
-    If in_trade is None, determine based on current state.
-    If in_trade is True, convert USDC dust to BTC.
-    If in_trade is False, convert BTC dust to USDC.
-    If force_conversion is True, convert dust regardless of previous conversions.
-    """
-    global trade_active, dust_converted_this_session
-    
-    # Determine trade state if not provided
-    if in_trade is None:
-        in_trade = trade_active
-    
-    # Skip dust conversion if already done this session and not forced
-    if dust_converted_this_session and not force_conversion:
-        print("Dust already converted this session. Skipping...")
-        return True
-    
-    try:
-        # Get current balances
-        btc_balance = get_account_balance(client, 'BTC')
-        usdc_balance = get_account_balance(client, 'USDC')
-        
-        print(f"Current balances - BTC: {btc_balance:.25f}, USDC: {usdc_balance:.25f}")
-        
-        if in_trade:
-            # If in trade, convert any USDC dust to BTC
-            if usdc_balance > MIN_USDC_THRESHOLD:
-                print("Converting USDC dust to BTC while in trade...")
-                if convert_usdc_to_btc(client):
-                    dust_converted_this_session = True
-                    return True
-                else:
-                    return False
-            else:
-                print("No USDC dust to convert while in trade")
-        else:
-            # If not in trade, convert any BTC dust to USDC
-            if btc_balance > MIN_BTC_THRESHOLD:
-                print("Converting BTC dust to USDC while not in trade...")
-                if convert_btc_to_usdc(client):
-                    dust_converted_this_session = True
-                    return True
-                else:
-                    return False
-            else:
-                print("No BTC dust to convert while not in trade")
-        
-        return True
-    except Exception as e:
-        print(f"Error in check_and_convert_dust: {e}")
-        return False
 
 # ------------------ Trade Recovery Functions ------------------
 
@@ -1999,7 +1804,7 @@ def execute_buy_order(client, symbol, usdc_amount):
         
         print(f"Final quantity after formatting: {quantity:.25f}")
         
-        # Execute the order
+        # Execute the order using the entire balance
         order = client.order_market_buy(
             symbol=symbol,
             quantity=quantity
@@ -2087,7 +1892,7 @@ def execute_sell_order(client, symbol):
         
         print(f"Final quantity after formatting: {quantity:.25f}")
         
-        # Execute the order
+        # Execute the order using the entire balance
         order = client.order_market_sell(
             symbol=symbol,
             quantity=quantity
@@ -2214,11 +2019,6 @@ def check_trade_status(client):
                 print(f"Actual Profit After Fees: {actual_profit_pct:.25f}%")
                 trade_active = False
                 trade_info = {}
-                
-                # Convert any remaining BTC to USDC
-                print("\nChecking for remaining BTC after trade...")
-                convert_btc_to_usdc(client)
-                
                 return True
             else:
                 print(f"ERROR EXECUTING SELL ORDER: {sell_result['error']}")
@@ -2254,8 +2054,8 @@ def display_trade_status():
 # ------------------ Main Analysis Function ------------------
 
 def perform_single_iteration_analysis(client):
-    """Perform single iteration analysis with only the 9 specified conditions."""
-    global trade_active, trade_info, dust_converted_this_session
+    """Perform single iteration analysis with only 9 specified conditions."""
+    global trade_active, trade_info
     
     # Clear screen for fresh iteration
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -2275,14 +2075,8 @@ def perform_single_iteration_analysis(client):
             print("Active trade detected! Attempting to resume...")
             if resume_active_trade(client):
                 print("Successfully resumed active trade!")
-                # Convert dust only once when resuming a trade
-                check_and_convert_dust(client, in_trade=True, force_conversion=True)
             else:
-                print("Failed to resume active trade. Converting any BTC to USDC...")
-                convert_btc_to_usdc(client)
-        else:
-            # No active trade, convert dust only once
-            check_and_convert_dust(client, in_trade=False, force_conversion=True)
+                print("Failed to resume active trade.")
     
     # Get current balances
     usdc_balance = get_account_balance(client, 'USDC')
@@ -2298,8 +2092,6 @@ def perform_single_iteration_analysis(client):
         
         if trade_closed:
             print("\nTrade closed. Resuming normal analysis...")
-            # Reset dust conversion flag for next trade
-            dust_converted_this_session = False
         else:
             print("\nTrade still active. Continuing with full analysis...")
     
@@ -2367,8 +2159,8 @@ def perform_single_iteration_analysis(client):
     else:
         print(f"Error analyzing 15s Pythagorean Harmonics: {pythagorean_15s['error']}")
     
-    # Step 3: Analyze the 9 specified conditions
-    print("\n3. Analyzing the 9 specified trading conditions...")
+    # Step 3: Analyze 9 specified conditions
+    print("\n3. Analyzing 9 specified trading conditions...")
     
     conditions_met = 0
     total_conditions = 9  # Total number of conditions (updated to 9)
@@ -2537,7 +2329,7 @@ def perform_single_iteration_analysis(client):
     
     if momentum_15s_met:
         conditions_met += 1
-        print("\nTRUE - Momentum > 0 (15s) condition NOT met")
+        print("\nTRUE - Momentum > 0 (15s) condition MET")
     else:
         print("\nFALSE - Momentum > 0 (15s) condition NOT met")
     
@@ -2613,10 +2405,6 @@ def perform_single_iteration_analysis(client):
                 
                 # Calculate actual profit after fees
                 trade_info['actual_profit_pct'] = ((current_price - buy_result['price']) / buy_result['price']) * 100 - TOTAL_FEE_PERCENT
-            
-            # Convert any remaining USDC to BTC after entering trade
-            print("\nConverting any remaining USDC to BTC after entering trade...")
-            convert_usdc_to_btc(client)
         else:
             print(f"\nERROR EXECUTING BUY ORDER: {buy_result['error']}")
     elif trade_active:
@@ -2662,8 +2450,7 @@ def main():
     print("Webhook endpoint: http://localhost:5000/webhook/price")
     print("Health check: http://localhost:5000/health")
     print("\nEach iteration will:")
-    print("0. Check for active trade and resume if necessary")
-    print("1. Check and convert dust only once when needed")
+    print("1. Check for active trade and resume if necessary")
     print("2. Use webhook data for real-time price updates")
     print("3. Analyze Pythagorean Harmonics for both 1m and 15s timeframes")
     print("4. Analyze 9 specified trading conditions:")
@@ -2678,18 +2465,18 @@ def main():
     print("   - DMI Up Trend (15s)")
     print("5. Execute trade if ALL conditions are met")
     print("6. Use 100% of USDC balance for entry")
-    print("7. Convert any remaining USDC to BTC after entering trade")
-    print("8. Monitor for profit target every 5 seconds")
-    print("9. Convert any remaining BTC to USDC after exiting trade")
-    print("10. Clean up for next iteration")
+    print("7. Monitor for profit target every 5 seconds")
+    print("8. Use 100% of BTC balance for exit")
+    print("9. Clean up for next iteration")
     print("\nEnhanced Features:")
-    print("- Only the 9 specified triggers are used")
+    print("- Only 9 specified triggers are used")
     print("- Improved Pythagorean Harmonics analysis")
     print("- More realistic 15-second timeframe creation")
     print("- FFT analysis between argmin and argmax for both timeframes")
     print("- Detailed frequency calculations and inverse FFT forecasting")
     print("- Proper data cleaning before ANY analysis")
     print("- Correct frequency dominance calculation from dip to top")
+    print("- Uses entire balance for both entry and exit trades")
     print("="*60)
     
     iteration_count = 0
@@ -2717,4 +2504,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
