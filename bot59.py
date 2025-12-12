@@ -2516,7 +2516,7 @@ def perform_single_iteration_analysis(client):
     print("\n5. Analyzing all specified trading conditions...")
     
     conditions_met = 0
-    total_conditions = 14  # Total number of conditions (updated to 14)
+    total_conditions = 16  # Total number of conditions (updated to 14)
     condition_results = {}  # Store individual condition results
     
     # Condition 1: RSI Oversold Most Recent (1m)
