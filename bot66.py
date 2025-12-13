@@ -61,7 +61,7 @@ RSI_OVERBOUGHT = 70
 # API Rate Limiting
 MIN_ITERATION_INTERVAL = 5  # 5 seconds between iterations
 
-# Updated configurable conditions - Now 10 conditions (original 9 + new ML condition)
+# Updated configurable conditions - Now 9 conditions
 CONFIG = {
     "conditions": {
         "up_cycle_confirmed_1m": True,  # Up Cycle Confirmed (1m)
@@ -73,9 +73,8 @@ CONFIG = {
         "argmin_more_recent_1m": True,  # Argmin More Recent (1m)
         "argmin_more_recent_3m": True,  # Argmin More Recent (3m)
         "rsi_oversold_most_recent_5m": True,  # RSI Oversold Most Recent (5m)
-        "ml_forecast_meets_tp": True,  # ML Forecast Meets TP Target
     },
-    "min_conditions_met": 10  # ALL 10 conditions must be met to trigger a trade
+    "min_conditions_met": 9  # ALL 9 conditions must be met to trigger a trade
 }
 
 # Global stop event
@@ -1041,372 +1040,6 @@ def analyze_frequency_gradient(data, dip_idx, top_idx):
         print(f"Error analyzing frequency gradient: {e}")
         return {"positive_dominance_pct": 50.0, "negative_dominance_pct": 50.0, "gradient": 0.0}
 
-# ------------------ NEW: Machine Learning Price Forecast ------------------
-
-def ml_forecast_price(client, symbol, timeframe='1m', lookback=500, forecast_period=15):
-    """
-    Enhanced Machine Learning Price Forecast that predicts if price will reach TP target.
-    
-    This function:
-    1. Fetches OHLCV data for multiple timeframes (1m, 3m, 5m, 15m, 1h)
-    2. Performs advanced feature engineering with multi-timeframe data
-    3. Trains an ensemble model on historical data
-    4. Predicts future price movement with confidence intervals
-    5. Determines if predicted price will meet the take-profit target with high confidence
-    
-    Args:
-        client: Binance client
-        symbol: Trading symbol (e.g., 'BTCUSDC')
-        timeframe: Primary timeframe for analysis ('1m', '3m', '5m')
-        lookback: Number of candles to look back
-        forecast_period: Number of periods ahead to forecast
-        
-    Returns:
-        Tuple of (forecast_meets_tp, details) where:
-        - forecast_meets_tp: Boolean indicating if forecast meets take-profit target with high confidence
-        - details: Dictionary with detailed forecast information
-    """
-    try:
-        # Get data for multiple timeframes
-        timeframes = [timeframe, '3m', '5m', '15m', '1h']
-        dfs = {}
-        
-        for tf in timeframes:
-            # --- FIX: Calculate limit and ensure it's sufficient for analysis ---
-            limit = 0
-            if tf == '1m':
-                limit = lookback + forecast_period
-            elif tf == '3m':
-                limit = lookback // 3 + forecast_period
-            elif tf == '5m':
-                limit = lookback // 5 + forecast_period
-            elif tf == '15m':
-                limit = lookback // 15 + forecast_period
-            elif tf == '1h':
-                limit = lookback // 60 + forecast_period
-            
-            # Ensure we request a minimum number of candles (e.g., 200) to have enough data
-            # for technical indicators like SMA 50/100 and to avoid "Insufficient data" error.
-            # This is crucial for higher timeframes like 15m and 1h.
-            limit = max(limit, 200)
-
-            if tf == '1m':
-                klines = safe_api_call(client.get_klines, symbol=symbol, interval='1m', limit=limit)
-            elif tf == '3m':
-                klines = safe_api_call(client.get_klines, symbol=symbol, interval='3m', limit=limit)
-            elif tf == '5m':
-                klines = safe_api_call(client.get_klines, symbol=symbol, interval='5m', limit=limit)
-            elif tf == '15m':
-                klines = safe_api_call(client.get_klines, symbol=symbol, interval='15m', limit=limit)
-            elif tf == '1h':
-                klines = safe_api_call(client.get_klines, symbol=symbol, interval='1h', limit=limit)
-            
-            if not klines or len(klines) < 50:
-                return False, {"error": f"Insufficient data for {tf} ML forecast even after adjustment"}
-                
-            df = pd.DataFrame(klines, columns=[
-                'timestamp','open','high','low','close','volume','close_time',
-                'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
-                'taker_buy_quote_asset_volume','ignore'])
-            
-            # Convert timestamp to datetime in GMT+2 timezone
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
-            
-            # Clean OHLC data
-            df = clean_ohlc_data(df)
-            
-            # --- FIX: Set timestamp as index for resampling ---
-            df = df.set_index('timestamp')
-            
-            dfs[tf] = df
-        
-        # Use the primary timeframe for the main analysis
-        df = dfs[timeframe].reset_index() # Reset index to use 'timestamp' column again for primary df
-        
-        # Enhanced Feature Engineering
-        # Basic returns and volatility
-        df['returns'] = df['close'].pct_change()
-        df['volatility'] = df['returns'].rolling(window=10).std()
-        
-        # Multi-timeframe features
-        for tf in ['3m', '5m', '15m', '1h']:
-            if tf in dfs:
-                tf_df = dfs[tf] # tf_df already has a DatetimeIndex
-                
-                # Resample to match primary timeframe
-                if tf == '3m' and timeframe == '1m':
-                    tf_resampled = tf_df.resample('1T').ffill()
-                elif tf == '5m' and timeframe == '1m':
-                    tf_resampled = tf_df.resample('1T').ffill()
-                elif tf == '15m' and timeframe == '1m':
-                    tf_resampled = tf_df.resample('1T').ffill()
-                elif tf == '1h' and timeframe == '1m':
-                    tf_resampled = tf_df.resample('1T').ffill()
-                else:
-                    tf_resampled = tf_df
-                
-                # Align with primary dataframe
-                tf_resampled = tf_resampled.reindex(df['timestamp'], method='ffill')
-                
-                # Add multi-timeframe features
-                df[f'close_{tf}'] = tf_resampled['close'].values
-                df[f'volume_{tf}'] = tf_resampled['volume'].values
-                df[f'returns_{tf}'] = tf_resampled['close'].pct_change().values
-                
-                # Add lag features for multi-timeframe data
-                for lag in [1, 2, 3]:
-                    df[f'close_{tf}_lag_{lag}'] = tf_resampled['close'].shift(lag).values
-        
-        # Add lag features for primary timeframe
-        for lag in range(1, 6):
-            df[f'close_lag_{lag}'] = df['close'].shift(lag)
-            df[f'returns_lag_{lag}'] = df['returns'].shift(lag)
-            df[f'volume_lag_{lag}'] = df['volume'].shift(lag)
-        
-        # Enhanced Technical Indicators
-        if TALIB_AVAILABLE:
-            # Primary timeframe indicators
-            df['sma_20'] = talib.SMA(df['close'].values, timeperiod=20)
-            df['sma_50'] = talib.SMA(df['close'].values, timeperiod=50)
-            df['ema_12'] = talib.EMA(df['close'].values, timeperiod=12)
-            df['ema_26'] = talib.EMA(df['close'].values, timeperiod=26)
-            df['rsi'] = talib.RSI(df['close'].values, timeperiod=RSI_PERIOD)
-            df['macd'], df['macd_signal'], df['macd_hist'] = talib.MACD(df['close'].values)
-            
-            # Bollinger Bands
-            df['bb_upper'], df['bb_middle'], df['bb_lower'] = talib.BBANDS(df['close'].values)
-            
-            # Stochastic
-            df['slowk'], df['slowd'] = talib.STOCH(df['high'].values, df['low'].values, df['close'].values)
-            
-            # ADX
-            df['adx'] = talib.ADX(df['high'].values, df['low'].values, df['close'].values)
-            
-            # Multi-timeframe indicators
-            for tf in ['3m', '5m', '15m', '1h']:
-                if tf in dfs and f'close_{tf}' in df.columns:
-                    tf_close = df[f'close_{tf}'].values
-                    df[f'rsi_{tf}'] = talib.RSI(tf_close, timeperiod=RSI_PERIOD)
-                    df[f'macd_{tf}'], df[f'macd_signal_{tf}'], _ = talib.MACD(tf_close)
-        else:
-            # Fallback manual calculations
-            df['sma_20'] = df['close'].rolling(window=20).mean()
-            df['sma_50'] = df['close'].rolling(window=50).mean()
-            df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
-            df['ema_26'] = df['close'].ewm(span=26, adjust=False).mean()
-            
-            # RSI
-            delta = df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=RSI_PERIOD).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=RSI_PERIOD).mean()
-            rs = gain / loss
-            df['rsi'] = 100 - (100 / (1 + rs))
-            
-            # MACD
-            df['macd'] = df['ema_12'] - df['ema_26']
-            df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
-            df['macd_hist'] = df['macd'] - df['macd_signal']
-            
-            # Bollinger Bands
-            df['bb_middle'] = df['close'].rolling(window=20).mean()
-            df['bb_std'] = df['close'].rolling(window=20).std()
-            df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
-            df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
-        
-        # Advanced features
-        # Price position within Bollinger Bands
-        df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
-        
-        # --- FIX: Add small epsilon to prevent division by zero ---
-        epsilon = 1e-10
-        # Distance from moving averages
-        df['dist_sma_20'] = (df['close'] - df['sma_20']) / (df['sma_20'] + epsilon)
-        df['dist_sma_50'] = (df['close'] - df['sma_50']) / (df['sma_50'] + epsilon)
-        
-        # Volume weighted average price (VWAP)
-        df['vwap'] = (df['volume'] * (df['high'] + df['low'] + df['close']) / 3).cumsum() / df['volume'].cumsum()
-        df['dist_vwap'] = (df['close'] - df['vwap']) / (df['vwap'] + epsilon)
-        
-        # Define target variable: future price change percentage
-        df['target'] = df['close'].shift(-forecast_period) / df['close'] - 1
-        
-        # Prepare data for modeling
-        features = [
-            'close', 'volume', 'returns', 'volatility',
-            'sma_20', 'sma_50', 'ema_12', 'ema_26', 'rsi', 'macd', 'macd_signal', 'macd_hist',
-            'bb_upper', 'bb_middle', 'bb_lower', 'bb_position', 'slowk', 'slowd', 'adx',
-            'dist_sma_20', 'dist_sma_50', 'dist_vwap'
-        ] + [f'close_lag_{lag}' for lag in range(1, 6)] + [f'returns_lag_{lag}' for lag in range(1, 6)]
-        
-        # Add multi-timeframe features
-        for tf in ['3m', '5m', '15m', '1h']:
-            if tf in dfs:
-                features.extend([
-                    f'close_{tf}', f'volume_{tf}', f'returns_{tf}',
-                    f'rsi_{tf}', f'macd_{tf}', f'macd_signal_{tf}'
-                ])
-                for lag in [1, 2, 3]:
-                    if f'close_{tf}_lag_{lag}' in df.columns:
-                        features.append(f'close_{tf}_lag_{lag}')
-        
-        df_model = df[features + ['target']].dropna()
-        
-        if df_model.shape[0] < 100:
-            return False, {"error": "Not enough data after feature engineering"}
-
-        # --- FIX: Final cleaning step to handle infinity and large values ---
-        # This is a safety net for any inf/nan values created during feature engineering
-        for col in df_model.columns:
-            # Replace infinity with NaN
-            df_model[col] = df_model[col].replace([np.inf, -np.inf], np.nan)
-            # Fill NaN with median of the column (more robust than mean)
-            if df_model[col].isna().any():
-                median_val = df_model[col].median()
-                df_model[col] = df_model[col].fillna(median_val if not np.isnan(median_val) else 0)
-        
-        # Final check to ensure all values are finite
-        if not np.all(np.isfinite(df_model[features].values)):
-            return False, {"error": "Data contains non-finite values even after cleaning"}
-
-        X = df_model[features]
-        y = df_model['target']
-        
-        # Scale features
-        scaler = MinMaxScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        # Split data for training and testing
-        X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-        
-        # Train ensemble model
-        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1)
-        gbr = GradientBoostingRegressor(n_estimators=100, random_state=42)
-        ridge = Ridge(alpha=1.0) # This line will now work because of the corrected import
-        
-        # Create voting ensemble
-        ensemble = VotingRegressor([('rf', rf), ('gbr', gbr), ('ridge', ridge)])
-        ensemble.fit(X_train, y_train)
-        
-        # Evaluate model
-        y_pred = ensemble.predict(X_test)
-        mse = mean_squared_error(y_test, y_pred)
-        
-        # Get prediction confidence intervals
-        gbr_for_intervals = GradientBoostingRegressor(n_estimators=100, random_state=42, loss='quantile', alpha=0.95)
-        gbr_for_intervals.fit(X_train, y_train)
-        upper_bound = gbr_for_intervals.predict(X_test)
-        
-        gbr_for_intervals.set_params(alpha=0.05)
-        lower_bound = gbr_for_intervals.predict(X_test)
-        
-        # Calculate prediction intervals for the last data point
-        last_features = df[features].iloc[-1:].values
-        last_features_scaled = scaler.transform(last_features)
-        
-        # Get point prediction
-        predicted_change = ensemble.predict(last_features_scaled)[0]
-        
-        # Get prediction intervals
-        gbr_for_intervals.set_params(alpha=0.95)
-        upper_change = gbr_for_intervals.predict(last_features_scaled)[0]
-        
-        gbr_for_intervals.set_params(alpha=0.05)
-        lower_change = gbr_for_intervals.predict(last_features_scaled)[0]
-        
-        # Get current price
-        current_price = df['close'].iloc[-1]
-        
-        # Calculate predicted future price
-        predicted_price = current_price * (1 + predicted_change)
-        upper_price = current_price * (1 + upper_change)
-        lower_price = current_price * (1 + lower_change)
-        
-        # Calculate the price needed to meet the take-profit target
-        tp_price = current_price * (1 + (PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT) / 100)
-        
-        # Determine if predicted price meets or exceeds the take-profit target
-        # Only return TRUE if we're confident (upper bound) the TP target will be reached
-        forecast_meets_tp = upper_price >= tp_price
-        
-        # Calculate percentage difference to take-profit target
-        tp_diff_pct = ((predicted_price - tp_price) / tp_price) * 100
-        upper_tp_diff_pct = ((upper_price - tp_price) / tp_price) * 100
-        
-        # Calculate confidence score based on how much of the prediction interval is above TP
-        if upper_price > tp_price and lower_price < tp_price:
-            # TP is within the prediction interval
-            confidence = (upper_price - tp_price) / (upper_price - lower_price)
-        elif upper_price >= tp_price and lower_price >= tp_price:
-            # Entire prediction interval is above TP
-            confidence = 1.0
-        else:
-            # TP is above the entire prediction interval
-            confidence = 0.0
-        
-        # Determine if a spike is incoming based on technical indicators
-        spike_incoming = False
-        spike_confidence = 0.0
-        
-        # Check for multiple bullish signals
-        bullish_signals = 0
-        
-        # RSI oversold
-        if df['rsi'].iloc[-1] < 30:
-            bullish_signals += 1
-        
-        # MACD bullish crossover
-        if (df['macd'].iloc[-1] > df['macd_signal'].iloc[-1] and 
-            df['macd'].iloc[-2] <= df['macd_signal'].iloc[-2]):
-            bullish_signals += 1
-        
-        # Price below lower Bollinger Band
-        if df['close'].iloc[-1] < df['bb_lower'].iloc[-1]:
-            bullish_signals += 1
-        
-        # Volume spike
-        if df['volume'].iloc[-1] > df['volume'].iloc[-20:].mean() * 1.5:
-            bullish_signals += 1
-        
-        # Price below VWAP
-        if df['close'].iloc[-1] < df['vwap'].iloc[-1]:
-            bullish_signals += 1
-        
-        # Calculate spike confidence
-        spike_confidence = bullish_signals / 5.0
-        spike_incoming = spike_confidence >= 0.6  # At least 3 out of 5 signals
-        
-        # Final decision: only return TRUE if both conditions are met
-        # 1. Upper bound of prediction is above TP target
-        # 2. Spike is incoming with high confidence
-        final_decision = forecast_meets_tp and spike_incoming
-        
-        details = {
-            "timeframe": timeframe,
-            "current_price": current_price,
-            "predicted_price": predicted_price,
-            "upper_price": upper_price,
-            "lower_price": lower_price,
-            "tp_price": tp_price,
-            "forecast_change_pct": predicted_change * 100,
-            "tp_diff_pct": tp_diff_pct,
-            "upper_tp_diff_pct": upper_tp_diff_pct,
-            "forecast_meets_tp": forecast_meets_tp,
-            "confidence": confidence,
-            "spike_incoming": spike_incoming,
-            "spike_confidence": spike_confidence,
-            "bullish_signals": bullish_signals,
-            "final_decision": final_decision,
-            "forecast_period": forecast_period,
-            "model_score": ensemble.score(X_test, y_test),  # R^2 score
-            "mse": mse
-        }
-        
-        return final_decision, details
-        
-    except Exception as e:
-        print(f"Error in ML forecast price: {e}")
-        return False, {"error": str(e)}
-
 # ------------------ Enhanced Analysis Functions ------------------
 
 def analyze_rsi_condition(client, symbol, lookback=500, timeframe='1m'):
@@ -2100,7 +1733,7 @@ def perform_single_iteration_analysis(client):
     os.system('cls' if os.name == 'nt' else 'clear')
     
     print("="*80)
-    print(f"ENHANCED BTCUSDC TRADING BOT - 10 TRIGGERS")
+    print(f"ENHANCED BTCUSDC TRADING BOT - 9 TRIGGERS")
     print(f"Time: {datetime.now(LOCAL_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} (GMT+2)")
     print("="*80)
     
@@ -2153,14 +1786,11 @@ def perform_single_iteration_analysis(client):
     # Fetch local extrema data for 1m timeframe
     local_extrema_1m = analyze_local_extrema(client, SYMBOL, timeframe='1m', lookback=500)
     
-    # Fetch ML forecast data for 1m timeframe
-    ml_forecast_meets_tp, ml_forecast_details = ml_forecast_price(client, SYMBOL, timeframe='1m', lookback=500)
-    
     # Step 2: Analyze all specified conditions
-    print("\n2. Analyzing all 10 specified trading conditions...")
+    print("\n2. Analyzing all 9 specified trading conditions...")
     
     conditions_met = 0
-    total_conditions = 10  # Total number of conditions
+    total_conditions = 9  # Total number of conditions
     condition_results = {}  # Store individual condition results
     
     # Condition 1: Up Cycle Confirmed (1m)
@@ -2362,39 +1992,6 @@ def perform_single_iteration_analysis(client):
     else:
         print("\nFALSE - RSI Oversold Most Recent (5m) condition NOT met")
     
-    # Condition 10: ML Forecast Meets TP Target 
-    print("\n--- Condition 10: ML Forecast Meets TP Target ---")
-    ml_forecast_met = False
-    if 'error' not in ml_forecast_details:
-        ml_forecast_met = ml_forecast_meets_tp
-        condition_results['ML Forecast Meets TP Target'] = ml_forecast_met
-        # Print details for this condition
-        print(f"\nCurrent Price: {ml_forecast_details['current_price']:.2f}")
-        print(f"Predicted Price: {ml_forecast_details['predicted_price']:.2f}")
-        print(f"Upper Bound: {ml_forecast_details['upper_price']:.2f}")
-        print(f"Lower Bound: {ml_forecast_details['lower_price']:.2f}")
-        print(f"TP Target Price: {ml_forecast_details['tp_price']:.2f}")
-        print(f"Forecast Change: {ml_forecast_details['forecast_change_pct']:.4f}%")
-        print(f"TP Difference: {ml_forecast_details['tp_diff_pct']:.4f}%")
-        print(f"Upper TP Difference: {ml_forecast_details['upper_tp_diff_pct']:.4f}%")
-        print(f"Model Score: {ml_forecast_details['model_score']:.4f}")
-        print(f"Confidence: {ml_forecast_details['confidence']:.4f}")
-        print(f"Spike Incoming: {ml_forecast_details['spike_incoming']}")
-        print(f"Spike Confidence: {ml_forecast_details['spike_confidence']:.4f}")
-        print(f"Bullish Signals: {ml_forecast_details['bullish_signals']}/5")
-        print(f"Final Decision: {ml_forecast_details['final_decision']}")
-        print(f"Condition Met: {ml_forecast_met}")
-        
-        if ml_forecast_met:
-            conditions_met += 1
-            print("\nTRUE - ML Forecast Meets TP Target condition MET")
-        else:
-            print("\nFALSE - ML Forecast Meets TP Target condition NOT met")
-    else:
-        condition_results['ML Forecast Meets TP Target'] = False
-        print(f"\nError: {ml_forecast_details['error']}")
-        print("\nFALSE - ML Forecast Meets TP Target condition NOT met")
-    
     # Step 3: Trading Decision
     print("\n" + "="*80)
     print("TRADING DECISION")
@@ -2492,12 +2089,12 @@ def main():
         print("No client available. Exiting.")
         return
     
-    print("=== ENHANCED BTCUSDC TRADING BOT - 10 TRIGGERS ===")
+    print("=== ENHANCED BTCUSDC TRADING BOT - 9 TRIGGERS ===")
     print("Press Ctrl+C to stop monitoring.")
     print("\nEach iteration will:")
     print("1. Check for active trade and resume if necessary")
     print("2. Fetch fresh data for all timeframes (1m, 3m, 5m)")
-    print("3. Analyze all 10 specified trading conditions:")
+    print("3. Analyze all 9 specified trading conditions:")
     print("   - Up Cycle Confirmed (1m)")
     print("   - Momentum Positive (1m)")
     print("   - Volume Bullish Dominance (1m)")
@@ -2507,18 +2104,16 @@ def main():
     print("   - Argmin More Recent (1m)")
     print("   - Argmin More Recent (3m)")
     print("   - RSI Oversold Most Recent (5m)")
-    print("   - ML Forecast Meets TP Target")
-    print("4. Execute trade if ALL 10 conditions are met")
+    print("4. Execute trade if ALL 9 conditions are met")
     print("5. Use 100% of USDC balance for entry")
     print("6. Monitor for profit target every 5 seconds")
     print("7. Use 100% of BTC balance for exit")
     print("8. Clean up for next iteration")
     print("\nEnhanced Features:")
-    print("- Now 10 selected triggers (original 9 + new ML condition)")
+    print("- Now 9 selected triggers")
     print("- Take profit target set to 1.25%")
     print("- Threshold analysis with argmin/argmax for all timeframes")
     print("- FFT analysis between argmin and argmax for all timeframes")
-    print("- NEW: Machine Learning forecast to predict if TP target will be met")
     print("- Detailed frequency calculations and inverse FFT forecasting")
     print("- Proper data cleaning before ANY analysis")
     print("- Correct frequency dominance calculation from dip to top")
