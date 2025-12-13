@@ -547,15 +547,32 @@ def calculate_manual_sma(data, period):
 def calculate_volume_percentages(df, lookback=1200):
     """Calculate volume percentages and bullish dominance"""
     try:
-        if df is None or len(df) < lookback:
+        if df is None or df.empty:
             return None
+            
+        # Adjust lookback if we don't have enough data
+        if len(df) < lookback:
+            if len(df) < 10:  # Minimum 10 candles needed
+                return None
+            lookback = len(df)
             
         # Clean data
         df_clean = clean_ohlc_data(df.copy())
+        if df_clean is None or df_clean.empty:
+            return None
+            
+        # Check if required columns exist
+        if 'close' not in df_clean.columns or 'volume' not in df_clean.columns:
+            return None
+        
         close_prices = validate_and_clean_data(df_clean['close'].values.astype(float))
         volumes = validate_and_clean_data(df_clean['volume'].values.astype(float))
         
         if close_prices is None or volumes is None:
+            return None
+            
+        # Ensure we have enough data for analysis
+        if len(close_prices) < 2 or len(volumes) < 2:
             return None
             
         # Determine bullish vs bearish volume
@@ -572,9 +589,10 @@ def calculate_volume_percentages(df, lookback=1200):
                 bearish_volume[i] = volumes[i] / 2
         
         # Calculate total volume over lookback period
-        total_volume = np.sum(volumes[-lookback:])
-        total_bullish = np.sum(bullish_volume[-lookback:])
-        total_bearish = np.sum(bearish_volume[-lookback:])
+        actual_lookback = min(lookback, len(volumes))
+        total_volume = np.sum(volumes[-actual_lookback:])
+        total_bullish = np.sum(bullish_volume[-actual_lookback:])
+        total_bearish = np.sum(bearish_volume[-actual_lookback:])
         
         # Calculate percentages
         if total_volume > 0:
@@ -605,35 +623,29 @@ def calculate_volume_percentages(df, lookback=1200):
             "dominance_pct": dominance_pct
         }
     except Exception as e:
-        print(f"Error calculating volume percentages: {e}")
-        return None
+        print(f"Error in calculate_volume_percentages: {e}")
+        # Return default values when error occurs
+        return {
+            "total_volume": 0.0,
+            "bullish_volume": 0.0,
+            "bearish_volume": 0.0,
+            "bullish_pct": 50.0,
+            "bearish_pct": 50.0,
+            "dominance": "Neutral",
+            "dominance_pct": 50.0
+        }
 
 def analyze_volume_dominance(client, symbol, timeframe='1m', lookback=1200):
     """
-    Analyze volume dominance for the specified timeframe.
+    Analyze volume dominance for specified timeframe.
     Returns whether bullish volume is greater than bearish volume.
     """
     try:
         # Get data based on timeframe
+        klines = None
         if timeframe == '15s':
             # Get 1m data and convert to 15s
             klines = safe_api_call(client.get_klines, symbol=symbol, interval='1m', limit=lookback//4)
-            if not klines or len(klines) < 50:
-                return {"error": "Insufficient data for volume analysis"}
-                
-            df = pd.DataFrame(klines, columns=[
-                'timestamp','open','high','low','close','volume','close_time',
-                'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
-                'taker_buy_quote_asset_volume','ignore'])
-            
-            # Convert timestamp to datetime in GMT+2 timezone
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
-            
-            # Clean OHLC data
-            df = clean_ohlc_data(df)
-            
-            # Generate 15s data from 1m data
-            df = generate_15s_data_from_1m(df)
         elif timeframe == '1m':
             klines = safe_api_call(client.get_klines, symbol=symbol, interval='1m', limit=lookback)
         elif timeframe == '3m':
@@ -641,20 +653,27 @@ def analyze_volume_dominance(client, symbol, timeframe='1m', lookback=1200):
         elif timeframe == '5m':
             klines = safe_api_call(client.get_klines, symbol=symbol, interval='5m', limit=lookback)
         
-        if timeframe != '15s':
-            if not klines or len(klines) < 50:
-                return {"error": "Insufficient data for volume analysis"}
-                
-            df = pd.DataFrame(klines, columns=[
-                'timestamp','open','high','low','close','volume','close_time',
-                'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
-                'taker_buy_quote_asset_volume','ignore'])
+        if not klines or len(klines) < 10:  # Reduced minimum requirement
+            return {"error": f"Insufficient data for volume analysis: got {len(klines) if klines else 0} klines"}
             
-            # Convert timestamp to datetime in GMT+2 timezone
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
+        df = pd.DataFrame(klines, columns=[
+            'timestamp','open','high','low','close','volume','close_time',
+            'quote_asset_volume','number_of_trades','taker_buy_base_asset_volume',
+            'taker_buy_quote_asset_volume','ignore'])
+        
+        # Convert timestamp to datetime in GMT+2 timezone
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
+        
+        # Clean OHLC data
+        df = clean_ohlc_data(df)
+        if df is None or df.empty:
+            return {"error": "Failed to clean OHLC data"}
             
-            # Clean OHLC data
-            df = clean_ohlc_data(df)
+        # Generate 15s data from 1m data if needed
+        if timeframe == '15s':
+            df = generate_15s_data_from_1m(df)
+            if df is None or df.empty:
+                return {"error": "Failed to generate 15s data"}
         
         # Calculate volume percentages
         volume_data = calculate_volume_percentages(df, lookback)
@@ -675,7 +694,14 @@ def analyze_volume_dominance(client, symbol, timeframe='1m', lookback=1200):
         
     except Exception as e:
         print(f"Error analyzing volume dominance: {e}")
-        return {"error": str(e)}
+        # Return default values when error occurs
+        return {
+            "timeframe": timeframe,
+            "bullish_pct": 50.0,
+            "bearish_pct": 50.0,
+            "dominance": "Neutral",
+            "bullish_dominance": False
+        }
 
 # ------------------ Enhanced FFT Analysis with Proper Frequency Gradients ------------------
 
