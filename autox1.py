@@ -818,10 +818,10 @@ def improved_fft_forecast(candles, forecast_periods=4):
         print(f"Error in improved FFT forecast: {e}")
         return np.array([candles[-1]["close"]] * forecast_periods) if candles else np.array([1.0] * forecast_periods)
 
-def analyze_fft_cycle_with_proper_argmin_argmax(candles, timeframe):
+def analyze_fft_cycle_with_natural_argmin_argmax(candles, timeframe):
     """
-    Analyze FFT cycle with proper argmin and argmax finding for most recent occurrence.
-    Uses last 1200 values for each timeframe with their own specifications.
+    Analyze FFT cycle using natural argmin and argmax from the last 1200 candles.
+    No pattern enforcement - uses the actual values as they naturally occur.
     """
     try:
         if not candles:
@@ -832,41 +832,22 @@ def analyze_fft_cycle_with_proper_argmin_argmax(candles, timeframe):
         low_prices = np.array([candle["low"] for candle in candles], dtype=np.float64)
         high_prices = np.array([candle["high"] for candle in candles], dtype=np.float64)
         
-        # Find argmin and argmax for most recent occurrence
-        # For argmin: find most recent lowest low
-        # For argmax: find most recent highest high
+        # Find natural argmin and argmax from the entire dataset
+        # For argmin: find absolute lowest low
+        # For argmax: find absolute highest high
         
-        # Use argrelextrema to find local minima and maxima
-        from scipy.signal import argrelextrema
+        # Find absolute minimum (lowest low)
+        min_idx = np.argmin(low_prices)
+        lowest_low_price = low_prices[min_idx]
+        lowest_low_time = datetime.datetime.fromtimestamp(candles[min_idx]["time"], tz=LOCAL_TIMEZONE)
         
-        # Find local minima (lows)
-        local_minima_indices = argrelextrema(low_prices, np.less, order=5)[0]
-        if len(local_minima_indices) > 0:
-            # Get most recent minimum
-            most_recent_min_idx = local_minima_indices[-1]
-            lowest_low_price = low_prices[most_recent_min_idx]
-            lowest_low_time = datetime.datetime.fromtimestamp(candles[most_recent_min_idx]["time"], tz=LOCAL_TIMEZONE)
-        else:
-            # Fallback to global minimum
-            most_recent_min_idx = np.argmin(low_prices)
-            lowest_low_price = low_prices[most_recent_min_idx]
-            lowest_low_time = datetime.datetime.fromtimestamp(candles[most_recent_min_idx]["time"], tz=LOCAL_TIMEZONE)
-        
-        # Find local maxima (highs)
-        local_maxima_indices = argrelextrema(high_prices, np.greater, order=5)[0]
-        if len(local_maxima_indices) > 0:
-            # Get most recent maximum
-            most_recent_max_idx = local_maxima_indices[-1]
-            highest_high_price = high_prices[most_recent_max_idx]
-            highest_high_time = datetime.datetime.fromtimestamp(candles[most_recent_max_idx]["time"], tz=LOCAL_TIMEZONE)
-        else:
-            # Fallback to global maximum
-            most_recent_max_idx = np.argmax(high_prices)
-            highest_high_price = high_prices[most_recent_max_idx]
-            highest_high_time = datetime.datetime.fromtimestamp(candles[most_recent_max_idx]["time"], tz=LOCAL_TIMEZONE)
+        # Find absolute maximum (highest high)
+        max_idx = np.argmax(high_prices)
+        highest_high_price = high_prices[max_idx]
+        highest_high_time = datetime.datetime.fromtimestamp(candles[max_idx]["time"], tz=LOCAL_TIMEZONE)
         
         # Determine which occurred more recently
-        dip_more_recent = most_recent_min_idx > most_recent_max_idx
+        dip_more_recent = min_idx > max_idx
         cycle_direction = "up" if dip_more_recent else "down"
         
         current_price = close_prices[-1]
@@ -887,10 +868,10 @@ def analyze_fft_cycle_with_proper_argmin_argmax(candles, timeframe):
             "forecast_diff_pct": forecast_diff_pct,
             "lowest_low_price": lowest_low_price,
             "lowest_low_time": lowest_low_time,
-            "lowest_low_idx": int(most_recent_min_idx),
+            "lowest_low_idx": int(min_idx),
             "highest_high_price": highest_high_price,
             "highest_high_time": highest_high_time,
-            "highest_high_idx": int(most_recent_max_idx),
+            "highest_high_idx": int(max_idx),
             "dip_more_recent": dip_more_recent,
             "data_points": len(candles)
         }
@@ -898,19 +879,19 @@ def analyze_fft_cycle_with_proper_argmin_argmax(candles, timeframe):
         return results
         
     except Exception as e:
-        print(f"Error analyzing FFT cycle with proper argmin/argmax: {e}")
+        print(f"Error analyzing FFT cycle with natural argmin/argmax: {e}")
         return {"error": str(e)}
 
-def analyze_fft_cycle_with_timeframe_ordering(candles_1m, candles_3m, candles_5m):
+def analyze_fft_cycle_with_natural_values(candles_1m, candles_3m, candles_5m):
     """
-    Analyze FFT cycles for all timeframes and ensure 1min < 3min < 5min pattern.
-    Uses proper argmin and argmax finding for most recent occurrence.
+    Analyze FFT cycles for all timeframes using natural argmin and argmax values.
+    No pattern enforcement - uses the actual values as they naturally occur.
     """
     try:
-        # Analyze each timeframe separately with proper argmin/argmax
-        fft_1m = analyze_fft_cycle_with_proper_argmin_argmax(candles_1m, '1m')
-        fft_3m = analyze_fft_cycle_with_proper_argmin_argmax(candles_3m, '3m')
-        fft_5m = analyze_fft_cycle_with_proper_argmin_argmax(candles_5m, '5m')
+        # Analyze each timeframe separately with natural argmin/argmax
+        fft_1m = analyze_fft_cycle_with_natural_argmin_argmax(candles_1m, '1m')
+        fft_3m = analyze_fft_cycle_with_natural_argmin_argmax(candles_3m, '3m')
+        fft_5m = analyze_fft_cycle_with_natural_argmin_argmax(candles_5m, '5m')
         
         # Check for errors
         if 'error' in fft_1m or 'error' in fft_3m or 'error' in fft_5m:
@@ -918,63 +899,41 @@ def analyze_fft_cycle_with_timeframe_ordering(candles_1m, candles_3m, candles_5m
                 "1m": fft_1m,
                 "3m": fft_3m,
                 "5m": fft_5m,
-                "ordering_error": True
+                "natural_analysis": False
             }
         
         # Print detailed argmin and argmax information for each timeframe
-        print(f"\n--- Detailed Argmin/Argmax Analysis ---")
-        print(f"1m - Argmin (Most Recent Low): {fft_1m['lowest_low_price']:.2f} at index {fft_1m['lowest_low_idx']} ({fft_1m['lowest_low_time'].strftime('%H:%M:%S')})")
-        print(f"1m - Argmax (Most Recent High): {fft_1m['highest_high_price']:.2f} at index {fft_1m['highest_high_idx']} ({fft_1m['highest_high_time'].strftime('%H:%M:%S')})")
-        print(f"3m - Argmin (Most Recent Low): {fft_3m['lowest_low_price']:.2f} at index {fft_3m['lowest_low_idx']} ({fft_3m['lowest_low_time'].strftime('%H:%M:%S')})")
-        print(f"3m - Argmax (Most Recent High): {fft_3m['highest_high_price']:.2f} at index {fft_3m['highest_high_idx']} ({fft_3m['highest_high_time'].strftime('%H:%M:%S')})")
-        print(f"5m - Argmin (Most Recent Low): {fft_5m['lowest_low_price']:.2f} at index {fft_5m['lowest_low_idx']} ({fft_5m['lowest_low_time'].strftime('%H:%M:%S')})")
-        print(f"5m - Argmax (Most Recent High): {fft_5m['highest_high_price']:.2f} at index {fft_5m['highest_high_idx']} ({fft_5m['highest_high_time'].strftime('%H:%M:%S')})")
+        print(f"\n--- Natural Argmin/Argmax Analysis ---")
+        print(f"1m - Argmin (Lowest Low): {fft_1m['lowest_low_price']:.2f} at index {fft_1m['lowest_low_idx']} ({fft_1m['lowest_low_time'].strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"1m - Argmax (Highest High): {fft_1m['highest_high_price']:.2f} at index {fft_1m['highest_high_idx']} ({fft_1m['highest_high_time'].strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"3m - Argmin (Lowest Low): {fft_3m['lowest_low_price']:.2f} at index {fft_3m['lowest_low_idx']} ({fft_3m['lowest_low_time'].strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"3m - Argmax (Highest High): {fft_3m['highest_high_price']:.2f} at index {fft_3m['highest_high_idx']} ({fft_3m['highest_high_time'].strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"5m - Argmin (Lowest Low): {fft_5m['lowest_low_price']:.2f} at index {fft_5m['lowest_low_idx']} ({fft_5m['lowest_low_time'].strftime('%Y-%m-%d %H:%M:%S')})")
+        print(f"5m - Argmax (Highest High): {fft_5m['highest_high_price']:.2f} at index {fft_5m['highest_high_idx']} ({fft_5m['highest_high_time'].strftime('%Y-%m-%d %H:%M:%S')})")
         
-        # Ensure 1min < 3min < 5min pattern for argmin and argmax values
-        # For lowest lows (argmin)
-        argmin_pattern_ok = True
-        if not (fft_1m['lowest_low_price'] <= fft_3m['lowest_low_price'] <= fft_5m['lowest_low_price']):
-            argmin_pattern_ok = False
-            print(f"\nWarning: Argmin pattern violated. 1m: {fft_1m['lowest_low_price']:.2f}, 3m: {fft_3m['lowest_low_price']:.2f}, 5m: {fft_5m['lowest_low_price']:.2f}")
-            
-            # Adjust to maintain pattern
-            if fft_1m['lowest_low_price'] > fft_3m['lowest_low_price']:
-                fft_3m['lowest_low_price'] = fft_1m['lowest_low_price']
-            if fft_3m['lowest_low_price'] > fft_5m['lowest_low_price']:
-                fft_5m['lowest_low_price'] = fft_3m['lowest_low_price']
+        # Note: We are NOT checking or enforcing any patterns
+        # Using the natural values as they occur in the market
         
-        # For highest highs (argmax)
-        argmax_pattern_ok = True
-        if not (fft_1m['highest_high_price'] <= fft_3m['highest_high_price'] <= fft_5m['highest_high_price']):
-            argmax_pattern_ok = False
-            print(f"Warning: Argmax pattern violated. 1m: {fft_1m['highest_high_price']:.2f}, 3m: {fft_3m['highest_high_price']:.2f}, 5m: {fft_5m['highest_high_price']:.2f}")
-            
-            # Adjust to maintain pattern
-            if fft_1m['highest_high_price'] > fft_3m['highest_high_price']:
-                fft_3m['highest_high_price'] = fft_1m['highest_high_price']
-            if fft_3m['highest_high_price'] > fft_5m['highest_high_price']:
-                fft_5m['highest_high_price'] = fft_3m['highest_high_price']
-        
-        # Print pattern verification
-        print(f"\n--- Pattern Verification ---")
-        print(f"Argmin Pattern (1m < 3m < 5m): {'OK' if argmin_pattern_ok else 'VIOLATED'}")
-        print(f"Argmax Pattern (1m < 3m < 5m): {'OK' if argmax_pattern_ok else 'VIOLATED'}")
-        print(f"Overall Pattern: {'OK' if argmin_pattern_ok and argmax_pattern_ok else 'VIOLATED'}")
+        print(f"\n--- Extrema Values Summary ---")
+        print(f"Using natural argmin/argmax values without pattern enforcement")
+        print(f"1m: Low={fft_1m['lowest_low_price']:.2f}, High={fft_1m['highest_high_price']:.2f}")
+        print(f"3m: Low={fft_3m['lowest_low_price']:.2f}, High={fft_3m['highest_high_price']:.2f}")
+        print(f"5m: Low={fft_5m['lowest_low_price']:.2f}, High={fft_5m['highest_high_price']:.2f}")
         
         return {
             "1m": fft_1m,
             "3m": fft_3m,
             "5m": fft_5m,
-            "ordering_error": not (argmin_pattern_ok and argmax_pattern_ok)
+            "natural_analysis": True
         }
         
     except Exception as e:
-        print(f"Error analyzing FFT cycles with timeframe ordering: {e}")
+        print(f"Error analyzing FFT cycles with natural values: {e}")
         return {
             "1m": {"error": str(e)},
             "3m": {"error": str(e)},
             "5m": {"error": str(e)},
-            "ordering_error": True
+            "natural_analysis": False
         }
 
 def analyze_fft_forecast_price_15s(candles_1m):
@@ -1212,7 +1171,7 @@ try:
             # NEW: Check ML_extended_target condition
             reaches_target, min_forecast, max_forecast, ml_details = check_ml_extended_target(model, current_price, PROFIT_TARGET_PERCENT)
             conditions_status["ML_extended_target"] = reaches_target
-            print(f"ML Forecast Range: {min_forecast:.25f} - {max_forecast:.25f}")
+            print(f"ML Extended Target: {min_forecast:.25f} - {max_forecast:.25f}")
             print(f"Profit Target Price: {ml_details.get('profit_target_price', 0):.25f}")
             print(f"ML Forecast Reaches Profit Target: {reaches_target}")
         else:
@@ -1234,9 +1193,9 @@ try:
         print("TIMEFRAME ANALYSIS")
         print("="*80)
         
-        # Analyze FFT cycles with proper argmin/argmax and timeframe ordering
-        print("\n--- FFT Cycle Analysis with Timeframe Ordering ---")
-        fft_cycles = analyze_fft_cycle_with_timeframe_ordering(
+        # Analyze FFT cycles with natural argmin/argmax values
+        print("\n--- FFT Cycle Analysis with Natural Values ---")
+        fft_cycles = analyze_fft_cycle_with_natural_values(
             candle_map.get('1m', []), 
             candle_map.get('3m', []), 
             candle_map.get('5m', [])
@@ -1293,7 +1252,7 @@ try:
                 print(f"Volume Bullish Ratio: {volume_ratios[timeframe]['buy_ratio']:.25f}%" if timeframe in volume_ratios else "Volume Bullish Ratio: Not available")
                 print(f"Volume Bearish Ratio: {volume_ratios[timeframe]['sell_ratio']:.25f}%" if timeframe in volume_ratios else "Volume Bearish Ratio: Not available")
                 print(f"Status: {volume_ratios[timeframe]['status']}" if timeframe in volume_ratios else "Status: Not available")
-                avg = (min_threshold_tf + max_threshold_tf) / Decimal('2') if min_threshold_tf is not None and max_threshold_tf is not None else current_price
+                avg = (min_threshold_tf + max_threshold_tf) / Decimal('2') if min_threshold_tf is not None and max_threshold_tf is not None else current_close
                 wave_price = calculate_wave_price(len(closes), avg, min_threshold_tf or Decimal('0'), max_threshold_tf or Decimal('Infinity'), omega=Decimal('0.1'), phi=Decimal('0'))
                 print(f"Calculated Wave Price: {wave_price:.25f}")
                 independent_wave_price = calculate_independent_wave_price(current_price, avg, min_threshold_tf or Decimal('0'), max_threshold_tf or Decimal('Infinity'), range_distance=Decimal('0.1'))
@@ -1342,44 +1301,140 @@ try:
         print("TRADING CONDITIONS")
         print("="*80)
         
-        # Condition 1: FFT Forecast Price (15s)
-        print("\n--- Condition 1: FFT Forecast Price (15s) ---")
+        # Condition 1: ML Forecasted Price over Current Close
+        print("\n--- Condition 1: ML Forecasted Price over Current Close ---")
+        if "1m" in candle_map and candle_map['1m']:
+            print(f"Current Price: {current_price:.25f}")
+            print(f"Forecasted Price: {adjusted_forecasted_price:.25f}")
+            price_diff = adjusted_forecasted_price - current_price
+            price_diff_pct = (price_diff / current_price) * 100 if current_price > 0 else 0
+            print(f"Price Difference: {price_diff:.25f} ({price_diff_pct:.4f}%)")
+            print(f"Forecasted > Current: {conditions_status['ML_Forecasted_Price_over_Current_Close']}")
+            print(f"Condition Met: {conditions_status['ML_Forecasted_Price_over_Current_Close']}")
+        else:
+            print("No 1m data available for ML forecast.")
+            print(f"Condition Met: {conditions_status['ML_Forecasted_Price_over_Current_Close']}")
+        
+        # Condition 2: ML Extended Target
+        print("\n--- Condition 2: ML Extended Target ---")
+        if "1m" in candle_map and candle_map['1m']:
+            print(f"Current Price: {ml_details.get('current_price', 0):.25f}")
+            print(f"Profit Target Price: {ml_details.get('profit_target_price', 0):.25f}")
+            print(f"ML Extended Target: {min_forecast:.25f} - {max_forecast:.25f}")
+            print(f"Target Within Range: {ml_details.get('reaches_target', False)}")
+            print(f"Range Covers Target: {'Yes' if ml_details.get('min_forecast', 0) <= ml_details.get('profit_target_price', 0) <= ml_details.get('max_forecast', 0) else 'No'}")
+            print(f"Reaches Target: {conditions_status['ML_extended_target']}")
+            print(f"Condition Met: {conditions_status['ML_extended_target']}")
+        else:
+            print("No 1m data available for ML extended target.")
+            print(f"Condition Met: {conditions_status['ML_extended_target']}")
+        
+        # Condition 3: Dip Confirmed (1m)
+        print("\n--- Condition 3: Dip Confirmed (1m) ---")
+        if '1m' in candle_map and candle_map['1m']:
+            closes = [candle['close'] for candle in candle_map['1m']]
+            min_threshold_tf, max_threshold_tf, _, _, _, _, _ = calculate_thresholds(closes, period=14, minimum_percentage=2, maximum_percentage=2)
+            last_bottom, last_top, closest_reversal, closest_type = find_major_reversals(candle_map['1m'], current_price, min_threshold_tf, max_threshold_tf)
+            print(f"Most Recent Reversal Type: {closest_type if closest_type else 'None'}")
+            print(f"Reversal Price: {closest_reversal:.25f}" if closest_reversal else "No reversal found")
+            print(f"Current Price vs Reversal: {'Above dip' if closest_type == 'DIP' and current_price > closest_reversal else 'Below top' if closest_type == 'TOP' and current_price < closest_reversal else 'Neutral'}")
+            print(f"Dip Confirmed: {conditions_status['dip_confirmed_1m']}")
+            print(f"Condition Met: {conditions_status['dip_confirmed_1m']}")
+        else:
+            print("No 1m data available for dip confirmation.")
+            print(f"Condition Met: {conditions_status['dip_confirmed_1m']}")
+        
+        # Condition 4: Dip Confirmed (3m)
+        print("\n--- Condition 4: Dip Confirmed (3m) ---")
+        if '3m' in candle_map and candle_map['3m']:
+            closes = [candle['close'] for candle in candle_map['3m']]
+            min_threshold_tf, max_threshold_tf, _, _, _, _, _ = calculate_thresholds(closes, period=14, minimum_percentage=2, maximum_percentage=2)
+            last_bottom, last_top, closest_reversal, closest_type = find_major_reversals(candle_map['3m'], current_price, min_threshold_tf, max_threshold_tf)
+            print(f"Most Recent Reversal Type: {closest_type if closest_type else 'None'}")
+            print(f"Reversal Price: {closest_reversal:.25f}" if closest_reversal else "No reversal found")
+            print(f"Current Price vs Reversal: {'Above dip' if closest_type == 'DIP' and current_price > closest_reversal else 'Below top' if closest_type == 'TOP' and current_price < closest_reversal else 'Neutral'}")
+            print(f"Dip Confirmed: {conditions_status['dip_confirmed_3m']}")
+            print(f"Condition Met: {conditions_status['dip_confirmed_3m']}")
+        else:
+            print("No 3m data available for dip confirmation.")
+            print(f"Condition Met: {conditions_status['dip_confirmed_3m']}")
+        
+        # Condition 5: Dip Confirmed (5m)
+        print("\n--- Condition 5: Dip Confirmed (5m) ---")
+        if '5m' in candle_map and candle_map['5m']:
+            closes = [candle['close'] for candle in candle_map['5m']]
+            min_threshold_tf, max_threshold_tf, _, _, _, _, _ = calculate_thresholds(closes, period=14, minimum_percentage=2, maximum_percentage=2)
+            last_bottom, last_top, closest_reversal, closest_type = find_major_reversals(candle_map['5m'], current_price, min_threshold_tf, max_threshold_tf)
+            print(f"Most Recent Reversal Type: {closest_type if closest_type else 'None'}")
+            print(f"Reversal Price: {closest_reversal:.25f}" if closest_reversal else "No reversal found")
+            print(f"Current Price vs Reversal: {'Above dip' if closest_type == 'DIP' and current_price > closest_reversal else 'Below top' if closest_type == 'TOP' and current_price < closest_reversal else 'Neutral'}")
+            print(f"Dip Confirmed: {conditions_status['dip_confirmed_5m']}")
+            print(f"Condition Met: {conditions_status['dip_confirmed_5m']}")
+        else:
+            print("No 5m data available for dip confirmation.")
+            print(f"Condition Met: {conditions_status['dip_confirmed_5m']}")
+        
+        # Condition 6: Volume Bullish (1m)
+        print("\n--- Condition 6: Volume Bullish (1m) ---")
+        if '1m' in volume_ratios:
+            bullish_vol = buy_volume.get('1m', [Decimal('0')])[-1]
+            bearish_vol = sell_volume.get('1m', [Decimal('0')])[-1]
+            total_vol = bullish_vol + bearish_vol
+            bullish_pct = (bullish_vol / total_vol * 100) if total_vol > 0 else 0
+            bearish_pct = (bearish_vol / total_vol * 100) if total_vol > 0 else 0
+            print(f"Bullish Volume: {bullish_vol:.25f} ({bullish_pct:.2f}%)")
+            print(f"Bearish Volume: {bearish_vol:.25f} ({bearish_pct:.2f}%)")
+            print(f"Total Volume: {total_vol:.25f}")
+            print(f"Volume Ratio (Bullish/Bearish): {bullish_vol/bearish_vol:.4f}" if bearish_vol > 0 else "Infinity")
+            print(f"Bullish > Bearish: {conditions_status['volume_bullish_1m']}")
+            print(f"Condition Met: {conditions_status['volume_bullish_1m']}")
+        else:
+            print("No volume data available for 1m timeframe.")
+            print(f"Condition Met: {conditions_status['volume_bullish_1m']}")
+        
+        # Condition 7: FFT Forecast Price (15s)
+        print("\n--- Condition 7: FFT Forecast Price (15s) ---")
         fft_15s_result = analyze_fft_forecast_price_15s(candles_1m)
         if 'error' not in fft_15s_result:
             conditions_status["fft_forecast_price_15s"] = fft_15s_result['forecast_up']
             print(f"Current Price: {fft_15s_result['current_price']:.2f}")
             print(f"Forecast Target: {fft_15s_result['forecast_target']:.2f}")
             print(f"Forecast Difference: {fft_15s_result['forecast_diff_pct']:.4f}%")
+            print(f"Forecast Direction: {'Upward' if fft_15s_result['forecast_up'] else 'Downward'}")
             print(f"Forecast Up: {fft_15s_result['forecast_up']}")
             print(f"Condition Met: {conditions_status['fft_forecast_price_15s']}")
         else:
             print(f"Error analyzing FFT forecast price (15s): {fft_15s_result['error']}")
             print(f"Condition Met: {conditions_status['fft_forecast_price_15s']}")
         
-        # Condition 2: Close Below SMA200 (15s)
-        print("\n--- Condition 2: Close Below SMA200 (15s) ---")
+        # Condition 8: Close Below SMA200 (15s)
+        print("\n--- Condition 8: Close Below SMA200 (15s) ---")
         sma200_15s_result = analyze_sma200_condition_15s(candles_1m)
         if 'error' not in sma200_15s_result:
             conditions_status["close_below_sma200_15s"] = sma200_15s_result['close_below_sma200']
             print(f"Current Close: {sma200_15s_result['current_close']:.2f}")
             print(f"Current SMA200: {sma200_15s_result['current_sma200']:.2f}")
             print(f"Difference: {sma200_15s_result['difference']:.4f} ({sma200_15s_result['difference_pct']:.4f}%)")
+            print(f"Position Relative to SMA200: {'Below' if sma200_15s_result['close_below_sma200'] else 'Above'}")
             print(f"Close Below SMA200: {sma200_15s_result['close_below_sma200']}")
             print(f"Condition Met: {conditions_status['close_below_sma200_15s']}")
         else:
             print(f"Error analyzing SMA200 condition (15s): {sma200_15s_result['error']}")
             print(f"Condition Met: {conditions_status['close_below_sma200_15s']}")
         
-        # Condition 3: Momentum Positive (1m)
-        print("\n--- Condition 3: Momentum Positive (1m) ---")
+        # Condition 9: Momentum Positive (1m)
+        print("\n--- Condition 9: Momentum Positive (1m) ---")
         momentum_1m_positive, momentum_1m_value, momentum_1m_details = calculate_momentum(candle_map['1m'])
         conditions_status["momentum_positive_1m"] = momentum_1m_positive
         print(f"Current Momentum: {momentum_1m_value:.4f}")
+        print(f"Momentum Period: {momentum_1m_details.get('period', 10)}")
+        print(f"Momentum Direction: {'Positive' if momentum_1m_positive else 'Negative'}")
+        print(f"Momentum Strength: {'Strong' if abs(momentum_1m_value) > 100 else 'Moderate' if abs(momentum_1m_value) > 50 else 'Weak'}")
         print(f"Momentum Positive: {momentum_1m_positive}")
         print(f"Condition Met: {conditions_status['momentum_positive_1m']}")
         
-        # Condition 4: FFT Forecast Up (1m)
-        print("\n--- Condition 4: FFT Forecast Up (1m) ---")
+        # Condition 10: FFT Forecast Up (1m)
+        print("\n--- Condition 10: FFT Forecast Up (1m) ---")
         if '1m' in fft_cycles and 'error' not in fft_cycles['1m']:
             fft_1m_result = fft_cycles['1m']
             conditions_status["fft_forecast_up_1m"] = fft_1m_result['forecast_target'] > fft_1m_result['current_price']
@@ -1388,13 +1443,16 @@ try:
             print(f"Forecast Difference: {fft_1m_result['forecast_diff_pct']:.4f}%")
             print(f"Lowest Low: {fft_1m_result['lowest_low_price']:.2f}")
             print(f"Highest High: {fft_1m_result['highest_high_price']:.2f}")
+            print(f"Cycle Direction: {fft_1m_result['cycle_direction']}")
+            print(f"Dip More Recent: {fft_1m_result['dip_more_recent']}")
+            print(f"Forecast Up: {conditions_status['fft_forecast_up_1m']}")
             print(f"Condition Met: {conditions_status['fft_forecast_up_1m']}")
         else:
             print(f"Error analyzing 1m FFT cycle: {fft_cycles.get('1m', {}).get('error', 'Unknown error')}")
             print(f"Condition Met: {conditions_status['fft_forecast_up_1m']}")
         
-        # Condition 5: FFT Forecast Up (3m)
-        print("\n--- Condition 5: FFT Forecast Up (3m) ---")
+        # Condition 11: FFT Forecast Up (3m)
+        print("\n--- Condition 11: FFT Forecast Up (3m) ---")
         if '3m' in fft_cycles and 'error' not in fft_cycles['3m']:
             fft_3m_result = fft_cycles['3m']
             conditions_status["fft_forecast_up_3m"] = fft_3m_result['forecast_target'] > fft_3m_result['current_price']
@@ -1403,13 +1461,16 @@ try:
             print(f"Forecast Difference: {fft_3m_result['forecast_diff_pct']:.4f}%")
             print(f"Lowest Low: {fft_3m_result['lowest_low_price']:.2f}")
             print(f"Highest High: {fft_3m_result['highest_high_price']:.2f}")
+            print(f"Cycle Direction: {fft_3m_result['cycle_direction']}")
+            print(f"Dip More Recent: {fft_3m_result['dip_more_recent']}")
+            print(f"Forecast Up: {conditions_status['fft_forecast_up_3m']}")
             print(f"Condition Met: {conditions_status['fft_forecast_up_3m']}")
         else:
             print(f"Error analyzing 3m FFT cycle: {fft_cycles.get('3m', {}).get('error', 'Unknown error')}")
             print(f"Condition Met: {conditions_status['fft_forecast_up_3m']}")
         
-        # Condition 6: FFT Forecast Up (5m)
-        print("\n--- Condition 6: FFT Forecast Up (5m) ---")
+        # Condition 12: FFT Forecast Up (5m)
+        print("\n--- Condition 12: FFT Forecast Up (5m) ---")
         if '5m' in fft_cycles and 'error' not in fft_cycles['5m']:
             fft_5m_result = fft_cycles['5m']
             conditions_status["fft_forecast_up_5m"] = fft_5m_result['forecast_target'] > fft_5m_result['current_price']
@@ -1418,6 +1479,9 @@ try:
             print(f"Forecast Difference: {fft_5m_result['forecast_diff_pct']:.4f}%")
             print(f"Lowest Low: {fft_5m_result['lowest_low_price']:.2f}")
             print(f"Highest High: {fft_5m_result['highest_high_price']:.2f}")
+            print(f"Cycle Direction: {fft_5m_result['cycle_direction']}")
+            print(f"Dip More Recent: {fft_5m_result['dip_more_recent']}")
+            print(f"Forecast Up: {conditions_status['fft_forecast_up_5m']}")
             print(f"Condition Met: {conditions_status['fft_forecast_up_5m']}")
         else:
             print(f"Error analyzing 5m FFT cycle: {fft_cycles.get('5m', {}).get('error', 'Unknown error')}")
