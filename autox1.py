@@ -55,7 +55,7 @@ CONFIG = {
     "conditions": {
         # Original conditions from first code (with some removed)
         "ML_Forecasted_Price_over_Current_Close": True,  # ML Forecast Price over Current Close
-        "ML_extended_target": True,  # NEW: ML Forecast reaches 1.25% profit target
+        "fibo_forecast_target_5m": True,  # NEW: Fibonacci forecast target (5m) above current close
         "dip_confirmed_1m": True,  # Dip Confirmed (1m)
         "dip_confirmed_3m": True,  # Dip Confirmed (3m)
         "dip_confirmed_5m": True,  # Dip Confirmed (5m)
@@ -1043,38 +1043,6 @@ def analyze_sma200_condition_15s(candles_1m):
         print(f"Error analyzing SMA200 condition (15s): {e}")
         return {"error": str(e)}
 
-def check_ml_extended_target(model, current_price, profit_target_pct=1.25):
-    """
-    Check if ML forecast reaches the profit target price.
-    Returns True if forecast range includes the profit target price.
-    """
-    try:
-        if model is None or current_price <= 0:
-            return False, 0.0, 0.0, {"error": "Invalid model or price"}
-        
-        # Calculate profit target price
-        # Fixed: Convert to Decimal to avoid type mismatch
-        profit_multiplier = Decimal('1') + Decimal(str(profit_target_pct)) / Decimal('100')
-        profit_target_price = current_price * profit_multiplier
-        
-        # Forecast price range
-        min_forecast, max_forecast, _ = forecast_price_range(model, num_steps=10)
-        
-        # Check if profit target is within forecast range
-        reaches_target = (min_forecast <= profit_target_price <= max_forecast)
-        
-        return reaches_target, float(min_forecast), float(max_forecast), {
-            "current_price": float(current_price),
-            "profit_target_price": float(profit_target_price),
-            "min_forecast": float(min_forecast),
-            "max_forecast": float(max_forecast),
-            "reaches_target": reaches_target
-        }
-        
-    except Exception as e:
-        print(f"Error checking ML extended target: {e}")
-        return False, 0.0, 0.0, {"error": str(e)}
-
 # Initialize lot size info
 lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
 min_trade_size = lot_size_info['minQty']
@@ -1141,7 +1109,7 @@ try:
         conditions_status = {
             # Original conditions from first code (with some removed)
             "ML_Forecasted_Price_over_Current_Close": False,
-            "ML_extended_target": False,  # NEW: ML Forecast reaches 1.25% profit target
+            "fibo_forecast_target_5m": False,  # NEW: Fibonacci forecast target (5m) above current close
             "dip_confirmed_1m": False,
             "dip_confirmed_3m": False,
             "dip_confirmed_5m": False,
@@ -1167,13 +1135,6 @@ try:
             
             # Check ML_Forecasted_Price_over_Current_Close condition
             conditions_status["ML_Forecasted_Price_over_Current_Close"] = adjusted_forecasted_price > current_price
-            
-            # NEW: Check ML_extended_target condition
-            reaches_target, min_forecast, max_forecast, ml_details = check_ml_extended_target(model, current_price, PROFIT_TARGET_PERCENT)
-            conditions_status["ML_extended_target"] = reaches_target
-            print(f"ML Extended Target: {min_forecast:.25f} - {max_forecast:.25f}")
-            print(f"Profit Target Price: {ml_details.get('profit_target_price', 0):.25f}")
-            print(f"ML Forecast Reaches Profit Target: {reaches_target}")
         else:
             min_threshold, max_threshold, adjusted_forecasted_price = None, None, None
             print("No 1m data available for forecasting.")
@@ -1270,6 +1231,16 @@ try:
                     print(f"Level {level}: {price:.25f}")
                 fib_reversal_price = forecast_fibo_target_price(fib_info[timeframe])
                 print(f"{timeframe} Incoming Fibonacci Reversal Target (Forecast): {fib_reversal_price:.25f}" if fib_reversal_price is not None else f"{timeframe} Incoming Fibonacci Reversal Target: price not available.")
+                
+                # Check fibo_forecast_target_5m condition for 5m timeframe
+                if timeframe == '5m':
+                    if fib_reversal_price is not None:
+                        conditions_status["fibo_forecast_target_5m"] = fib_reversal_price > current_price
+                        print(f"Fibonacci Forecast Target > Current Price: {conditions_status['fibo_forecast_target_5m']}")
+                    else:
+                        conditions_status["fibo_forecast_target_5m"] = False
+                        print("Fibonacci Forecast Target not available")
+                
                 dist_to_min = ((current_price - low_tf) / (high_tf - low_tf)) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
                 dist_to_max = ((high_tf - current_price) / (high_tf - low_tf)) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
                 print(f"Distance from Current Close to Min Threshold ({low_tf:.25f}): {dist_to_min:.25f}%")
@@ -1315,19 +1286,25 @@ try:
             print("No 1m data available for ML forecast.")
             print(f"Condition Met: {conditions_status['ML_Forecasted_Price_over_Current_Close']}")
         
-        # Condition 2: ML Extended Target
-        print("\n--- Condition 2: ML Extended Target ---")
-        if "1m" in candle_map and candle_map['1m']:
-            print(f"Current Price: {ml_details.get('current_price', 0):.25f}")
-            print(f"Profit Target Price: {ml_details.get('profit_target_price', 0):.25f}")
-            print(f"ML Extended Target: {min_forecast:.25f} - {max_forecast:.25f}")
-            print(f"Target Within Range: {ml_details.get('reaches_target', False)}")
-            print(f"Range Covers Target: {'Yes' if ml_details.get('min_forecast', 0) <= ml_details.get('profit_target_price', 0) <= ml_details.get('max_forecast', 0) else 'No'}")
-            print(f"Reaches Target: {conditions_status['ML_extended_target']}")
-            print(f"Condition Met: {conditions_status['ML_extended_target']}")
+        # Condition 2: Fibonacci Forecast Target (5m) above Current Close
+        print("\n--- Condition 2: Fibonacci Forecast Target (5m) above Current Close ---")
+        if '5m' in candle_map and candle_map['5m']:
+            fib_5m_levels = fib_info.get('5m', {})
+            fib_5m_target = forecast_fibo_target_price(fib_5m_levels)
+            if fib_5m_target is not None:
+                print(f"Current Price: {current_price:.25f}")
+                print(f"Fibonacci Forecast Target (5m): {fib_5m_target:.25f}")
+                price_diff = fib_5m_target - current_price
+                price_diff_pct = (price_diff / current_price) * 100 if current_price > 0 else 0
+                print(f"Price Difference: {price_diff:.25f} ({price_diff_pct:.4f}%)")
+                print(f"Fibonacci Target > Current: {conditions_status['fibo_forecast_target_5m']}")
+                print(f"Condition Met: {conditions_status['fibo_forecast_target_5m']}")
+            else:
+                print("Fibonacci forecast target not available for 5m timeframe.")
+                print(f"Condition Met: {conditions_status['fibo_forecast_target_5m']}")
         else:
-            print("No 1m data available for ML extended target.")
-            print(f"Condition Met: {conditions_status['ML_extended_target']}")
+            print("No 5m data available for Fibonacci forecast.")
+            print(f"Condition Met: {conditions_status['fibo_forecast_target_5m']}")
         
         # Condition 3: Dip Confirmed (1m)
         print("\n--- Condition 3: Dip Confirmed (1m) ---")
@@ -1551,22 +1528,33 @@ try:
                 print("Error: BTC balance is zero or negative. Target price set to 0.")
             print(f"Price for 1.25% Profit Target: {target_price:.25f}")
 
-            # Percentage Distance to 1.25% Profit Target
+            # Percentage Price Differences
             if entry_price > Decimal('0') and target_price > entry_price:
-                if current_price >= target_price:
-                    percentage_to_target = Decimal('0.0')
-                elif current_price >= entry_price:
-                    percentage_to_target = ((target_price - current_price) / (target_price - entry_price)) * Decimal('100')
-                else:
-                    percentage_to_target = Decimal('100.0') + (((entry_price - current_price) / (target_price - entry_price)) * Decimal('100'))
+                # Entry to Current percentage change
+                entry_to_current_pct = ((current_price - entry_price) / entry_price) * Decimal('100')
+                
+                # Current to Target percentage change (what we need to gain)
+                current_to_target_pct = ((target_price - current_price) / current_price) * Decimal('100')
+                
+                # Entry to Target percentage change (should be 1.25%)
+                entry_to_target_pct = ((target_price - entry_price) / entry_price) * Decimal('100')
+                
+                print(f"Entry Price: {entry_price:.2f}")
+                print(f"Current Price: {current_price:.2f}")
+                print(f"Target Price: {target_price:.2f}")
+                print(f"Entry to Current: {entry_to_current_pct:.2f}%")
+                print(f"Current to Target: {current_to_target_pct:.2f}%")
+                print(f"Entry to Target: {entry_to_target_pct:.2f}%")
+                
             else:
-                percentage_to_target = Decimal('0.0')
-                print("Error: Invalid entry or target price for percentage to target calculation.")
-            print(f"Percentage Distance to 1.25% Profit Target: {percentage_to_target:.25f}%")
+                entry_to_current_pct = Decimal('0.0')
+                current_to_target_pct = Decimal('0.0')
+                entry_to_target_pct = Decimal('0.0')
+                print("Error: Invalid entry or target price for percentage calculations.")
 
-            # Percentage Progress to 1.25% Profit Target
-            percentage_progress = Decimal('100.0') - percentage_to_target
-            print(f"Percentage Progress to 1.25% Profit Target: {percentage_progress:.25f}%")
+            print(f"Price Change from Entry: {entry_to_current_pct:.2f}%")
+            print(f"Needed Gain to Target: {current_to_target_pct:.2f}%")
+
             print()
 
             if check_exit_condition(initial_investment, asset_balance, entry_price):
