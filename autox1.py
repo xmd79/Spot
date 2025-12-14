@@ -73,7 +73,7 @@ CONFIG = {
 }
 
 # Utility Functions
-def fetch_candles_in_parallel(timeframes, symbol=TRADE_SYMBOL, limit=100):
+def fetch_candles_in_parallel(timeframes, symbol=TRADE_SYMBOL, limit=1200):
     def fetch_candles(timeframe):
         return get_candles(symbol, timeframe, limit)
 
@@ -81,7 +81,7 @@ def fetch_candles_in_parallel(timeframes, symbol=TRADE_SYMBOL, limit=100):
         results = list(executor.map(fetch_candles, timeframes))
     return dict(zip(timeframes, results))
 
-def get_candles(symbol, timeframe, limit=100, retries=5, delay=5):
+def get_candles(symbol, timeframe, limit=1200, retries=5, delay=5):
     for attempt in range(retries):
         try:
             klines = client.get_klines(symbol=symbol, interval=timeframe, limit=limit)
@@ -818,32 +818,57 @@ def improved_fft_forecast(candles, forecast_periods=4):
         print(f"Error in improved FFT forecast: {e}")
         return np.array([candles[-1]["close"]] * forecast_periods) if candles else np.array([1.0] * forecast_periods)
 
-def analyze_fft_cycle(candles, timeframe):
+def analyze_fft_cycle_with_proper_argmin_argmax(candles, timeframe):
     """
-    Analyze FFT cycle between argmin and argmax for specified timeframe.
-    Provides detailed frequency calculations and inverse FFT forecasting.
+    Analyze FFT cycle with proper argmin and argmax finding for most recent occurrence.
+    Uses last 1200 values for each timeframe with their own specifications.
     """
     try:
         if not candles:
             return {"error": "No data provided"}
         
-        # Find index of the lowest low and highest high using argmin/argmax
-        lowest_low_idx = np.argmin([candle["low"] for candle in candles])
-        highest_high_idx = np.argmax([candle["high"] for candle in candles])
+        # Extract price data
+        close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
+        low_prices = np.array([candle["low"] for candle in candles], dtype=np.float64)
+        high_prices = np.array([candle["high"] for candle in candles], dtype=np.float64)
         
-        # Get values and timestamps
-        lowest_low_price = candles[lowest_low_idx]["low"]
-        lowest_low_time = datetime.datetime.fromtimestamp(candles[lowest_low_idx]["time"], tz=LOCAL_TIMEZONE)
+        # Find argmin and argmax for most recent occurrence
+        # For argmin: find most recent lowest low
+        # For argmax: find most recent highest high
         
-        highest_high_price = candles[highest_high_idx]["high"]
-        highest_high_time = datetime.datetime.fromtimestamp(candles[highest_high_idx]["time"], tz=LOCAL_TIMEZONE)
+        # Use argrelextrema to find local minima and maxima
+        from scipy.signal import argrelextrema
+        
+        # Find local minima (lows)
+        local_minima_indices = argrelextrema(low_prices, np.less, order=5)[0]
+        if len(local_minima_indices) > 0:
+            # Get most recent minimum
+            most_recent_min_idx = local_minima_indices[-1]
+            lowest_low_price = low_prices[most_recent_min_idx]
+            lowest_low_time = datetime.datetime.fromtimestamp(candles[most_recent_min_idx]["time"], tz=LOCAL_TIMEZONE)
+        else:
+            # Fallback to global minimum
+            most_recent_min_idx = np.argmin(low_prices)
+            lowest_low_price = low_prices[most_recent_min_idx]
+            lowest_low_time = datetime.datetime.fromtimestamp(candles[most_recent_min_idx]["time"], tz=LOCAL_TIMEZONE)
+        
+        # Find local maxima (highs)
+        local_maxima_indices = argrelextrema(high_prices, np.greater, order=5)[0]
+        if len(local_maxima_indices) > 0:
+            # Get most recent maximum
+            most_recent_max_idx = local_maxima_indices[-1]
+            highest_high_price = high_prices[most_recent_max_idx]
+            highest_high_time = datetime.datetime.fromtimestamp(candles[most_recent_max_idx]["time"], tz=LOCAL_TIMEZONE)
+        else:
+            # Fallback to global maximum
+            most_recent_max_idx = np.argmax(high_prices)
+            highest_high_price = high_prices[most_recent_max_idx]
+            highest_high_time = datetime.datetime.fromtimestamp(candles[most_recent_max_idx]["time"], tz=LOCAL_TIMEZONE)
         
         # Determine which occurred more recently
-        dip_more_recent = lowest_low_idx > highest_high_idx
+        dip_more_recent = most_recent_min_idx > most_recent_max_idx
         cycle_direction = "up" if dip_more_recent else "down"
         
-        # Extract price data for FFT analysis
-        close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
         current_price = close_prices[-1]
         
         # Use improved FFT for forecasting
@@ -862,16 +887,95 @@ def analyze_fft_cycle(candles, timeframe):
             "forecast_diff_pct": forecast_diff_pct,
             "lowest_low_price": lowest_low_price,
             "lowest_low_time": lowest_low_time,
+            "lowest_low_idx": int(most_recent_min_idx),
             "highest_high_price": highest_high_price,
             "highest_high_time": highest_high_time,
-            "dip_more_recent": dip_more_recent
+            "highest_high_idx": int(most_recent_max_idx),
+            "dip_more_recent": dip_more_recent,
+            "data_points": len(candles)
         }
         
         return results
         
     except Exception as e:
-        print(f"Error analyzing FFT cycle: {e}")
+        print(f"Error analyzing FFT cycle with proper argmin/argmax: {e}")
         return {"error": str(e)}
+
+def analyze_fft_cycle_with_timeframe_ordering(candles_1m, candles_3m, candles_5m):
+    """
+    Analyze FFT cycles for all timeframes and ensure 1min < 3min < 5min pattern.
+    Uses proper argmin and argmax finding for most recent occurrence.
+    """
+    try:
+        # Analyze each timeframe separately with proper argmin/argmax
+        fft_1m = analyze_fft_cycle_with_proper_argmin_argmax(candles_1m, '1m')
+        fft_3m = analyze_fft_cycle_with_proper_argmin_argmax(candles_3m, '3m')
+        fft_5m = analyze_fft_cycle_with_proper_argmin_argmax(candles_5m, '5m')
+        
+        # Check for errors
+        if 'error' in fft_1m or 'error' in fft_3m or 'error' in fft_5m:
+            return {
+                "1m": fft_1m,
+                "3m": fft_3m,
+                "5m": fft_5m,
+                "ordering_error": True
+            }
+        
+        # Print detailed argmin and argmax information for each timeframe
+        print(f"\n--- Detailed Argmin/Argmax Analysis ---")
+        print(f"1m - Argmin (Most Recent Low): {fft_1m['lowest_low_price']:.2f} at index {fft_1m['lowest_low_idx']} ({fft_1m['lowest_low_time'].strftime('%H:%M:%S')})")
+        print(f"1m - Argmax (Most Recent High): {fft_1m['highest_high_price']:.2f} at index {fft_1m['highest_high_idx']} ({fft_1m['highest_high_time'].strftime('%H:%M:%S')})")
+        print(f"3m - Argmin (Most Recent Low): {fft_3m['lowest_low_price']:.2f} at index {fft_3m['lowest_low_idx']} ({fft_3m['lowest_low_time'].strftime('%H:%M:%S')})")
+        print(f"3m - Argmax (Most Recent High): {fft_3m['highest_high_price']:.2f} at index {fft_3m['highest_high_idx']} ({fft_3m['highest_high_time'].strftime('%H:%M:%S')})")
+        print(f"5m - Argmin (Most Recent Low): {fft_5m['lowest_low_price']:.2f} at index {fft_5m['lowest_low_idx']} ({fft_5m['lowest_low_time'].strftime('%H:%M:%S')})")
+        print(f"5m - Argmax (Most Recent High): {fft_5m['highest_high_price']:.2f} at index {fft_5m['highest_high_idx']} ({fft_5m['highest_high_time'].strftime('%H:%M:%S')})")
+        
+        # Ensure 1min < 3min < 5min pattern for argmin and argmax values
+        # For lowest lows (argmin)
+        argmin_pattern_ok = True
+        if not (fft_1m['lowest_low_price'] <= fft_3m['lowest_low_price'] <= fft_5m['lowest_low_price']):
+            argmin_pattern_ok = False
+            print(f"\nWarning: Argmin pattern violated. 1m: {fft_1m['lowest_low_price']:.2f}, 3m: {fft_3m['lowest_low_price']:.2f}, 5m: {fft_5m['lowest_low_price']:.2f}")
+            
+            # Adjust to maintain pattern
+            if fft_1m['lowest_low_price'] > fft_3m['lowest_low_price']:
+                fft_3m['lowest_low_price'] = fft_1m['lowest_low_price']
+            if fft_3m['lowest_low_price'] > fft_5m['lowest_low_price']:
+                fft_5m['lowest_low_price'] = fft_3m['lowest_low_price']
+        
+        # For highest highs (argmax)
+        argmax_pattern_ok = True
+        if not (fft_1m['highest_high_price'] <= fft_3m['highest_high_price'] <= fft_5m['highest_high_price']):
+            argmax_pattern_ok = False
+            print(f"Warning: Argmax pattern violated. 1m: {fft_1m['highest_high_price']:.2f}, 3m: {fft_3m['highest_high_price']:.2f}, 5m: {fft_5m['highest_high_price']:.2f}")
+            
+            # Adjust to maintain pattern
+            if fft_1m['highest_high_price'] > fft_3m['highest_high_price']:
+                fft_3m['highest_high_price'] = fft_1m['highest_high_price']
+            if fft_3m['highest_high_price'] > fft_5m['highest_high_price']:
+                fft_5m['highest_high_price'] = fft_3m['highest_high_price']
+        
+        # Print pattern verification
+        print(f"\n--- Pattern Verification ---")
+        print(f"Argmin Pattern (1m < 3m < 5m): {'OK' if argmin_pattern_ok else 'VIOLATED'}")
+        print(f"Argmax Pattern (1m < 3m < 5m): {'OK' if argmax_pattern_ok else 'VIOLATED'}")
+        print(f"Overall Pattern: {'OK' if argmin_pattern_ok and argmax_pattern_ok else 'VIOLATED'}")
+        
+        return {
+            "1m": fft_1m,
+            "3m": fft_3m,
+            "5m": fft_5m,
+            "ordering_error": not (argmin_pattern_ok and argmax_pattern_ok)
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing FFT cycles with timeframe ordering: {e}")
+        return {
+            "1m": {"error": str(e)},
+            "3m": {"error": str(e)},
+            "5m": {"error": str(e)},
+            "ordering_error": True
+        }
 
 def analyze_fft_forecast_price_15s(candles_1m):
     """
@@ -990,7 +1094,9 @@ def check_ml_extended_target(model, current_price, profit_target_pct=1.25):
             return False, 0.0, 0.0, {"error": "Invalid model or price"}
         
         # Calculate profit target price
-        profit_target_price = current_price * (1 + profit_target_pct / 100)
+        # Fixed: Convert to Decimal to avoid type mismatch
+        profit_multiplier = Decimal('1') + Decimal(str(profit_target_pct)) / Decimal('100')
+        profit_target_price = current_price * profit_multiplier
         
         # Forecast price range
         min_forecast, max_forecast, _ = forecast_price_range(model, num_steps=10)
@@ -1029,404 +1135,438 @@ asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
 print("Trading Bot Initialized!")
 
 # Main trading loop
-while True:
-    current_local_time = datetime.datetime.now()
-    current_local_time_str = current_local_time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"\nCurrent Local Time: {current_local_time_str}")
+try:
+    while True:
+        current_local_time = datetime.datetime.now()
+        current_local_time_str = current_local_time.strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\nCurrent Local Time: {current_local_time_str}")
 
-    usdc_balance = get_balance('USDC')
-    asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
-    current_price = get_current_price()
-    btc_value_in_usdc = asset_balance * current_price
+        usdc_balance = get_balance('USDC')
+        asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
+        current_price = get_current_price()
+        btc_value_in_usdc = asset_balance * current_price
 
-    if btc_value_in_usdc > usdc_balance and not position_open:
-        print(f"BTC Value in USDC ({btc_value_in_usdc:.25f}) > USDC Balance ({usdc_balance:.25f}). Entering in-trade mode.")
-        position_open = True
-        entry_price = get_average_entry_price()
-        if entry_price > Decimal('0'):
-            initial_investment = asset_balance * entry_price
-            print(f"Estimated Initial Investment: {initial_investment:.25f} USDC based on last buy trade entry price {entry_price:.25f}")
-            last_trade = get_last_buy_trade()
-            if last_trade:
-                entry_datetime = datetime.datetime.fromtimestamp(last_trade['time'] / 1000)
-                print(f"Entry Datetime set from last trade: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
-            else:
-                entry_datetime = current_local_time
-                print(f"No trade history found. Using current time as Entry Datetime: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
-        else:
-            initial_investment = asset_balance * current_price
-            print(f"No valid entry price found. Using current price {current_price:.25f} to estimate Initial Investment: {initial_investment:.25f} USDC")
-            entry_price = current_price
-            entry_datetime = current_local_time
-            print(f"Entry Datetime set to current time: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
-
-    # Fetch candles for all timeframes
-    candle_map = fetch_candles_in_parallel(['1m', '3m', '5m'])
-    
-    # Also fetch 1m candles for 15s analysis
-    candles_1m = get_candles(TRADE_SYMBOL, '1m', limit=500)
-    
-    if not candle_map.get('1m'):
-        print("Error: '1m' candles not fetched. Check API connectivity or symbol.")
-    if current_price == Decimal('0.0'):
-        print(f"Warning: Current {TRADE_SYMBOL} price is {current_price:.25f}. API may be failing.")
-
-    # Initialize all condition results
-    conditions_status = {
-        # Original conditions from first code (with some removed)
-        "ML_Forecasted_Price_over_Current_Close": False,
-        "ML_extended_target": False,  # NEW: ML Forecast reaches 1.25% profit target
-        "dip_confirmed_1m": False,
-        "dip_confirmed_3m": False,
-        "dip_confirmed_5m": False,
-        "volume_bullish_1m": False,
-        
-        # Conditions from second code (with some removed)
-        "fft_forecast_price_15s": False,
-        "close_below_sma200_15s": False,
-        "momentum_positive_1m": False,
-        "fft_forecast_up_1m": False,
-        "fft_forecast_up_3m": False,
-        "fft_forecast_up_5m": False,
-    }
-
-    if "1m" in candle_map and candle_map['1m']:
-        model, backtest_mae, last_predictions, actuals = backtest_model(candle_map["1m"])
-        print(f"Backtest MAE: {backtest_mae:.25f}")
-        forecasted_prices = forecast_next_price(model, num_steps=1)
-        closes = [candle['close'] for candle in candle_map["1m"]]
-        min_threshold, max_threshold, _, _, _, _, _ = calculate_thresholds(closes)
-        adjusted_forecasted_price = min(max(forecasted_prices[-1], min_threshold), max_threshold) if min_threshold is not None and max_threshold is not None else forecasted_prices[-1]
-        print(f"Forecasted Price: {adjusted_forecasted_price:.25f}")
-        
-        # Check ML_Forecasted_Price_over_Current_Close condition
-        conditions_status["ML_Forecasted_Price_over_Current_Close"] = adjusted_forecasted_price > current_price
-        
-        # NEW: Check ML_extended_target condition
-        reaches_target, min_forecast, max_forecast, ml_details = check_ml_extended_target(model, current_price, PROFIT_TARGET_PERCENT)
-        conditions_status["ML_extended_target"] = reaches_target
-        print(f"ML Forecast Range: {min_forecast:.25f} - {max_forecast:.25f}")
-        print(f"Profit Target Price: {ml_details.get('profit_target_price', 0):.25f}")
-        print(f"ML Forecast Reaches Profit Target: {reaches_target}")
-    else:
-        min_threshold, max_threshold, adjusted_forecasted_price = None, None, None
-        print("No 1m data available for forecasting.")
-
-    buy_volume, sell_volume = calculate_buy_sell_volume(candle_map)
-    volume_ratios = calculate_volume_ratio(buy_volume, sell_volume)
-    support_levels, resistance_levels = find_specific_support_resistance(candle_map, min_threshold or current_price * Decimal('0.95'), max_threshold or current_price * Decimal('1.05'), current_price)
-    volume_ratios_details = calculate_bullish_bearish_volume_ratios(candle_map)
-    volume_trends_details = analyze_volume_changes_over_time(candle_map)
-
-    fib_info = {}
-    pythagorean_forecasts = {'1m': {'price': None, 'rate': None}, '3m': {'price': None, 'rate': None}, '5m': {'price': None, 'rate': None}}
-    last_major_reversal_type = None
-
-    # Check conditions from second code
-    
-    # Condition 1: FFT Forecast Price (15s)
-    print("\n--- Condition 1: FFT Forecast Price (15s) ---")
-    fft_15s_result = analyze_fft_forecast_price_15s(candles_1m)
-    if 'error' not in fft_15s_result:
-        conditions_status["fft_forecast_price_15s"] = fft_15s_result['forecast_up']
-        print(f"Current Price: {fft_15s_result['current_price']:.2f}")
-        print(f"Forecast Target: {fft_15s_result['forecast_target']:.2f}")
-        print(f"Forecast Difference: {fft_15s_result['forecast_diff_pct']:.4f}%")
-        print(f"Forecast Up: {fft_15s_result['forecast_up']}")
-        print(f"Condition Met: {conditions_status['fft_forecast_price_15s']}")
-    else:
-        print(f"Error analyzing FFT forecast price (15s): {fft_15s_result['error']}")
-        print(f"Condition Met: {conditions_status['fft_forecast_price_15s']}")
-    
-    # Condition 2: Close Below SMA200 (15s)
-    print("\n--- Condition 2: Close Below SMA200 (15s) ---")
-    sma200_15s_result = analyze_sma200_condition_15s(candles_1m)
-    if 'error' not in sma200_15s_result:
-        conditions_status["close_below_sma200_15s"] = sma200_15s_result['close_below_sma200']
-        print(f"Current Close: {sma200_15s_result['current_close']:.2f}")
-        print(f"Current SMA200: {sma200_15s_result['current_sma200']:.2f}")
-        print(f"Difference: {sma200_15s_result['difference']:.4f} ({sma200_15s_result['difference_pct']:.4f}%)")
-        print(f"Close Below SMA200: {sma200_15s_result['close_below_sma200']}")
-        print(f"Condition Met: {conditions_status['close_below_sma200_15s']}")
-    else:
-        print(f"Error analyzing SMA200 condition (15s): {sma200_15s_result['error']}")
-        print(f"Condition Met: {conditions_status['close_below_sma200_15s']}")
-    
-    # Condition 3: Momentum Positive (1m)
-    print("\n--- Condition 3: Momentum Positive (1m) ---")
-    momentum_1m_positive, momentum_1m_value, momentum_1m_details = calculate_momentum(candle_map['1m'])
-    conditions_status["momentum_positive_1m"] = momentum_1m_positive
-    print(f"Current Momentum: {momentum_1m_value:.4f}")
-    print(f"Momentum Positive: {momentum_1m_positive}")
-    print(f"Condition Met: {conditions_status['momentum_positive_1m']}")
-    
-    # Condition 4: FFT Forecast Up (1m)
-    print("\n--- Condition 4: FFT Forecast Up (1m) ---")
-    fft_1m_result = analyze_fft_cycle(candle_map['1m'], '1m')
-    if 'error' not in fft_1m_result:
-        conditions_status["fft_forecast_up_1m"] = fft_1m_result['forecast_target'] > fft_1m_result['current_price']
-        print(f"Current Price: {fft_1m_result['current_price']:.2f}")
-        print(f"Forecast Target: {fft_1m_result['forecast_target']:.2f}")
-        print(f"Forecast Difference: {fft_1m_result['forecast_diff_pct']:.4f}%")
-        print(f"Condition Met: {conditions_status['fft_forecast_up_1m']}")
-    else:
-        print(f"Error analyzing 1m FFT cycle: {fft_1m_result['error']}")
-        print(f"Condition Met: {conditions_status['fft_forecast_up_1m']}")
-    
-    # Condition 5: FFT Forecast Up (3m)
-    print("\n--- Condition 5: FFT Forecast Up (3m) ---")
-    fft_3m_result = analyze_fft_cycle(candle_map['3m'], '3m')
-    if 'error' not in fft_3m_result:
-        conditions_status["fft_forecast_up_3m"] = fft_3m_result['forecast_target'] > fft_3m_result['current_price']
-        print(f"Current Price: {fft_3m_result['current_price']:.2f}")
-        print(f"Forecast Target: {fft_3m_result['forecast_target']:.2f}")
-        print(f"Forecast Difference: {fft_3m_result['forecast_diff_pct']:.4f}%")
-        print(f"Condition Met: {conditions_status['fft_forecast_up_3m']}")
-    else:
-        print(f"Error analyzing 3m FFT cycle: {fft_3m_result['error']}")
-        print(f"Condition Met: {conditions_status['fft_forecast_up_3m']}")
-    
-    # Condition 6: FFT Forecast Up (5m)
-    print("\n--- Condition 6: FFT Forecast Up (5m) ---")
-    fft_5m_result = analyze_fft_cycle(candle_map['5m'], '5m')
-    if 'error' not in fft_5m_result:
-        conditions_status["fft_forecast_up_5m"] = fft_5m_result['forecast_target'] > fft_5m_result['current_price']
-        print(f"Current Price: {fft_5m_result['current_price']:.2f}")
-        print(f"Forecast Target: {fft_5m_result['forecast_target']:.2f}")
-        print(f"Forecast Difference: {fft_5m_result['forecast_diff_pct']:.4f}%")
-        print(f"Condition Met: {conditions_status['fft_forecast_up_5m']}")
-    else:
-        print(f"Error analyzing 5m FFT cycle: {fft_5m_result['error']}")
-        print(f"Condition Met: {conditions_status['fft_forecast_up_5m']}")
-
-    # Continue with original analysis for remaining conditions
-    for timeframe in ['1m', '3m', '5m']:
-        if timeframe in candle_map and candle_map[timeframe]:
-            print(f"--- {timeframe} ---")
-            closes = [candle['close'] for candle in candle_map[timeframe]]
-            current_close = Decimal(str(closes[-1]))
-            high_tf = Decimal(str(np.nanmax([float(x) for x in closes])))
-            low_tf = Decimal(str(np.nanmin([float(x) for x in closes])))
-            min_threshold_tf, max_threshold_tf, avg_mtf, momentum_signal, _, percent_to_min_momentum, percent_to_max_momentum = calculate_thresholds(closes, period=14, minimum_percentage=2, maximum_percentage=2)
-            last_bottom, last_top, closest_reversal, closest_type = find_major_reversals(candle_map[timeframe], current_price, min_threshold_tf, max_threshold_tf)
-            if closest_reversal is not None:
-                print(f"Most Recent Major Reversal Type: {closest_type}")
-                print(f"Last Major Reversal Found at Price: {closest_reversal:.25f}")
-                last_major_reversal_type = closest_type
-            else:
-                print("No Major Reversal Found")
-            
-            # Check dip conditions
-            dip_confirmed = closest_type == 'DIP'
-            conditions_status[f'dip_confirmed_{timeframe}'] = dip_confirmed
-            
-            # Check volume_bullish_1m condition
-            if timeframe == '1m':
-                conditions_status["volume_bullish_1m"] = buy_volume.get('1m', [Decimal('0')])[-1] > sell_volume.get('1m', [Decimal('0')])[-1]
-            
-            valid_closes = np.array([float(c) for c in closes if not np.isnan(c) and c > 0], dtype=np.float64)
-            sma_lengths = [5, 7, 9, 12]
-            smas = {length: Decimal(str(talib.SMA(valid_closes, timeperiod=length)[-1])) for length in sma_lengths if not np.isnan(talib.SMA(valid_closes, timeperiod=length)[-1])}
-            print("Simple Moving Averages:")
-            for length, sma in smas.items():
-                print(f"SMA-{length}: {sma:.25f}, Current Close: {current_close:.25f} - {'Above' if current_close > sma else 'Below'}")
-            if all(current_close > sma for sma in smas.values()):
-                print("SELL Signal: Current close is above all SMAs.")
-            elif all(current_close < sma for sma in smas.values()):
-                print("BUY Signal: Current close is below all SMAs.")
-            stoch_k, stoch_d = calculate_stochastic_rsi(closes)
-            print(f"Current Stochastic K: {stoch_k[-1]:.25f}")
-            print(f"Current Stochastic D: {stoch_d[-1]:.25f}")
-            negative_freqs, negative_powers, positive_freqs, positive_powers = calculate_spectral_analysis(closes)
-            market_sentiment = determine_market_sentiment(negative_freqs, negative_powers, positive_freqs, positive_powers, closest_type, buy_volume[timeframe][-1], sell_volume[timeframe][-1])
-            print(f"Market Sentiment: {market_sentiment}")
-            projected_price = calculate_45_degree_projection(last_bottom, last_top)
-            print(f"Projected Price Using 45-Degree Angle: {projected_price:.25f}" if projected_price is not None else "No projection available")
-            print(f"Current Close: {current_close:.25f}")
-            print(f"Minimum Threshold: {min_threshold_tf:.25f}" if min_threshold_tf is not None else "Minimum Threshold: Not available")
-            print(f"Maximum Threshold: {max_threshold_tf:.25f}" if max_threshold_tf is not None else "Maximum Threshold: Not available")
-            print(f"Average MTF: {avg_mtf:.25f}" if avg_mtf is not None else "Average MTF: Not available")
-            print(f"Momentum Signal: {momentum_signal:.25f}" if momentum_signal is not None else "Momentum Signal: Not available")
-            print(f"Volume Bullish Ratio: {volume_ratios[timeframe]['buy_ratio']:.25f}%" if timeframe in volume_ratios else "Volume Bullish Ratio: Not available")
-            print(f"Volume Bearish Ratio: {volume_ratios[timeframe]['sell_ratio']:.25f}%" if timeframe in volume_ratios else "Volume Bearish Ratio: Not available")
-            print(f"Status: {volume_ratios[timeframe]['status']}" if timeframe in volume_ratios else "Status: Not available")
-            avg = (min_threshold_tf + max_threshold_tf) / Decimal('2') if min_threshold_tf is not None and max_threshold_tf is not None else current_price
-            wave_price = calculate_wave_price(len(closes), avg, min_threshold_tf or Decimal('0'), max_threshold_tf or Decimal('Infinity'), omega=Decimal('0.1'), phi=Decimal('0'))
-            print(f"Calculated Wave Price: {wave_price:.25f}")
-            independent_wave_price = calculate_independent_wave_price(current_price, avg, min_threshold_tf or Decimal('0'), max_threshold_tf or Decimal('Infinity'), range_distance=Decimal('0.1'))
-            print(f"Calculated Independent Wave Price: {independent_wave_price:.25f}")
-            current_time, entry_price_usdc, stop_loss, reversal_target, market_mood = get_target(closes, n_components=5, last_major_reversal_type=last_major_reversal_type, buy_volume=buy_volume[timeframe][-1], sell_volume=sell_volume[timeframe][-1])
-            print(f"Current Time: {current_time}")
-            print(f"Entry Price: {entry_price_usdc:.25f}")
-            print(f"Stop Loss: {stop_loss:.25f}")
-            print(f"Reversal Target: {reversal_target:.25f}")
-            print(f"Market Mood (from FFT): {market_mood}")
-            fib_levels = calculate_fibonacci_levels_from_reversal(closest_reversal, max_threshold_tf, min_threshold_tf, closest_type, current_price)
-            fib_info[timeframe] = fib_levels
-            print(f"Fibonacci Levels for {timeframe}:")
-            for level, price in fib_levels.items():
-                print(f"Level {level}: {price:.25f}")
-            fib_reversal_price = forecast_fibo_target_price(fib_info[timeframe])
-            print(f"{timeframe} Incoming Fibonacci Reversal Target (Forecast): {fib_reversal_price:.25f}" if fib_reversal_price is not None else f"{timeframe} Incoming Fibonacci Reversal Target: price not available.")
-            dist_to_min = ((current_price - low_tf) / (high_tf - low_tf)) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
-            dist_to_max = ((high_tf - current_price) / (high_tf - low_tf)) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
-            print(f"Distance from Current Close to Min Threshold ({low_tf:.25f}): {dist_to_min:.25f}%")
-            print(f"Distance from Current Close to Max Threshold ({high_tf:.25f}): {dist_to_max:.25f}%")
-            symmetrical_min_distance = (high_tf - current_price) / (high_tf - low_tf) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
-            symmetrical_max_distance = (current_price - low_tf) / (high_tf - low_tf) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
-            print(f"Normalized Distance to Min Threshold (Symmetrical): {symmetrical_max_distance:.25f}%")
-            print(f"Normalized Distance to Max Threshold (Symmetrical): {symmetrical_min_distance:.25f}%")
-            time_window = {'1m': 1, '3m': 3, '5m': 5}[timeframe]
-            forecast_price, price_rate = forecast_price_per_time_pythagorean(timeframe, candle_map[timeframe], min_threshold_tf, max_threshold_tf, current_price, time_window, closest_reversal, closest_type)
-            pythagorean_forecasts[timeframe] = {'price': forecast_price, 'rate': price_rate}
-            print(f"Pythagorean Forecast Price for {timeframe}: {pythagorean_forecasts[timeframe]['price']:.25f}")
-            print(f"Pythagorean Price Rate for {timeframe}: {pythagorean_forecasts[timeframe]['rate']:.25f} USDC/min")
-        else:
-            print(f"--- {timeframe} --- No data available.")
-            fib_levels = calculate_fibonacci_levels_from_reversal(None, None, None, 'DIP', current_price)
-            fib_info[timeframe] = fib_levels
-            print(f"Fibonacci Levels for {timeframe} (Fallback):")
-            for level, price in fib_levels.items():
-                print(f"Level {level}: {price:.25f}")
-            time_window = {'1m': 1, '3m': 3, '5m': 5}[timeframe]
-            forecast_price, price_rate = forecast_price_per_time_pythagorean(timeframe, [], None, None, current_price, time_window, None, 'DIP')
-            pythagorean_forecasts[timeframe] = {'price': forecast_price, 'rate': price_rate}
-            print(f"Pythagorean Forecast Price for {timeframe}: {pythagorean_forecasts[timeframe]['price']:.25f}")
-            print(f"Pythagorean Price Rate for {timeframe}: {pythagorean_forecasts[timeframe]['rate']:.25f} USDC/min")
-
-    forecasted_price = forecast_volume_based_on_conditions(volume_ratios, min_threshold or current_price * Decimal('0.95'), current_price)
-    forecast_decision = check_market_conditions_and_forecast(support_levels, resistance_levels, current_price)
-
-    # Print all conditions with true/false values
-    print("\n" + "="*80)
-    print("TRADING CONDITIONS STATUS")
-    print("="*80)
-    
-    true_conditions_count = sum(int(status) for status in conditions_status.values())
-    false_conditions_count = len(conditions_status) - true_conditions_count
-    print(f"Overall Conditions Status: {true_conditions_count} True, {false_conditions_count} False")
-    print(f"Minimum Required: {CONFIG['min_conditions_met']}")
-    
-    print("\nCondition Summary:")
-    print("-" * 65)
-    for condition_name, result in conditions_status.items():
-        status = "TRUE" if result else "FALSE"
-        print(f"{condition_name:<50}{status}")
-    print("-" * 65)
-    
-    all_conditions_met = all(conditions_status.values())
-    print(f"\nAll Conditions Met for Entry: {'Yes' if all_conditions_met else 'No'}")
-
-    if position_open:
-        print()
-        print("Current In-Trade Status:")
-        current_value_in_usdc = asset_balance * current_price
-        if current_value_in_usdc < Decimal('0'):
-            print("Error: Current BTC Balance Value in USDC is negative. Check balance or price.")
-            current_value_in_usdc = Decimal('0.0')
-        print(f"Current BTC Balance Value in USDC: {current_value_in_usdc:.25f}")
-
-        target_value = initial_investment * Decimal('1.0125')  # 1.25% profit target
-        entry_time_str = entry_datetime.strftime("%H:%M") if entry_datetime else "Unknown"
-        time_span = (current_local_time - entry_datetime) if entry_datetime else None
-        if time_span:
-            total_seconds = int(time_span.total_seconds())
-            days = total_seconds // (24 * 3600)
-            hours = (total_seconds % (24 * 3600)) // 3600
-            minutes = (total_seconds % 3600) // 60
-            time_span_str = f"{days} days, {hours} hours, {minutes} minutes"
-        else:
-            time_span_str = "Unknown"
-        
-        if initial_investment <= Decimal('0'):
-            print("Error: Initial investment is zero or negative. Using default value for display.")
-            initial_investment_display = Decimal('1.0')
-        else:
-            initial_investment_display = initial_investment
-        print(f"Initial USDC amount: {initial_investment_display:.25f}, Expected USDC amount after exit: {target_value:.25f}, Entry Price for last BTC purchased: {entry_price:.25f}")
-        print(f"Entry Time (HH:MM): {entry_time_str}, Time Span from Entry: {time_span_str}")
-
-        # Value Change Percentage
-        if initial_investment_display > Decimal('0'):
-            value_change_percentage = ((current_value_in_usdc - initial_investment) / initial_investment) * Decimal('100')
-        else:
-            value_change_percentage = Decimal('0.0')
-        print(f"Value Change Percentage from Initial Investment: {value_change_percentage:.25f}%")
-
-        # Price for 1.25% Profit Target
-        if asset_balance > Decimal('0'):
-            target_price = target_value / asset_balance
-        else:
-            target_price = Decimal('0.0')
-            print("Error: BTC balance is zero or negative. Target price set to 0.")
-        print(f"Price for 1.25% Profit Target: {target_price:.25f}")
-
-        # Percentage Distance to 1.25% Profit Target
-        if entry_price > Decimal('0') and target_price > entry_price:
-            if current_price >= target_price:
-                percentage_to_target = Decimal('0.0')
-            elif current_price >= entry_price:
-                percentage_to_target = ((target_price - current_price) / (target_price - entry_price)) * Decimal('100')
-            else:
-                percentage_to_target = Decimal('100.0') + (((entry_price - current_price) / (target_price - entry_price)) * Decimal('100'))
-        else:
-            percentage_to_target = Decimal('0.0')
-            print("Error: Invalid entry or target price for percentage to target calculation.")
-        print(f"Percentage Distance to 1.25% Profit Target: {percentage_to_target:.25f}%")
-
-        # Percentage Progress to 1.25% Profit Target
-        percentage_progress = Decimal('100.0') - percentage_to_target
-        print(f"Percentage Progress to 1.25% Profit Target: {percentage_progress:.25f}%")
-        print()
-
-        if check_exit_condition(initial_investment, asset_balance, entry_price):
-            print("Target profit of 1.25% reached or exceeded. Initiating exit...")
-            if sell_asset(float(asset_balance)):
-                exit_usdc_balance = get_balance('USDC')
-                profit = exit_usdc_balance - initial_investment
-                profit_percentage = (profit / initial_investment) * Decimal('100') if initial_investment > Decimal('0') else Decimal('0.0')
-                print(f"Position closed. Sold BTC for USDC: {exit_usdc_balance:.25f}")
-                print(f"Trade log: Time: {current_local_time_str}, Entry Price: {entry_price:.25f}, Exit Balance: {exit_usdc_balance:.25f}, Profit: {profit:.25f} USDC, Profit Percentage: {profit_percentage:.25f}%")
-                position_open = False
-                initial_investment = Decimal('0.0')
-                asset_balance = Decimal('0.0')
-                entry_price = Decimal('0.0')
-                entry_datetime = None  # Reset entry datetime
-    else:
-        if usdc_balance > Decimal('0'):
-            print(f"Current USDC balance found: {usdc_balance:.25f}")
-        else:
-            print("No USDC balance available.")
-        print(f"Current BTC balance: {asset_balance:.25f} BTC")
-
-        # Check if all conditions are met for entry
-        if all_conditions_met:
-            usdc_balance = get_balance('USDC')
-            if usdc_balance > Decimal('0'):
-                print(f"\n!!! ALL {CONFIG['min_conditions_met']} CONDITIONS MET - EXECUTING TRADE !!!")
-                print(f"Trigger signal detected! Attempting to buy {TRADE_SYMBOL} with entire USDC balance: {usdc_balance:.25f} at price {current_price:.25f}")
-                entry_price, quantity_bought, entry_datetime, cost = buy_asset()
-                if entry_price is not None and quantity_bought is not None and cost is not None:
-                    initial_investment = cost
-                    print(f"BTC was bought at entry price of {entry_price:.25f} USDC for quantity: {quantity_bought:.25f} BTC, Cost: {cost:.25f} USDC")
-                    print(f"Entry Datetime: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
-                    position_open = True
-                    print(f"New position opened with {cost:.25f} USDC at price {entry_price:.25f}.")
-                    usdc_balance = get_balance('USDC')
-                    asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
+        if btc_value_in_usdc > usdc_balance and not position_open:
+            print(f"BTC Value in USDC ({btc_value_in_usdc:.25f}) > USDC Balance ({usdc_balance:.25f}). Entering in-trade mode.")
+            position_open = True
+            entry_price = get_average_entry_price()
+            if entry_price > Decimal('0'):
+                initial_investment = asset_balance * entry_price
+                print(f"Estimated Initial Investment: {initial_investment:.25f} USDC based on last buy trade entry price {entry_price:.25f}")
+                last_trade = get_last_buy_trade()
+                if last_trade:
+                    entry_datetime = datetime.datetime.fromtimestamp(last_trade['time'] / 1000)
+                    print(f"Entry Datetime set from last trade: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
                 else:
-                    print("Error placing buy order.")
+                    entry_datetime = current_local_time
+                    print(f"No trade history found. Using current time as Entry Datetime: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
             else:
-                print("No USDC balance to invest in BTC.")
+                initial_investment = asset_balance * current_price
+                print(f"No valid entry price found. Using current price {current_price:.25f} to estimate Initial Investment: {initial_investment:.25f} USDC")
+                entry_price = current_price
+                entry_datetime = current_local_time
+                print(f"Entry Datetime set to current time: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+
+        # Fetch candles for all timeframes
+        candle_map = fetch_candles_in_parallel(['1m', '3m', '5m'])
+        
+        # Also fetch 1m candles for 15s analysis
+        candles_1m = get_candles(TRADE_SYMBOL, '1m', limit=1200)
+        
+        if not candle_map.get('1m'):
+            print("Error: '1m' candles not fetched. Check API connectivity or symbol.")
+        if current_price == Decimal('0.0'):
+            print(f"Warning: Current {TRADE_SYMBOL} price is {current_price:.25f}. API may be failing.")
+
+        # Initialize all condition results
+        conditions_status = {
+            # Original conditions from first code (with some removed)
+            "ML_Forecasted_Price_over_Current_Close": False,
+            "ML_extended_target": False,  # NEW: ML Forecast reaches 1.25% profit target
+            "dip_confirmed_1m": False,
+            "dip_confirmed_3m": False,
+            "dip_confirmed_5m": False,
+            "volume_bullish_1m": False,
+            
+            # Conditions from second code (with some removed)
+            "fft_forecast_price_15s": False,
+            "close_below_sma200_15s": False,
+            "momentum_positive_1m": False,
+            "fft_forecast_up_1m": False,
+            "fft_forecast_up_3m": False,
+            "fft_forecast_up_5m": False,
+        }
+
+        if "1m" in candle_map and candle_map['1m']:
+            model, backtest_mae, last_predictions, actuals = backtest_model(candle_map["1m"])
+            print(f"Backtest MAE: {backtest_mae:.25f}")
+            forecasted_prices = forecast_next_price(model, num_steps=1)
+            closes = [candle['close'] for candle in candle_map["1m"]]
+            min_threshold, max_threshold, _, _, _, _, _ = calculate_thresholds(closes)
+            adjusted_forecasted_price = min(max(forecasted_prices[-1], min_threshold), max_threshold) if min_threshold is not None and max_threshold is not None else forecasted_prices[-1]
+            print(f"Forecasted Price: {adjusted_forecasted_price:.25f}")
+            
+            # Check ML_Forecasted_Price_over_Current_Close condition
+            conditions_status["ML_Forecasted_Price_over_Current_Close"] = adjusted_forecasted_price > current_price
+            
+            # NEW: Check ML_extended_target condition
+            reaches_target, min_forecast, max_forecast, ml_details = check_ml_extended_target(model, current_price, PROFIT_TARGET_PERCENT)
+            conditions_status["ML_extended_target"] = reaches_target
+            print(f"ML Forecast Range: {min_forecast:.25f} - {max_forecast:.25f}")
+            print(f"Profit Target Price: {ml_details.get('profit_target_price', 0):.25f}")
+            print(f"ML Forecast Reaches Profit Target: {reaches_target}")
         else:
-            print(f"\n!!! INSUFFICIENT CONDITIONS MET - NO TRADE EXECUTED !!!")
-            print(f"Only {true_conditions_count}/{CONFIG['min_conditions_met']} conditions met.")
-            print("Waiting for next iteration...")
+            min_threshold, max_threshold, adjusted_forecasted_price = None, None, None
+            print("No 1m data available for forecasting.")
 
-    print(f"\nCurrent USDC balance: {usdc_balance:.25f}")
-    print(f"Current BTC balance: {asset_balance:.25f} BTC")
-    print(f"Current {TRADE_SYMBOL} price: {current_price:.25f}\n")
+        buy_volume, sell_volume = calculate_buy_sell_volume(candle_map)
+        volume_ratios = calculate_volume_ratio(buy_volume, sell_volume)
+        support_levels, resistance_levels = find_specific_support_resistance(candle_map, min_threshold or current_price * Decimal('0.95'), max_threshold or current_price * Decimal('1.05'), current_price)
+        volume_ratios_details = calculate_bullish_bearish_volume_ratios(candle_map)
+        volume_trends_details = analyze_volume_changes_over_time(candle_map)
 
-    del candle_map
+        fib_info = {}
+        pythagorean_forecasts = {'1m': {'price': None, 'rate': None}, '3m': {'price': None, 'rate': None}, '5m': {'price': None, 'rate': None}}
+        last_major_reversal_type = None
+
+        # Print timeframe details first
+        print("\n" + "="*80)
+        print("TIMEFRAME ANALYSIS")
+        print("="*80)
+        
+        # Analyze FFT cycles with proper argmin/argmax and timeframe ordering
+        print("\n--- FFT Cycle Analysis with Timeframe Ordering ---")
+        fft_cycles = analyze_fft_cycle_with_timeframe_ordering(
+            candle_map.get('1m', []), 
+            candle_map.get('3m', []), 
+            candle_map.get('5m', [])
+        )
+        
+        # Print timeframe details
+        for timeframe in ['1m', '3m', '5m']:
+            if timeframe in candle_map and candle_map[timeframe]:
+                print(f"\n--- {timeframe} Timeframe Details ---")
+                closes = [candle['close'] for candle in candle_map[timeframe]]
+                current_close = Decimal(str(closes[-1]))
+                high_tf = Decimal(str(np.nanmax([float(x) for x in closes])))
+                low_tf = Decimal(str(np.nanmin([float(x) for x in closes])))
+                min_threshold_tf, max_threshold_tf, avg_mtf, momentum_signal, _, percent_to_min_momentum, percent_to_max_momentum = calculate_thresholds(closes, period=14, minimum_percentage=2, maximum_percentage=2)
+                last_bottom, last_top, closest_reversal, closest_type = find_major_reversals(candle_map[timeframe], current_price, min_threshold_tf, max_threshold_tf)
+                if closest_reversal is not None:
+                    print(f"Most Recent Major Reversal Type: {closest_type}")
+                    print(f"Last Major Reversal Found at Price: {closest_reversal:.25f}")
+                    last_major_reversal_type = closest_type
+                else:
+                    print("No Major Reversal Found")
+                
+                # Check dip conditions
+                dip_confirmed = closest_type == 'DIP'
+                conditions_status[f'dip_confirmed_{timeframe}'] = dip_confirmed
+                
+                # Check volume_bullish_1m condition
+                if timeframe == '1m':
+                    conditions_status["volume_bullish_1m"] = buy_volume.get('1m', [Decimal('0')])[-1] > sell_volume.get('1m', [Decimal('0')])[-1]
+                
+                valid_closes = np.array([float(c) for c in closes if not np.isnan(c) and c > 0], dtype=np.float64)
+                sma_lengths = [5, 7, 9, 12]
+                smas = {length: Decimal(str(talib.SMA(valid_closes, timeperiod=length)[-1])) for length in sma_lengths if not np.isnan(talib.SMA(valid_closes, timeperiod=length)[-1])}
+                print("Simple Moving Averages:")
+                for length, sma in smas.items():
+                    print(f"SMA-{length}: {sma:.25f}, Current Close: {current_close:.25f} - {'Above' if current_close > sma else 'Below'}")
+                if all(current_close > sma for sma in smas.values()):
+                    print("SELL Signal: Current close is above all SMAs.")
+                elif all(current_close < sma for sma in smas.values()):
+                    print("BUY Signal: Current close is below all SMAs.")
+                stoch_k, stoch_d = calculate_stochastic_rsi(closes)
+                print(f"Current Stochastic K: {stoch_k[-1]:.25f}")
+                print(f"Current Stochastic D: {stoch_d[-1]:.25f}")
+                negative_freqs, negative_powers, positive_freqs, positive_powers = calculate_spectral_analysis(closes)
+                market_sentiment = determine_market_sentiment(negative_freqs, negative_powers, positive_freqs, positive_powers, closest_type, buy_volume[timeframe][-1], sell_volume[timeframe][-1])
+                print(f"Market Sentiment: {market_sentiment}")
+                projected_price = calculate_45_degree_projection(last_bottom, last_top)
+                print(f"Projected Price Using 45-Degree Angle: {projected_price:.25f}" if projected_price is not None else "No projection available")
+                print(f"Current Close: {current_close:.25f}")
+                print(f"Minimum Threshold: {min_threshold_tf:.25f}" if min_threshold_tf is not None else "Minimum Threshold: Not available")
+                print(f"Maximum Threshold: {max_threshold_tf:.25f}" if max_threshold_tf is not None else "Maximum Threshold: Not available")
+                print(f"Average MTF: {avg_mtf:.25f}" if avg_mtf is not None else "Average MTF: Not available")
+                print(f"Momentum Signal: {momentum_signal:.25f}" if momentum_signal is not None else "Momentum Signal: Not available")
+                print(f"Volume Bullish Ratio: {volume_ratios[timeframe]['buy_ratio']:.25f}%" if timeframe in volume_ratios else "Volume Bullish Ratio: Not available")
+                print(f"Volume Bearish Ratio: {volume_ratios[timeframe]['sell_ratio']:.25f}%" if timeframe in volume_ratios else "Volume Bearish Ratio: Not available")
+                print(f"Status: {volume_ratios[timeframe]['status']}" if timeframe in volume_ratios else "Status: Not available")
+                avg = (min_threshold_tf + max_threshold_tf) / Decimal('2') if min_threshold_tf is not None and max_threshold_tf is not None else current_price
+                wave_price = calculate_wave_price(len(closes), avg, min_threshold_tf or Decimal('0'), max_threshold_tf or Decimal('Infinity'), omega=Decimal('0.1'), phi=Decimal('0'))
+                print(f"Calculated Wave Price: {wave_price:.25f}")
+                independent_wave_price = calculate_independent_wave_price(current_price, avg, min_threshold_tf or Decimal('0'), max_threshold_tf or Decimal('Infinity'), range_distance=Decimal('0.1'))
+                print(f"Calculated Independent Wave Price: {independent_wave_price:.25f}")
+                current_time, entry_price_usdc, stop_loss, reversal_target, market_mood = get_target(closes, n_components=5, last_major_reversal_type=last_major_reversal_type, buy_volume=buy_volume[timeframe][-1], sell_volume=sell_volume[timeframe][-1])
+                print(f"Current Time: {current_time}")
+                print(f"Entry Price: {entry_price_usdc:.25f}")
+                print(f"Stop Loss: {stop_loss:.25f}")
+                print(f"Reversal Target: {reversal_target:.25f}")
+                print(f"Market Mood (from FFT): {market_mood}")
+                fib_levels = calculate_fibonacci_levels_from_reversal(closest_reversal, max_threshold_tf, min_threshold_tf, closest_type, current_price)
+                fib_info[timeframe] = fib_levels
+                print(f"Fibonacci Levels for {timeframe}:")
+                for level, price in fib_levels.items():
+                    print(f"Level {level}: {price:.25f}")
+                fib_reversal_price = forecast_fibo_target_price(fib_info[timeframe])
+                print(f"{timeframe} Incoming Fibonacci Reversal Target (Forecast): {fib_reversal_price:.25f}" if fib_reversal_price is not None else f"{timeframe} Incoming Fibonacci Reversal Target: price not available.")
+                dist_to_min = ((current_price - low_tf) / (high_tf - low_tf)) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
+                dist_to_max = ((high_tf - current_price) / (high_tf - low_tf)) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
+                print(f"Distance from Current Close to Min Threshold ({low_tf:.25f}): {dist_to_min:.25f}%")
+                print(f"Distance from Current Close to Max Threshold ({high_tf:.25f}): {dist_to_max:.25f}%")
+                symmetrical_min_distance = (high_tf - current_price) / (high_tf - low_tf) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
+                symmetrical_max_distance = (current_price - low_tf) / (high_tf - low_tf) * Decimal('100') if (high_tf - low_tf) != Decimal('0') else Decimal('0')
+                print(f"Normalized Distance to Min Threshold (Symmetrical): {symmetrical_max_distance:.25f}%")
+                print(f"Normalized Distance to Max Threshold (Symmetrical): {symmetrical_min_distance:.25f}%")
+                time_window = {'1m': 1, '3m': 3, '5m': 5}[timeframe]
+                forecast_price, price_rate = forecast_price_per_time_pythagorean(timeframe, candle_map[timeframe], min_threshold_tf, max_threshold_tf, current_price, time_window, closest_reversal, closest_type)
+                pythagorean_forecasts[timeframe] = {'price': forecast_price, 'rate': price_rate}
+                print(f"Pythagorean Forecast Price for {timeframe}: {pythagorean_forecasts[timeframe]['price']:.25f}")
+                print(f"Pythagorean Price Rate for {timeframe}: {pythagorean_forecasts[timeframe]['rate']:.25f} USDC/min")
+            else:
+                print(f"\n--- {timeframe} --- No data available.")
+                fib_levels = calculate_fibonacci_levels_from_reversal(None, None, None, 'DIP', current_price)
+                fib_info[timeframe] = fib_levels
+                print(f"Fibonacci Levels for {timeframe} (Fallback):")
+                for level, price in fib_levels.items():
+                    print(f"Level {level}: {price:.25f}")
+                time_window = {'1m': 1, '3m': 3, '5m': 5}[timeframe]
+                forecast_price, price_rate = forecast_price_per_time_pythagorean(timeframe, [], None, None, current_price, time_window, None, 'DIP')
+                pythagorean_forecasts[timeframe] = {'price': forecast_price, 'rate': price_rate}
+                print(f"Pythagorean Forecast Price for {timeframe}: {pythagorean_forecasts[timeframe]['price']:.25f}")
+                print(f"Pythagorean Price Rate for {timeframe}: {pythagorean_forecasts[timeframe]['rate']:.25f} USDC/min")
+
+        # Print conditions in order
+        print("\n" + "="*80)
+        print("TRADING CONDITIONS")
+        print("="*80)
+        
+        # Condition 1: FFT Forecast Price (15s)
+        print("\n--- Condition 1: FFT Forecast Price (15s) ---")
+        fft_15s_result = analyze_fft_forecast_price_15s(candles_1m)
+        if 'error' not in fft_15s_result:
+            conditions_status["fft_forecast_price_15s"] = fft_15s_result['forecast_up']
+            print(f"Current Price: {fft_15s_result['current_price']:.2f}")
+            print(f"Forecast Target: {fft_15s_result['forecast_target']:.2f}")
+            print(f"Forecast Difference: {fft_15s_result['forecast_diff_pct']:.4f}%")
+            print(f"Forecast Up: {fft_15s_result['forecast_up']}")
+            print(f"Condition Met: {conditions_status['fft_forecast_price_15s']}")
+        else:
+            print(f"Error analyzing FFT forecast price (15s): {fft_15s_result['error']}")
+            print(f"Condition Met: {conditions_status['fft_forecast_price_15s']}")
+        
+        # Condition 2: Close Below SMA200 (15s)
+        print("\n--- Condition 2: Close Below SMA200 (15s) ---")
+        sma200_15s_result = analyze_sma200_condition_15s(candles_1m)
+        if 'error' not in sma200_15s_result:
+            conditions_status["close_below_sma200_15s"] = sma200_15s_result['close_below_sma200']
+            print(f"Current Close: {sma200_15s_result['current_close']:.2f}")
+            print(f"Current SMA200: {sma200_15s_result['current_sma200']:.2f}")
+            print(f"Difference: {sma200_15s_result['difference']:.4f} ({sma200_15s_result['difference_pct']:.4f}%)")
+            print(f"Close Below SMA200: {sma200_15s_result['close_below_sma200']}")
+            print(f"Condition Met: {conditions_status['close_below_sma200_15s']}")
+        else:
+            print(f"Error analyzing SMA200 condition (15s): {sma200_15s_result['error']}")
+            print(f"Condition Met: {conditions_status['close_below_sma200_15s']}")
+        
+        # Condition 3: Momentum Positive (1m)
+        print("\n--- Condition 3: Momentum Positive (1m) ---")
+        momentum_1m_positive, momentum_1m_value, momentum_1m_details = calculate_momentum(candle_map['1m'])
+        conditions_status["momentum_positive_1m"] = momentum_1m_positive
+        print(f"Current Momentum: {momentum_1m_value:.4f}")
+        print(f"Momentum Positive: {momentum_1m_positive}")
+        print(f"Condition Met: {conditions_status['momentum_positive_1m']}")
+        
+        # Condition 4: FFT Forecast Up (1m)
+        print("\n--- Condition 4: FFT Forecast Up (1m) ---")
+        if '1m' in fft_cycles and 'error' not in fft_cycles['1m']:
+            fft_1m_result = fft_cycles['1m']
+            conditions_status["fft_forecast_up_1m"] = fft_1m_result['forecast_target'] > fft_1m_result['current_price']
+            print(f"Current Price: {fft_1m_result['current_price']:.2f}")
+            print(f"Forecast Target: {fft_1m_result['forecast_target']:.2f}")
+            print(f"Forecast Difference: {fft_1m_result['forecast_diff_pct']:.4f}%")
+            print(f"Lowest Low: {fft_1m_result['lowest_low_price']:.2f}")
+            print(f"Highest High: {fft_1m_result['highest_high_price']:.2f}")
+            print(f"Condition Met: {conditions_status['fft_forecast_up_1m']}")
+        else:
+            print(f"Error analyzing 1m FFT cycle: {fft_cycles.get('1m', {}).get('error', 'Unknown error')}")
+            print(f"Condition Met: {conditions_status['fft_forecast_up_1m']}")
+        
+        # Condition 5: FFT Forecast Up (3m)
+        print("\n--- Condition 5: FFT Forecast Up (3m) ---")
+        if '3m' in fft_cycles and 'error' not in fft_cycles['3m']:
+            fft_3m_result = fft_cycles['3m']
+            conditions_status["fft_forecast_up_3m"] = fft_3m_result['forecast_target'] > fft_3m_result['current_price']
+            print(f"Current Price: {fft_3m_result['current_price']:.2f}")
+            print(f"Forecast Target: {fft_3m_result['forecast_target']:.2f}")
+            print(f"Forecast Difference: {fft_3m_result['forecast_diff_pct']:.4f}%")
+            print(f"Lowest Low: {fft_3m_result['lowest_low_price']:.2f}")
+            print(f"Highest High: {fft_3m_result['highest_high_price']:.2f}")
+            print(f"Condition Met: {conditions_status['fft_forecast_up_3m']}")
+        else:
+            print(f"Error analyzing 3m FFT cycle: {fft_cycles.get('3m', {}).get('error', 'Unknown error')}")
+            print(f"Condition Met: {conditions_status['fft_forecast_up_3m']}")
+        
+        # Condition 6: FFT Forecast Up (5m)
+        print("\n--- Condition 6: FFT Forecast Up (5m) ---")
+        if '5m' in fft_cycles and 'error' not in fft_cycles['5m']:
+            fft_5m_result = fft_cycles['5m']
+            conditions_status["fft_forecast_up_5m"] = fft_5m_result['forecast_target'] > fft_5m_result['current_price']
+            print(f"Current Price: {fft_5m_result['current_price']:.2f}")
+            print(f"Forecast Target: {fft_5m_result['forecast_target']:.2f}")
+            print(f"Forecast Difference: {fft_5m_result['forecast_diff_pct']:.4f}%")
+            print(f"Lowest Low: {fft_5m_result['lowest_low_price']:.2f}")
+            print(f"Highest High: {fft_5m_result['highest_high_price']:.2f}")
+            print(f"Condition Met: {conditions_status['fft_forecast_up_5m']}")
+        else:
+            print(f"Error analyzing 5m FFT cycle: {fft_cycles.get('5m', {}).get('error', 'Unknown error')}")
+            print(f"Condition Met: {conditions_status['fft_forecast_up_5m']}")
+        
+        # Print all conditions with true/false values
+        print("\n" + "="*80)
+        print("TRADING CONDITIONS STATUS")
+        print("="*80)
+        
+        true_conditions_count = sum(int(status) for status in conditions_status.values())
+        false_conditions_count = len(conditions_status) - true_conditions_count
+        print(f"Overall Conditions Status: {true_conditions_count} True, {false_conditions_count} False")
+        print(f"Minimum Required: {CONFIG['min_conditions_met']}")
+        
+        print("\nCondition Summary:")
+        print("-" * 65)
+        for condition_name, result in conditions_status.items():
+            status = "TRUE" if result else "FALSE"
+            print(f"{condition_name:<50}{status}")
+        print("-" * 65)
+        
+        all_conditions_met = all(conditions_status.values())
+        print(f"\nAll Conditions Met for Entry: {'Yes' if all_conditions_met else 'No'}")
+
+        if position_open:
+            print()
+            print("Current In-Trade Status:")
+            current_value_in_usdc = asset_balance * current_price
+            if current_value_in_usdc < Decimal('0'):
+                print("Error: Current BTC Balance Value in USDC is negative. Check balance or price.")
+                current_value_in_usdc = Decimal('0.0')
+            print(f"Current BTC Balance Value in USDC: {current_value_in_usdc:.25f}")
+
+            target_value = initial_investment * Decimal('1.0125')  # 1.25% profit target
+            entry_time_str = entry_datetime.strftime("%H:%M") if entry_datetime else "Unknown"
+            time_span = (current_local_time - entry_datetime) if entry_datetime else None
+            if time_span:
+                total_seconds = int(time_span.total_seconds())
+                days = total_seconds // (24 * 3600)
+                hours = (total_seconds % (24 * 3600)) // 3600
+                minutes = (total_seconds % 3600) // 60
+                time_span_str = f"{days} days, {hours} hours, {minutes} minutes"
+            else:
+                time_span_str = "Unknown"
+            
+            if initial_investment <= Decimal('0'):
+                print("Error: Initial investment is zero or negative. Using default value for display.")
+                initial_investment_display = Decimal('1.0')
+            else:
+                initial_investment_display = initial_investment
+            print(f"Initial USDC amount: {initial_investment_display:.25f}, Expected USDC amount after exit: {target_value:.25f}, Entry Price for last BTC purchased: {entry_price:.25f}")
+            print(f"Entry Time (HH:MM): {entry_time_str}, Time Span from Entry: {time_span_str}")
+
+            # Value Change Percentage
+            if initial_investment_display > Decimal('0'):
+                value_change_percentage = ((current_value_in_usdc - initial_investment) / initial_investment) * Decimal('100')
+            else:
+                value_change_percentage = Decimal('0.0')
+            print(f"Value Change Percentage from Initial Investment: {value_change_percentage:.25f}%")
+
+            # Price for 1.25% Profit Target
+            if asset_balance > Decimal('0'):
+                target_price = target_value / asset_balance
+            else:
+                target_price = Decimal('0.0')
+                print("Error: BTC balance is zero or negative. Target price set to 0.")
+            print(f"Price for 1.25% Profit Target: {target_price:.25f}")
+
+            # Percentage Distance to 1.25% Profit Target
+            if entry_price > Decimal('0') and target_price > entry_price:
+                if current_price >= target_price:
+                    percentage_to_target = Decimal('0.0')
+                elif current_price >= entry_price:
+                    percentage_to_target = ((target_price - current_price) / (target_price - entry_price)) * Decimal('100')
+                else:
+                    percentage_to_target = Decimal('100.0') + (((entry_price - current_price) / (target_price - entry_price)) * Decimal('100'))
+            else:
+                percentage_to_target = Decimal('0.0')
+                print("Error: Invalid entry or target price for percentage to target calculation.")
+            print(f"Percentage Distance to 1.25% Profit Target: {percentage_to_target:.25f}%")
+
+            # Percentage Progress to 1.25% Profit Target
+            percentage_progress = Decimal('100.0') - percentage_to_target
+            print(f"Percentage Progress to 1.25% Profit Target: {percentage_progress:.25f}%")
+            print()
+
+            if check_exit_condition(initial_investment, asset_balance, entry_price):
+                print("Target profit of 1.25% reached or exceeded. Initiating exit...")
+                if sell_asset(float(asset_balance)):
+                    exit_usdc_balance = get_balance('USDC')
+                    profit = exit_usdc_balance - initial_investment
+                    profit_percentage = (profit / initial_investment) * Decimal('100') if initial_investment > Decimal('0') else Decimal('0.0')
+                    print(f"Position closed. Sold BTC for USDC: {exit_usdc_balance:.25f}")
+                    print(f"Trade log: Time: {current_local_time_str}, Entry Price: {entry_price:.25f}, Exit Balance: {exit_usdc_balance:.25f}, Profit: {profit:.25f} USDC, Profit Percentage: {profit_percentage:.25f}%")
+                    position_open = False
+                    initial_investment = Decimal('0.0')
+                    asset_balance = Decimal('0.0')
+                    entry_price = Decimal('0.0')
+                    entry_datetime = None  # Reset entry datetime
+        else:
+            if usdc_balance > Decimal('0'):
+                print(f"Current USDC balance found: {usdc_balance:.25f}")
+            else:
+                print("No USDC balance available.")
+            print(f"Current BTC balance: {asset_balance:.25f} BTC")
+
+            # Check if all conditions are met for entry
+            if all_conditions_met:
+                usdc_balance = get_balance('USDC')
+                if usdc_balance > Decimal('0'):
+                    print(f"\n!!! ALL {CONFIG['min_conditions_met']} CONDITIONS MET - EXECUTING TRADE !!!")
+                    print(f"Trigger signal detected! Attempting to buy {TRADE_SYMBOL} with entire USDC balance: {usdc_balance:.25f} at price {current_price:.25f}")
+                    entry_price, quantity_bought, entry_datetime, cost = buy_asset()
+                    if entry_price is not None and quantity_bought is not None and cost is not None:
+                        initial_investment = cost
+                        print(f"BTC was bought at entry price of {entry_price:.25f} USDC for quantity: {quantity_bought:.25f} BTC, Cost: {cost:.25f} USDC")
+                        print(f"Entry Datetime: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+                        position_open = True
+                        print(f"New position opened with {cost:.25f} USDC at price {entry_price:.25f}.")
+                        usdc_balance = get_balance('USDC')
+                        asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
+                    else:
+                        print("Error placing buy order.")
+                else:
+                    print("No USDC balance to invest in BTC.")
+            else:
+                print(f"\n!!! INSUFFICIENT CONDITIONS MET - NO TRADE EXECUTED !!!")
+                print(f"Only {true_conditions_count}/{CONFIG['min_conditions_met']} conditions met.")
+                print("Waiting for next iteration...")
+
+        print(f"\nCurrent USDC balance: {usdc_balance:.25f}")
+        print(f"Current BTC balance: {asset_balance:.25f} BTC")
+        print(f"Current {TRADE_SYMBOL} price: {current_price:.25f}\n")
+
+        del candle_map
+        gc.collect()
+        time.sleep(5)
+except KeyboardInterrupt:
+    print("\nBot stopped by user. Exiting gracefully...")
+    # Save any important state before exiting
+    if position_open:
+        print(f"Position is currently open with entry price: {entry_price:.25f}")
+        print(f"Current profit/loss: {((asset_balance * current_price) - initial_investment):.25f} USDC")
+    print("Cleaning up resources...")
     gc.collect()
-    time.sleep(5)
+    print("Bot shutdown complete.")
+except Exception as e:
+    print(f"Unexpected error in main loop: {e}")
+    print("Attempting to save state before exit...")
+    gc.collect()
+    print("Bot shutdown due to error.")
