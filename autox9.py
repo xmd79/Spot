@@ -537,6 +537,104 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
         print(f"Error calculating linear regression channel: {e}")
         return {"error": str(e)}
 
+def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0):
+    """
+    Calculate Linear Regression Channel similar to Pine Script implementation.
+    Returns upper and lower channel lines and channel break information.
+    """
+    try:
+        if not candles or len(candles) < period:
+            return {"error": "Insufficient data for linear regression channel"}
+        
+        # Extract close prices
+        close_prices = np.array([candle["close"] for candle in candles[-period:]], dtype=np.float64)
+        n = len(close_prices)
+        
+        # Create x values (time indices)
+        x = np.arange(n)
+        
+        # Calculate linear regression coefficients
+        coeffs = np.polyfit(x, close_prices, 1)
+        slope = coeffs[0]
+        intercept = coeffs[1]
+        
+        # Calculate regression line values
+        regression_line = slope * x + intercept
+        
+        # Calculate standard deviation of residuals
+        residuals = close_prices - regression_line
+        std_dev = np.std(residuals)
+        
+        # Calculate upper and lower channel lines
+        upper_channel = regression_line + dev_multiplier * std_dev
+        lower_channel = regression_line - dev_multiplier * std_dev
+        
+        # Get current price and channel values at the most recent point
+        current_price = close_prices[-1]
+        current_upper = upper_channel[-1]
+        current_lower = lower_channel[-1]
+        
+        # Check for channel breaks
+        above_upper = current_price > current_upper
+        below_lower = current_price < current_lower
+        
+        # Check for recent channel crossings and track their indices
+        # Expand the detection window to look at more history
+        detection_window = min(100, n-1)  # Look at up to 100 periods
+        
+        below_lower_indices = []
+        above_upper_indices = []
+        
+        # Check if we crossed below the lower channel
+        for i in range(detection_window):
+            if close_prices[n-2-i] >= lower_channel[n-2-i] and close_prices[n-1-i] < lower_channel[n-1-i]:
+                below_lower_indices.append(n-1-i)
+        
+        # Check if we crossed above the upper channel
+        for i in range(detection_window):
+            if close_prices[n-2-i] <= upper_channel[n-2-i] and close_prices[n-1-i] > upper_channel[n-1-i]:
+                above_upper_indices.append(n-1-i)
+        
+        # Determine which crossing was most recent
+        most_recent_below_lower = len(below_lower_indices) > 0
+        most_recent_above_upper = len(above_upper_indices) > 0
+        
+        # If both types of crossings occurred, find which was most recent
+        if most_recent_below_lower and most_recent_above_upper:
+            most_recent_below_lower_index = max(below_lower_indices)
+            most_recent_above_upper_index = max(above_upper_indices)
+            
+            # The most recent crossing is the one with the higher index
+            most_recent_below_lower = most_recent_below_lower_index > most_recent_above_upper_index
+            most_recent_above_upper = most_recent_above_upper_index > most_recent_below_lower_index
+        
+        # Determine the trading signal based on the most recent crossing
+        # According to the user's clarification:
+        # - When most recent was close below lowest line (compared to close above highest line), it's an up cycle
+        # - When most recent was close above upper line, it's a down cycle
+        up_cycle = most_recent_below_lower and not most_recent_above_upper
+        
+        return {
+            "current_price": current_price,
+            "current_upper": current_upper,
+            "current_lower": current_lower,
+            "above_upper": above_upper,
+            "below_lower": below_lower,
+            "most_recent_below_lower": most_recent_below_lower,
+            "most_recent_above_upper": most_recent_above_upper,
+            "up_cycle": up_cycle,
+            "slope": slope,
+            "intercept": intercept,
+            "std_dev": std_dev,
+            "period": period,
+            "dev_multiplier": dev_multiplier,
+            "detection_window": detection_window
+        }
+        
+    except Exception as e:
+        print(f"Error calculating linear regression channel: {e}")
+        return {"error": str(e)}
+
 def analyze_linear_regression_channel_break(candles_1m):
     """
     Analyze linear regression channel break condition.
@@ -556,6 +654,78 @@ def analyze_linear_regression_channel_break(candles_1m):
         # The condition is met if up_cycle is True
         condition_met = lrc_result["up_cycle"]
         
+        # Create a dynamic description based on the actual analysis
+        if lrc_result["most_recent_below_lower"] and not lrc_result["most_recent_above_upper"]:
+            description = "Most recent occurrence was a close below the lowest line (indicating upward cycle)"
+        elif lrc_result["most_recent_above_upper"] and not lrc_result["most_recent_below_lower"]:
+            description = "Most recent occurrence was a close above the highest line (indicating downward cycle)"
+        elif lrc_result["most_recent_below_lower"] and lrc_result["most_recent_above_upper"]:
+            # If both are true, check which happened more recently
+            if lrc_result["up_cycle"]:
+                description = "Most recent occurrence was a close below the lowest line (indicating upward cycle)"
+            else:
+                description = "Most recent occurrence was a close above the highest line (indicating downward cycle)"
+        else:
+            # If no recent breaks detected, look for any breaks in the entire period
+            # This is a fallback to ensure we always find some breaks
+            close_prices = np.array([candle["close"] for candle in candles_1m[-500:]], dtype=np.float64)
+            n = len(close_prices)
+            
+            # Recalculate the channel lines
+            x = np.arange(n)
+            coeffs = np.polyfit(x, close_prices, 1)
+            slope = coeffs[0]
+            intercept = coeffs[1]
+            regression_line = slope * x + intercept
+            residuals = close_prices - regression_line
+            std_dev = np.std(residuals)
+            upper_channel = regression_line + 2.0 * std_dev
+            lower_channel = regression_line - 2.0 * std_dev
+            
+            # Look for any breaks in the entire period
+            below_lower_indices = []
+            above_upper_indices = []
+            
+            for i in range(1, n):
+                if close_prices[i-1] >= lower_channel[i-1] and close_prices[i] < lower_channel[i]:
+                    below_lower_indices.append(i)
+                if close_prices[i-1] <= upper_channel[i-1] and close_prices[i] > upper_channel[i]:
+                    above_upper_indices.append(i)
+            
+            if below_lower_indices and above_upper_indices:
+                # Find the most recent break
+                most_recent_below_lower_index = max(below_lower_indices)
+                most_recent_above_upper_index = max(above_upper_indices)
+                
+                if most_recent_below_lower_index > most_recent_above_upper_index:
+                    condition_met = True
+                    description = "Most recent occurrence in the entire period was a close below the lowest line (indicating upward cycle)"
+                else:
+                    condition_met = False
+                    description = "Most recent occurrence in the entire period was a close above the highest line (indicating downward cycle)"
+            elif below_lower_indices:
+                condition_met = True
+                description = "Most recent occurrence in the entire period was a close below the lowest line (indicating upward cycle)"
+            elif above_upper_indices:
+                condition_met = False
+                description = "Most recent occurrence in the entire period was a close above the highest line (indicating downward cycle)"
+            else:
+                # If still no breaks found, use the current position relative to the channel
+                if lrc_result["below_lower"]:
+                    condition_met = True
+                    description = "Currently below the lower channel (indicating upward cycle)"
+                elif lrc_result["above_upper"]:
+                    condition_met = False
+                    description = "Currently above the upper channel (indicating downward cycle)"
+                else:
+                    # As a last resort, use the slope of the regression line
+                    if lrc_result["slope"] > 0:
+                        condition_met = True
+                        description = "No channel breaks detected, but regression slope is positive (indicating upward trend)"
+                    else:
+                        condition_met = False
+                        description = "No channel breaks detected, and regression slope is negative or flat (indicating downward trend)"
+        
         return {
             "condition_met": condition_met,
             "current_price": lrc_result["current_price"],
@@ -566,12 +736,13 @@ def analyze_linear_regression_channel_break(candles_1m):
             "most_recent_below_lower": lrc_result["most_recent_below_lower"],
             "most_recent_above_upper": lrc_result["most_recent_above_upper"],
             "up_cycle": lrc_result["up_cycle"],
-            "description": "Most recent occurrence between close below lowest line and close above highest line is close below lowest line"
+            "description": description
         }
         
     except Exception as e:
         print(f"Error analyzing linear regression channel break: {e}")
         return {"error": str(e)}
+
 
 # Initialize lot size info
 lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
