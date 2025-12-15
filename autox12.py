@@ -1083,45 +1083,42 @@ def analyze_linear_regression_channel_break(candles_1m):
         if "error" in lrc_result:
             return lrc_result
         
-        # Determine if we have a cyclic pattern (price went below lower channel and then above upper channel)
-        has_cyclic_pattern = False
-        description = "No recent channel breaks detected"
+        # Get all instances of channel breaks
+        below_lower_indices = lrc_result["below_lower_indices"]
+        above_upper_indices = lrc_result["above_upper_indices"]
         
-        # Check if we have both below lower and above upper channel events
-        if lrc_result["most_recent_below_lower"] and lrc_result["most_recent_above_upper"]:
-            # Check if the most recent below lower event happened after the most recent above upper event
-            if (lrc_result["most_recent_below_lower_index"] and 
-                lrc_result["most_recent_above_upper_index"] and
-                lrc_result["most_recent_below_lower_index"] > lrc_result["most_recent_above_upper_index"]):
-                has_cyclic_pattern = True
-                description = "Cyclic pattern detected: Price moved from above upper channel to below lower channel and back up"
-            # Or if the most recent above upper event happened after the most recent below lower event
-            elif (lrc_result["most_recent_below_lower_index"] and 
-                  lrc_result["most_recent_above_upper_index"] and
-                  lrc_result["most_recent_above_upper_index"] > lrc_result["most_recent_below_lower_index"]):
-                has_cyclic_pattern = True
-                description = "Cyclic pattern detected: Price moved from below lower channel to above upper channel"
+        # Find the most recent occurrences (the one with the highest index)
+        most_recent_below_lower_index = max(below_lower_indices) if below_lower_indices else None
+        most_recent_above_upper_index = max(above_upper_indices) if above_upper_indices else None
         
-        # For the condition_met, we want to detect when we're in an upward cycle
-        # This happens when the price has recently been below the lower channel and is now moving up
-        condition_met = lrc_result["up_cycle"]
+        # Determine which event was more recent to decide the cycle direction
+        condition_met = False
+        description = "No channel breaks detected in the analysis window."
         
-        # If we have a cyclic pattern and the price is currently above the middle of the channel,
-        # that's a strong signal for an upward movement
-        if has_cyclic_pattern and lrc_result["current_price"] > ((lrc_result["current_upper"] + lrc_result["current_lower"]) / 2):
-            condition_met = True
-            description = "Strong upward signal: Cyclic pattern with price above channel middle"
+        # Determine which event was most recent
+        is_most_recent_below_lower = False
+        is_most_recent_above_upper = False
         
-        # Create a more accurate description based on what actually happened
-        if lrc_result["most_recent_below_lower"] and not lrc_result["most_recent_above_upper"]:
-            description = "Most recent occurrence was price below the lower channel (indicating potential upward cycle)"
-        elif lrc_result["most_recent_above_upper"] and not lrc_result["most_recent_below_lower"]:
-            description = "Most recent occurrence was price above the upper channel (indicating potential downward cycle)"
-        elif lrc_result["most_recent_below_lower"] and lrc_result["most_recent_above_upper"]:
-            if lrc_result["up_cycle"]:
+        if most_recent_below_lower_index is not None and most_recent_above_upper_index is not None:
+            # Both types of breaks occurred, compare which was more recent
+            if most_recent_below_lower_index > most_recent_above_upper_index:
+                condition_met = True  # Most recent was below lower channel
                 description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
+                is_most_recent_below_lower = True
             else:
+                condition_met = False  # Most recent was above upper channel
                 description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
+                is_most_recent_above_upper = True
+        elif most_recent_below_lower_index is not None:
+            # Only below lower channel breaks occurred
+            condition_met = True
+            description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
+            is_most_recent_below_lower = True
+        elif most_recent_above_upper_index is not None:
+            # Only above upper channel breaks occurred
+            condition_met = False
+            description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
+            is_most_recent_above_upper = True
         
         return {
             "condition_met": condition_met,
@@ -1130,15 +1127,14 @@ def analyze_linear_regression_channel_break(candles_1m):
             "lower_channel": lrc_result["current_lower"],
             "above_upper": lrc_result["above_upper"],
             "below_lower": lrc_result["below_lower"],
-            "most_recent_below_lower": lrc_result["most_recent_below_lower"],
-            "most_recent_above_upper": lrc_result["most_recent_above_upper"],
-            "most_recent_below_lower_index": lrc_result["most_recent_below_lower_index"],
-            "most_recent_above_upper_index": lrc_result["most_recent_above_upper_index"],
-            "up_cycle": lrc_result["up_cycle"],
-            "has_cyclic_pattern": has_cyclic_pattern,
+            "most_recent_below_lower": is_most_recent_below_lower,  # Fixed: Only true if this was the most recent event
+            "most_recent_above_upper": is_most_recent_above_upper,  # Fixed: Only true if this was the most recent event
+            "most_recent_below_lower_index": most_recent_below_lower_index,
+            "most_recent_above_upper_index": most_recent_above_upper_index,
+            "up_cycle": condition_met,  # True if condition is met
             "description": description,
-            "below_lower_indices": lrc_result["below_lower_indices"],
-            "above_upper_indices": lrc_result["above_upper_indices"]
+            "below_lower_indices": below_lower_indices[-10:] if len(below_lower_indices) > 0 else [],
+            "above_upper_indices": above_upper_indices[-10:] if len(above_upper_indices) > 0 else []
         }
         
     except Exception as e:
@@ -1853,13 +1849,10 @@ try:
             print(f"Current Price: {lrc_break_result['current_price']:.2f}")
             print(f"Upper Channel: {lrc_break_result['upper_channel']:.2f}")
             print(f"Lower Channel: {lrc_break_result['lower_channel']:.2f}")
-            print(f"Above Upper Channel: {lrc_break_result['above_upper']}")
-            print(f"Below Lower Channel: {lrc_break_result['below_lower']}")
             print(f"Most Recent Below Lower: {lrc_break_result['most_recent_below_lower']}")
             print(f"Most Recent Above Upper: {lrc_break_result['most_recent_above_upper']}")
             print(f"Most Recent Below Lower Index: {lrc_break_result['most_recent_below_lower_index']}")
             print(f"Most Recent Above Upper Index: {lrc_break_result['most_recent_above_upper_index']}")
-            print(f"Has Cyclic Pattern: {lrc_break_result['has_cyclic_pattern']}")
             print(f"Up Cycle: {lrc_break_result['up_cycle']}")
             print(f"Description: {lrc_break_result['description']}")
     
