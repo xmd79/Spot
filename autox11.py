@@ -50,6 +50,10 @@ CONFIG = {
     "min_conditions_met": 6  # ALL 6 conditions must be met to trigger a trade
 }
 
+# Global variables to track reversal history
+last_reversal_type = None
+last_reversal_time = None
+
 # =========================================================
 # 1. FFT CYCLE + PHASE EXTRACTION
 # =========================================================
@@ -122,15 +126,16 @@ def ml_reversal_probability(features):
 
 
 # =========================================================
-# 4. FFT + AROON + ML DIP REVERSAL ANALYSIS
+# 4. FFT + AROON + ML REVERSAL ANALYSIS (ENHANCED)
 # =========================================================
 
 def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
     """
-    Enhanced FFT + Aroon + ML Dip Reversal analysis with:
+    Enhanced FFT + Aroon + ML Reversal analysis with:
     - Current trend detection (UP or DOWN cycle)
     - Forecast price for reversal
-    - Confirmation at exact dip reversal point (LONG ONLY)
+    - Confirmation at exact reversal point (DIP or TOP)
+    - Continuation detection for sideways markets
     
     candles = list of dicts:
     {
@@ -140,6 +145,7 @@ def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
         "close": float
     }
     """
+    global last_reversal_type, last_reversal_time
 
     if len(candles) < 20:
         return {"error": "Not enough candles", "condition_met": False}
@@ -175,6 +181,7 @@ def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
     
     # Calculate reversal forecast price
     # For a DOWN to UP reversal, forecast a higher price
+    # For an UP to DOWN reversal, forecast a lower price
     current_price = close[-1]
     reversal_strength = abs(cycle_slope) * 10  # Scale the slope to estimate reversal magnitude
     
@@ -182,52 +189,116 @@ def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
         # DOWN to UP reversal - forecast higher price
         reversal_forecast = current_price + (reversal_strength * 0.5)  # Conservative estimate
         reversal_type = "DIP REVERSAL (DOWN to UP)"
+        incoming_reversal_type = "UP CYCLE"
     elif current_trend == "UP":
-        # UP to DOWN reversal - forecast lower price (not used for spot trading)
+        # UP to DOWN reversal - forecast lower price
         reversal_forecast = current_price - (reversal_strength * 0.5)
-        reversal_type = "UP to DOWN (not used)"
+        reversal_type = "TOP REVERSAL (UP to DOWN)"
+        incoming_reversal_type = "DOWN CYCLE"
     else:
-        # SIDEWAYS market - no clear reversal direction
-        reversal_forecast = current_price
-        reversal_type = "SIDEWAYS"
-
+        # SIDEWAYS market - analyze recent price action and cycle slope
+        # Check if recent price action suggests upward movement
+        price_change_5 = close[-1] - close[-6] if len(close) >= 6 else close[-1] - close[0]
+        
+        # Check if cycle slope is slightly positive or negative
+        slope_direction = "UPWARD" if cycle_slope > 0.01 else "DOWNWARD" if cycle_slope < -0.01 else "FLAT"
+        
+        # Determine likely continuation direction
+        if price_change_5 > 0 and slope_direction == "UPWARD":
+            # Price is rising and slope is upward - likely to continue UP
+            reversal_forecast = current_price + (reversal_strength * 0.2)  # Smaller forecast for continuation
+            reversal_type = "CONTINUATION UP"
+            incoming_reversal_type = "UP CYCLE"
+        elif price_change_5 < 0 and slope_direction == "DOWNWARD":
+            # Price is falling and slope is downward - likely to continue DOWN
+            reversal_forecast = current_price - (reversal_strength * 0.2)
+            reversal_type = "CONTINUATION DOWN"
+            incoming_reversal_type = "DOWN CYCLE"
+        else:
+            # Mixed signals - use dominant recent direction
+            recent_prices = close[-10:] if len(close) >= 10 else close
+            if sum(1 for p in recent_prices if p > recent_prices[0]) > sum(1 for p in recent_prices if p < recent_prices[0]):
+                # More upward movement than downward
+                reversal_forecast = current_price + (reversal_strength * 0.2)
+                reversal_type = "CONTINUATION UP"
+                incoming_reversal_type = "UP CYCLE"
+            else:
+                # More downward movement than upward
+                reversal_forecast = current_price - (reversal_strength * 0.2)
+                reversal_type = "CONTINUATION DOWN"
+                incoming_reversal_type = "DOWN CYCLE"
+    
     # =====================================================
-    # DIP REVERSAL CONFIRMATION LOGIC (LONG ONLY)
+    # REVERSAL CONFIRMATION LOGIC (DIP OR TOP)
     # =====================================================
     
-    # Check for dip exhaustion (the downtrend is ending)
-    dip_exhaustion = False
+    # Check for trend exhaustion (the current trend is ending)
+    trend_exhaustion = False
     if current_trend == "DOWN":
         # DOWN trend exhaustion: high Aroon Down, low Aroon Up, but cycle slope starting to turn positive
-        dip_exhaustion = (aroon_down > 70 and aroon_up < 30 and cycle_slope > 0)
+        trend_exhaustion = (aroon_down > 70 and aroon_up < 30 and cycle_slope > 0)
+    elif current_trend == "UP":
+        # UP trend exhaustion: high Aroon Up, low Aroon Down, but cycle slope starting to turn negative
+        trend_exhaustion = (aroon_up > 70 and aroon_down < 30 and cycle_slope < 0)
     
-    # Check for early signs of UP cycle (the reversal is starting)
-    up_cycle_starting = False
+    # Check for early signs of new trend (the reversal is starting)
+    new_trend_emerging = False
     if current_trend == "DOWN":
         # Early signs of UP cycle: cycle slope turning positive, price starting to rise above cycle
-        up_cycle_starting = (cycle_slope > 0 and price_vs_cycle > 0)
+        new_trend_emerging = (cycle_slope > 0 and price_vs_cycle > 0)
+    elif current_trend == "UP":
+        # Early signs of DOWN cycle: cycle slope turning negative, price starting to fall below cycle
+        new_trend_emerging = (cycle_slope < 0 and price_vs_cycle < 0)
     
-    # Dip reversal confirmation - requires both dip exhaustion and up cycle starting
-    dip_reversal_confirmed = (
+    # Reversal confirmation - requires both trend exhaustion and new trend emerging
+    reversal_confirmed = (
         probability > 0.7 and 
-        dip_exhaustion and 
-        up_cycle_starting
+        trend_exhaustion and 
+        new_trend_emerging
     )
     
     # =====================================================
-    # LONG ONLY DECISION LOGIC
+    # DECISION LOGIC (DIP, TOP, OR CONTINUATION)
     # =====================================================
 
-    # Only generate a LONG signal for dip reversal confirmation
+    # Generate a LONG signal for dip reversal confirmation
     long_signal = (
-        dip_reversal_confirmed and
+        reversal_confirmed and
         current_trend == "DOWN" and  # Must be in a downtrend (dip)
         reversal_type == "DIP REVERSAL (DOWN to UP)" # Must be a reversal to an uptrend
+    )
+
+    # Generate a SHORT signal for top reversal confirmation
+    short_signal = (
+        reversal_confirmed and
+        current_trend == "UP" and  # Must be in an uptrend (top)
+        reversal_type == "TOP REVERSAL (UP to DOWN)" # Must be a reversal to a downtrend
+    )
+
+    # Generate a CONTINUATION signal for sideways markets
+    continuation_signal = (
+        current_trend == "SIDEWAYS" and
+        (reversal_type == "CONTINUATION UP" or reversal_type == "CONTINUATION DOWN")
     )
 
     if long_signal:
         signal = "LONG"
         condition_met = True
+        # Update the last reversal tracking variables
+        last_reversal_type = "DIP"
+        last_reversal_time = datetime.datetime.now()
+    elif short_signal:
+        signal = "SHORT"
+        condition_met = True
+        # Update the last reversal tracking variables
+        last_reversal_type = "TOP"
+        last_reversal_time = datetime.datetime.now()
+    elif continuation_signal:
+        signal = "CONTINUATION"
+        condition_met = True
+        # Update the last reversal tracking variables
+        last_reversal_type = "CONTINUATION"
+        last_reversal_time = datetime.datetime.now()
     else:
         signal = "NO TRADE"
         condition_met = False
@@ -243,10 +314,13 @@ def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
         "current_trend": current_trend,
         "reversal_type": reversal_type,
         "reversal_forecast": round(reversal_forecast, 2),
-        "dip_exhaustion": dip_exhaustion,
-        "up_cycle_starting": up_cycle_starting,
-        "dip_reversal_confirmed": dip_reversal_confirmed,
-        "logic": "Dip reversal confirmation: Detects the end of a downtrend and the start of an uptrend"
+        "trend_exhaustion": trend_exhaustion,
+        "new_trend_emerging": new_trend_emerging,
+        "reversal_confirmed": reversal_confirmed,
+        "last_reversal_type": last_reversal_type,
+        "last_reversal_time": last_reversal_time.strftime("%Y-%m-%d %H:%M:%S") if last_reversal_time else "None",
+        "incoming_reversal_type": incoming_reversal_type,
+        "logic": "Reversal confirmation: Detects the end of a trend and the start of a new trend"
     }
 
 # Utility Functions
@@ -729,8 +803,8 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
         
         # Determine the trading signal based on the most recent crossing
         # According to the user's clarification:
-        # - When most recent was close below lowest line (compared to close above highest line), it's an up cycle
-        # - When most recent was close above upper line, it's a down cycle
+        # - When most recent was close below the lowest line (compared to close above the highest line), it's an up cycle
+        # - When most recent was close above the upper line, it's a down cycle
         up_cycle = most_recent_below_lower and not most_recent_above_upper
         
         return {
@@ -757,8 +831,8 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
 def analyze_linear_regression_channel_break(candles_1m):
     """
     Analyze linear regression channel break condition.
-    Returns True if the most recent occurrence between close below lowest line and 
-    close above highest line is close below lowest line of channel (indicating up cycle).
+    Returns True if the most recent occurrence between close below the lowest line and 
+    close above the highest line is close below the lowest line of channel (indicating up cycle).
     """
     try:
         if not candles_1m:
@@ -1171,8 +1245,8 @@ try:
             print(f"Error analyzing FFT prediction: {fft_prediction_result['error']}")
             print(f"Condition Met: {conditions_status['fft_prediction_1m']}")
             
-        # Condition 6: FFT + Aroon + ML Dip Reversal (LONG ONLY)
-        print("\n--- Condition 6: FFT + Aroon + ML Dip Reversal (LONG ONLY) ---")
+        # Condition 6: FFT + Aroon + ML Reversal (ENHANCED)
+        print("\n--- Condition 6: FFT + Aroon + ML Reversal (ENHANCED) ---")
         fft_aroon_ml_result = analyze_fft_aroon_ml_reversal(candles_1m)
         if 'error' not in fft_aroon_ml_result:
             conditions_status["fft_aroon_ml_reversal"] = fft_aroon_ml_result['condition_met']
@@ -1185,13 +1259,15 @@ try:
             print(f"Current Trend: {fft_aroon_ml_result['current_trend']}")
             print(f"Reversal Type: {fft_aroon_ml_result['reversal_type']}")
             print(f"Reversal Forecast: {fft_aroon_ml_result['reversal_forecast']}")
-            print(f"Dip Exhaustion: {fft_aroon_ml_result['dip_exhaustion']}")
-            print(f"Up Cycle Starting: {fft_aroon_ml_result['up_cycle_starting']}")
-            print(f"Dip Reversal Confirmed: {fft_aroon_ml_result['dip_reversal_confirmed']}")
-            print(f"Logic: {fft_aroon_ml_result['logic']}")
+            print(f"Trend Exhaustion: {fft_aroon_ml_result['trend_exhaustion']}")
+            print(f"New Trend Emerging: {fft_aroon_ml_result['new_trend_emerging']}")
+            print(f"Reversal Confirmed: {fft_aroon_ml_result['reversal_confirmed']}")
+            print(f"Last Reversal Type: {fft_aroon_ml_result['last_reversal_type']}")
+            print(f"Last Reversal Time: {fft_aroon_ml_result['last_reversal_time']}")
+            print(f"Incoming Reversal Type: {fft_aroon_ml_result['incoming_reversal_type']}")
             print(f"Condition Met: {conditions_status['fft_aroon_ml_reversal']}")
         else:
-            print(f"Error analyzing FFT + Aroon + ML Dip Reversal: {fft_aroon_ml_result['error']}")
+            print(f"Error analyzing FFT + Aroon + ML Reversal: {fft_aroon_ml_result['error']}")
             print(f"Condition Met: {conditions_status['fft_aroon_ml_reversal']}")
 
         # Print all conditions with true/false values
