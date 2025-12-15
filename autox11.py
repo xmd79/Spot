@@ -748,22 +748,30 @@ def analyze_linear_regression_channel_break(candles_1m):
         condition_met = False
         description = "No channel breaks detected in the analysis window."
         
+        # Determine which event was most recent
+        is_most_recent_below_lower = False
+        is_most_recent_above_upper = False
+        
         if most_recent_below_lower_index is not None and most_recent_above_upper_index is not None:
             # Both types of breaks occurred, compare which was more recent
             if most_recent_below_lower_index > most_recent_above_upper_index:
                 condition_met = True  # Most recent was below lower channel
                 description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
+                is_most_recent_below_lower = True
             else:
                 condition_met = False  # Most recent was above upper channel
                 description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
+                is_most_recent_above_upper = True
         elif most_recent_below_lower_index is not None:
             # Only below lower channel breaks occurred
             condition_met = True
             description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
+            is_most_recent_below_lower = True
         elif most_recent_above_upper_index is not None:
             # Only above upper channel breaks occurred
             condition_met = False
             description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
+            is_most_recent_above_upper = True
         
         return {
             "condition_met": condition_met,
@@ -772,8 +780,8 @@ def analyze_linear_regression_channel_break(candles_1m):
             "lower_channel": lrc_result["current_lower"],
             "above_upper": lrc_result["above_upper"],
             "below_lower": lrc_result["below_lower"],
-            "most_recent_below_lower": most_recent_below_lower_index is not None,
-            "most_recent_above_upper": most_recent_above_upper_index is not None,
+            "most_recent_below_lower": is_most_recent_below_lower,  # Fixed: Only true if this was the most recent event
+            "most_recent_above_upper": is_most_recent_above_upper,  # Fixed: Only true if this was the most recent event
             "most_recent_below_lower_index": most_recent_below_lower_index,
             "most_recent_above_upper_index": most_recent_above_upper_index,
             "up_cycle": condition_met,  # True if condition is met
