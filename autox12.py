@@ -48,7 +48,7 @@ CONFIG = {
         "fft_aroon_ml_reversal": True,
         "ema_crossover_orderflow": True,  # New condition
     },
-    "min_conditions_met": 6
+    "min_conditions_met": 7
 }
 
 # Global variables for market state tracking
