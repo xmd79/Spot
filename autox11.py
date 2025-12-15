@@ -37,300 +37,54 @@ PROFIT_TARGET_PERCENT = 0.35  # 0.35% profit target
 TOTAL_FEE_PERCENT = 0.22  # Total fee percentage
 MIN_TRADE_AMOUNT = 10
 
-# Updated configurable conditions - Now includes FFT + Aroon + ML
+# Updated configurable conditions
 CONFIG = {
     "conditions": {
-        "momentum_positive_1m": True,  # Momentum Positive (1m)
-        "momentum_positive_15sec": True, # Momentum Positive (15s)
-        "linear_regression_forecast_15s": True,  # Linear Regression Forecast (15s)
-        "linear_regression_channel_break": True,  # Linear Regression Channel Break condition
-        "fft_prediction_1m": True,  # FFT Prediction (1m)
-        "fft_aroon_ml_reversal": True,  # FFT + Aroon + ML Reversal
+        "momentum_positive_1m": True,
+        "momentum_positive_15sec": True,
+        "linear_regression_forecast_15s": True,
+        "linear_regression_channel_break": True,
+        "fft_prediction_1m": True,
+        "fft_aroon_ml_reversal": True,
     },
-    "min_conditions_met": 6  # ALL 6 conditions must be met to trigger a trade
+    "min_conditions_met": 6
 }
 
-# Global variables to track reversal history
+# Global variables for market state tracking
 last_reversal_type = None
 last_reversal_time = None
+current_major_trend = "UNKNOWN"
+last_major_high = None
+last_major_low = None
+resistance_level = None
+support_level = None
+market_cycle_position = 0
+
+# Variables for extrema tracking across timeframes
+timeframe_extrema = {
+    '1m': {'recent_high': None, 'recent_low': None, 'recent_high_idx': None, 'recent_low_idx': None},
+    '3m': {'recent_high': None, 'recent_low': None, 'recent_high_idx': None, 'recent_low_idx': None},
+    '5m': {'recent_high': None, 'recent_low': None, 'recent_high_idx': None, 'recent_low_idx': None}
+}
 
 # =========================================================
-# 1. FFT CYCLE + PHASE EXTRACTION
+# UTILITY FUNCTIONS
 # =========================================================
 
-def fft_cycle_phase(close, keep_ratio=0.10):
-    """
-    Extract dominant cycle and its slope using FFT.
-    Optimized for fast scalping (noise suppression).
-    """
-    close = np.asarray(close, dtype=np.float64)
-    n = len(close)
-
-    if n < 16:
-        return 0.0, 0.0
-
-    detrended = close - np.mean(close)
-    fft_vals = np.fft.fft(detrended)
-    magnitudes = np.abs(fft_vals)
-
-    threshold = np.quantile(magnitudes, 1 - keep_ratio)
-    fft_vals[magnitudes < threshold] = 0
-
-    cycle = np.real(np.fft.ifft(fft_vals))
-
-    cycle_value = cycle[-1]
-    cycle_slope = cycle[-1] - cycle[-2]
-
-    return cycle_value, cycle_slope
-
-
-# =========================================================
-# 2. AROON (TIME-BASED EXHAUSTION)
-# =========================================================
-
-def aroon(high, low, period=14):
-    """
-    Ultra-fast Aroon calculation.
-    """
-    if len(high) < period:
-        return None, None
-
-    window_high = high[-period:]
-    window_low = low[-period:]
-
-    hh_index = np.argmax(window_high)
-    ll_index = np.argmin(window_low)
-
-    aroon_up = (period - (period - hh_index)) / period * 100.0
-    aroon_down = (period - (period - ll_index)) / period * 100.0
-
-    return aroon_up, aroon_down
-
-
-# =========================================================
-# 3. LIGHTWEIGHT ML (LOGISTIC PROBABILITY MODEL)
-# =========================================================
-
-def ml_reversal_probability(features):
-    """
-    Fixed logistic model (hand-tuned for scalping).
-    No sklearn, no retraining lag.
-    """
-    weights = np.array([1.5, 1.1, 0.9, 0.6])
-    bias = -0.20
-
-    z = np.dot(weights, features) + bias
-    probability = 1.0 / (1.0 + math.exp(-z))
-
-    return probability
-
-
-# =========================================================
-# 4. FFT + AROON + ML REVERSAL ANALYSIS (ENHANCED)
-# =========================================================
-
-def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
-    """
-    Enhanced FFT + Aroon + ML Reversal analysis with:
-    - Current trend detection (UP or DOWN cycle)
-    - Forecast price for reversal
-    - Confirmation at exact reversal point (DIP or TOP)
-    - Continuation detection for sideways markets
-    
-    candles = list of dicts:
-    {
-        "open": float,
-        "high": float,
-        "low": float,
-        "close": float
-    }
-    """
-    global last_reversal_type, last_reversal_time
-
-    if len(candles) < 20:
-        return {"error": "Not enough candles", "condition_met": False}
-
-    close = [c["close"] for c in candles]
-    high = [c["high"] for c in candles]
-    low = [c["low"] for c in candles]
-
-    # FFT
-    cycle_value, cycle_slope = fft_cycle_phase(close)
-
-    # Aroon
-    aroon_up, aroon_down = aroon(high, low, aroon_period)
-    if aroon_up is None:
-        return {"error": "Aroon unavailable", "condition_met": False}
-
-    # Feature engineering
-    price_vs_cycle = close[-1] - cycle_value
-    aroon_diff = (aroon_up - aroon_down) / 100.0
-    aroon_strength = abs(aroon_diff)
-
-    features = np.array([
-        cycle_slope,
-        price_vs_cycle,
-        aroon_diff,
-        aroon_strength
-    ])
-
-    probability = ml_reversal_probability(features)
-    
-    # Determine current trend
-    current_trend = "DOWN" if cycle_slope < 0 and aroon_down > aroon_up else "UP" if cycle_slope > 0 and aroon_up > aroon_down else "SIDEWAYS"
-    
-    # Calculate reversal forecast price
-    # For a DOWN to UP reversal, forecast a higher price
-    # For an UP to DOWN reversal, forecast a lower price
-    current_price = close[-1]
-    reversal_strength = abs(cycle_slope) * 10  # Scale the slope to estimate reversal magnitude
-    
-    if current_trend == "DOWN":
-        # DOWN to UP reversal - forecast higher price
-        reversal_forecast = current_price + (reversal_strength * 0.5)  # Conservative estimate
-        reversal_type = "DIP REVERSAL (DOWN to UP)"
-        incoming_reversal_type = "UP CYCLE"
-    elif current_trend == "UP":
-        # UP to DOWN reversal - forecast lower price
-        reversal_forecast = current_price - (reversal_strength * 0.5)
-        reversal_type = "TOP REVERSAL (UP to DOWN)"
-        incoming_reversal_type = "DOWN CYCLE"
-    else:
-        # SIDEWAYS market - analyze recent price action and cycle slope
-        # Check if recent price action suggests upward movement
-        price_change_5 = close[-1] - close[-6] if len(close) >= 6 else close[-1] - close[0]
-        
-        # Check if cycle slope is slightly positive or negative
-        slope_direction = "UPWARD" if cycle_slope > 0.01 else "DOWNWARD" if cycle_slope < -0.01 else "FLAT"
-        
-        # Determine likely continuation direction
-        if price_change_5 > 0 and slope_direction == "UPWARD":
-            # Price is rising and slope is upward - likely to continue UP
-            reversal_forecast = current_price + (reversal_strength * 0.2)  # Smaller forecast for continuation
-            reversal_type = "CONTINUATION UP"
-            incoming_reversal_type = "UP CYCLE"
-        elif price_change_5 < 0 and slope_direction == "DOWNWARD":
-            # Price is falling and slope is downward - likely to continue DOWN
-            reversal_forecast = current_price - (reversal_strength * 0.2)
-            reversal_type = "CONTINUATION DOWN"
-            incoming_reversal_type = "DOWN CYCLE"
-        else:
-            # Mixed signals - use dominant recent direction
-            recent_prices = close[-10:] if len(close) >= 10 else close
-            if sum(1 for p in recent_prices if p > recent_prices[0]) > sum(1 for p in recent_prices if p < recent_prices[0]):
-                # More upward movement than downward
-                reversal_forecast = current_price + (reversal_strength * 0.2)
-                reversal_type = "CONTINUATION UP"
-                incoming_reversal_type = "UP CYCLE"
-            else:
-                # More downward movement than upward
-                reversal_forecast = current_price - (reversal_strength * 0.2)
-                reversal_type = "CONTINUATION DOWN"
-                incoming_reversal_type = "DOWN CYCLE"
-    
-    # =====================================================
-    # REVERSAL CONFIRMATION LOGIC (DIP OR TOP)
-    # =====================================================
-    
-    # Check for trend exhaustion (the current trend is ending)
-    trend_exhaustion = False
-    if current_trend == "DOWN":
-        # DOWN trend exhaustion: high Aroon Down, low Aroon Up, but cycle slope starting to turn positive
-        trend_exhaustion = (aroon_down > 70 and aroon_up < 30 and cycle_slope > 0)
-    elif current_trend == "UP":
-        # UP trend exhaustion: high Aroon Up, low Aroon Down, but cycle slope starting to turn negative
-        trend_exhaustion = (aroon_up > 70 and aroon_down < 30 and cycle_slope < 0)
-    
-    # Check for early signs of new trend (the reversal is starting)
-    new_trend_emerging = False
-    if current_trend == "DOWN":
-        # Early signs of UP cycle: cycle slope turning positive, price starting to rise above cycle
-        new_trend_emerging = (cycle_slope > 0 and price_vs_cycle > 0)
-    elif current_trend == "UP":
-        # Early signs of DOWN cycle: cycle slope turning negative, price starting to fall below cycle
-        new_trend_emerging = (cycle_slope < 0 and price_vs_cycle < 0)
-    
-    # Reversal confirmation - requires both trend exhaustion and new trend emerging
-    reversal_confirmed = (
-        probability > 0.7 and 
-        trend_exhaustion and 
-        new_trend_emerging
-    )
-    
-    # =====================================================
-    # DECISION LOGIC (DIP, TOP, OR CONTINUATION)
-    # =====================================================
-
-    # Generate a LONG signal for dip reversal confirmation
-    long_signal = (
-        reversal_confirmed and
-        current_trend == "DOWN" and  # Must be in a downtrend (dip)
-        reversal_type == "DIP REVERSAL (DOWN to UP)" # Must be a reversal to an uptrend
-    )
-
-    # Generate a SHORT signal for top reversal confirmation
-    short_signal = (
-        reversal_confirmed and
-        current_trend == "UP" and  # Must be in an uptrend (top)
-        reversal_type == "TOP REVERSAL (UP to DOWN)" # Must be a reversal to a downtrend
-    )
-
-    # Generate a CONTINUATION signal for sideways markets
-    continuation_signal = (
-        current_trend == "SIDEWAYS" and
-        (reversal_type == "CONTINUATION UP" or reversal_type == "CONTINUATION DOWN")
-    )
-
-    if long_signal:
-        signal = "LONG"
-        condition_met = True
-        # Update the last reversal tracking variables
-        last_reversal_type = "DIP"
-        last_reversal_time = datetime.datetime.now()
-    elif short_signal:
-        signal = "SHORT"
-        condition_met = True
-        # Update the last reversal tracking variables
-        last_reversal_type = "TOP"
-        last_reversal_time = datetime.datetime.now()
-    elif continuation_signal:
-        signal = "CONTINUATION"
-        condition_met = True
-        # Update the last reversal tracking variables
-        last_reversal_type = "CONTINUATION"
-        last_reversal_time = datetime.datetime.now()
-    else:
-        signal = "NO TRADE"
-        condition_met = False
-
-    return {
-        "signal": signal,
-        "condition_met": condition_met,
-        "probability": round(probability, 4),
-        "cycle_slope": round(cycle_slope, 6),
-        "price_vs_cycle": round(price_vs_cycle, 6),
-        "aroon_up": round(aroon_up, 2),
-        "aroon_down": round(aroon_down, 2),
-        "current_trend": current_trend,
-        "reversal_type": reversal_type,
-        "reversal_forecast": round(reversal_forecast, 2),
-        "trend_exhaustion": trend_exhaustion,
-        "new_trend_emerging": new_trend_emerging,
-        "reversal_confirmed": reversal_confirmed,
-        "last_reversal_type": last_reversal_type,
-        "last_reversal_time": last_reversal_time.strftime("%Y-%m-%d %H:%M:%S") if last_reversal_time else "None",
-        "incoming_reversal_type": incoming_reversal_type,
-        "logic": "Reversal confirmation: Detects the end of a trend and the start of a new trend"
-    }
-
-# Utility Functions
-def fetch_candles_in_parallel(timeframes, symbol=TRADE_SYMBOL, limit=1200):
-    def fetch_candles(timeframe):
-        return get_candles(symbol, timeframe, limit)
-
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        results = list(executor.map(fetch_candles, timeframes))
-    return dict(zip(timeframes, results))
+def get_symbol_lot_size_info(symbol):
+    try:
+        exchange_info = client.get_symbol_info(symbol)
+        for filter_info in exchange_info['filters']:
+            if filter_info['filterType'] == 'LOT_SIZE':
+                return {
+                    'minQty': Decimal(str(filter_info['minQty'])),
+                    'stepSize': Decimal(str(filter_info['stepSize']))
+                }
+        print(f"Could not find LOT_SIZE filter for {symbol}. Using defaults.")
+        return {'minQty': Decimal('0.00001'), 'stepSize': Decimal('0.00001')}
+    except BinanceAPIException as e:
+        print(f"Error fetching symbol info for {symbol}: {e.message}")
+        return {'minQty': Decimal('0.00001'), 'stepSize': Decimal('0.00001')}
 
 def get_candles(symbol, timeframe, limit=1200, retries=5, delay=5):
     for attempt in range(retries):
@@ -359,6 +113,13 @@ def get_candles(symbol, timeframe, limit=1200, retries=5, delay=5):
                 time.sleep(delay * (attempt + 1))
     print(f"Failed to fetch candles for {timeframe} after {retries} attempts.")
     return []
+
+def fetch_candles_in_parallel(timeframes, symbol=TRADE_SYMBOL, limit=1200):
+    def fetch_candles(timeframe):
+        return get_candles(symbol, timeframe, limit)
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        results = list(executor.map(fetch_candles, timeframes))
+    return dict(zip(timeframes, results))
 
 def get_current_price(retries=5, delay=5):
     for attempt in range(retries):
@@ -413,21 +174,6 @@ def get_average_entry_price():
     print(f"No valid last buy trade found for {TRADE_SYMBOL}; cannot calculate entry price.")
     return Decimal('0.0')
 
-def get_symbol_lot_size_info(symbol):
-    try:
-        exchange_info = client.get_symbol_info(symbol)
-        for filter in exchange_info['filters']:
-            if filter['filterType'] == 'LOT_SIZE':
-                return {
-                    'minQty': Decimal(str(filter['minQty'])),
-                    'stepSize': Decimal(str(filter['stepSize']))
-                }
-        print(f"Could not find LOT_SIZE filter for {symbol}. Using defaults.")
-        return {'minQty': Decimal('0.00001'), 'stepSize': Decimal('0.00001')}
-    except BinanceAPIException as e:
-        print(f"Error fetching symbol info for {symbol}: {e.message}")
-        return {'minQty': Decimal('0.00001'), 'stepSize': Decimal('0.00001')}
-
 def buy_asset():
     try:
         current_price = get_current_price()
@@ -440,11 +186,17 @@ def buy_asset():
             return None, None, None, None
         raw_quantity = usdc_balance / current_price
         print(f"Raw quantity calculated: {raw_quantity:.25f} (USDC: {usdc_balance:.25f}, Price: {current_price:.25f})")
+        
+        lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
+        step_size = lot_size_info['stepSize']
+        min_trade_size = lot_size_info['minQty']
+        
         step_precision = int(-math.log10(float(step_size))) if step_size > Decimal('0') else 8
         adjusted_quantity = (raw_quantity // step_size) * step_size
         adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
         cost = adjusted_quantity * current_price
-        print(f"Adjusted quantity (max balance): {adjusted_quantity:.25f}, Cost: {cost:.25f} (Step size: {step_size:.25f}, Precision: {step_precision})")
+        print(f"Adjusted quantity (max balance): {adjusted_quantity:.25f}, Cost: {cost:.25f}")
+        
         min_notional = Decimal('10.0')
         if cost < min_notional:
             print(f"Cost {cost:.25f} USDC is below minimum notional value {min_notional:.25f}. Adjusting quantity.")
@@ -453,20 +205,25 @@ def buy_asset():
             adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
             cost = adjusted_quantity * current_price
             print(f"Re-adjusted quantity for notional: {adjusted_quantity:.25f}, New Cost: {cost:.25f}")
+        
         if adjusted_quantity < min_trade_size:
             print(f"Adjusted quantity {adjusted_quantity:.25f} is below minimum trade size {min_trade_size:.25f}. Cannot execute trade.")
             return None, None, None, None
+        
         if cost > usdc_balance:
             print(f"Cost {cost:.25f} exceeds available balance {usdc_balance:.25f}. Re-adjusting.")
             adjusted_quantity = ((usdc_balance / current_price) // step_size) * step_size
             adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
             cost = adjusted_quantity * current_price
             print(f"Re-adjusted quantity to fit balance: {adjusted_quantity:.25f}, Final Cost: {cost:.25f}")
+        
         if adjusted_quantity < min_trade_size:
             print(f"Final adjusted quantity {adjusted_quantity:.25f} still below minimum trade size {min_trade_size:.25f}. Cannot execute trade.")
             return None, None, None, None
+        
         remaining_balance = usdc_balance - cost
         print(f"Using {cost:.25f} of {usdc_balance:.25f} USDC, Remaining Balance: {remaining_balance:.25f} USDC")
+        
         order = client.order_market_buy(symbol=TRADE_SYMBOL, quantity=float(adjusted_quantity))
         print(f"Market buy order executed: {order}")
         entry_price = Decimal(str(order['fills'][0]['price']))
@@ -483,12 +240,19 @@ def sell_asset(asset_balance):
             print(f"Invalid current price {current_price:.25f} for sell order.")
             return False
         asset_balance_dec = Decimal(str(asset_balance))
+        
+        lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
+        step_size = lot_size_info['stepSize']
+        min_trade_size = lot_size_info['minQty']
+        
         step_precision = int(-math.log10(float(step_size))) if step_size > Decimal('0') else 8
         sell_quantity = (asset_balance_dec // step_size) * step_size
         sell_quantity = sell_quantity.quantize(Decimal('0.' + '0' * step_precision))
+        
         if sell_quantity < min_trade_size:
             print(f"Cannot sell: Adjusted quantity {sell_quantity:.25f} is below minimum trade size {min_trade_size:.25f}.")
             return False
+        
         sell_order = client.order_market_sell(symbol=TRADE_SYMBOL, quantity=float(sell_quantity))
         print(f"Market sell order executed: {sell_order}")
         return True
@@ -505,28 +269,232 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
         print("Invalid current price for exit condition check.")
         return False
     current_value = asset_balance * current_price
-    target_value = initial_investment * Decimal('1.0035')  # 0.35% profit target
+    target_value = initial_investment * Decimal('1.0035')
     target_price = target_value / asset_balance
     print(f"Exit Check: Current Price: {current_price:.25f}, Target Price: {target_price:.25f}, Current Value: {current_value:.25f}, Target Value: {target_value:.25f}")
     return current_price >= target_price
 
-# Analysis Functions
+# =========================================================
+# ENHANCED TECHNICAL ANALYSIS FUNCTIONS
+# =========================================================
+
+def calculate_extrema_with_indices(prices, period=14):
+    """
+    Calculate recent highs and lows with their indices using argmax/argmin.
+    """
+    if len(prices) < period:
+        return None, None, None, None
+    
+    # Get recent window
+    recent_prices = prices[-period:]
+    
+    # Find indices within the recent window
+    recent_high_idx = np.argmax(recent_prices)
+    recent_low_idx = np.argmin(recent_prices)
+    
+    # Calculate actual indices in the full array
+    actual_high_idx = len(prices) - period + recent_high_idx
+    actual_low_idx = len(prices) - period + recent_low_idx
+    
+    # Get values
+    recent_high = prices[actual_high_idx]
+    recent_low = prices[actual_low_idx]
+    
+    # Calculate periods since high/low
+    current_idx = len(prices) - 1
+    periods_since_high = current_idx - actual_high_idx
+    periods_since_low = current_idx - actual_low_idx
+    
+    return recent_high, recent_low, periods_since_high, periods_since_low, actual_high_idx, actual_low_idx
+
+def calculate_thresholds_with_extrema(close_prices, period=14, minimum_percentage=3, maximum_percentage=3):
+    """
+    Calculate thresholds using recent extrema with indices.
+    """
+    try:
+        if len(close_prices) < period:
+            return None, None, None, None, None, None, None, None, None
+        
+        # Calculate recent extrema with indices
+        recent_high, recent_low, periods_since_high, periods_since_low, high_idx, low_idx = calculate_extrema_with_indices(close_prices, period)
+        
+        if recent_high is None or recent_low is None:
+            return None, None, None, None, None, None, None, None, None
+        
+        # Calculate thresholds based on recent extrema
+        min_percentage = Decimal(str(minimum_percentage)) / Decimal('100')
+        max_percentage = Decimal(str(maximum_percentage)) / Decimal('100')
+        
+        # Middle threshold (average of recent high and low)
+        middle_threshold = Decimal(str((recent_high + recent_low) / 2))
+        
+        # Dynamic thresholds based on volatility
+        recent_range = recent_high - recent_low
+        min_threshold = Decimal(str(recent_low - (recent_range * float(min_percentage))))
+        max_threshold = Decimal(str(recent_high + (recent_range * float(max_percentage))))
+        
+        # Calculate momentum
+        close_array = np.array(close_prices, dtype=np.float64)
+        momentum = talib.MOM(close_array, timeperiod=period)
+        
+        # Find momentum extremes
+        if len(momentum) >= period:
+            recent_momentum = momentum[-period:]
+            recent_max_momentum_idx = np.argmax(recent_momentum)
+            recent_min_momentum_idx = np.argmin(recent_momentum)
+            recent_max_momentum = Decimal(str(momentum[len(momentum) - period + recent_max_momentum_idx]))
+            recent_min_momentum = Decimal(str(momentum[len(momentum) - period + recent_min_momentum_idx]))
+        else:
+            recent_max_momentum = Decimal(str(np.nanmax(momentum)))
+            recent_min_momentum = Decimal(str(np.nanmin(momentum)))
+        
+        current_momentum = Decimal(str(momentum[-1])) if len(momentum) > 0 else Decimal('0')
+        
+        # Calculate momentum percentages
+        if recent_max_momentum != recent_min_momentum:
+            percent_to_min_momentum = (recent_max_momentum - current_momentum) / (recent_max_momentum - recent_min_momentum) * Decimal('100')
+            percent_to_max_momentum = (current_momentum - recent_min_momentum) / (recent_max_momentum - recent_min_momentum) * Decimal('100')
+        else:
+            percent_to_min_momentum = Decimal('50')
+            percent_to_max_momentum = Decimal('50')
+        
+        return (
+            min_threshold, 
+            max_threshold, 
+            middle_threshold,
+            periods_since_high,
+            periods_since_low,
+            percent_to_min_momentum,
+            percent_to_max_momentum,
+            high_idx,
+            low_idx
+        )
+        
+    except Exception as e:
+        print(f"Error in calculate_thresholds_with_extrema: {e}")
+        return None, None, None, None, None, None, None, None, None
+
+def enhanced_aroon(high, low, close, period=14):
+    """
+    Enhanced Aroon calculation using recent extrema indices.
+    """
+    try:
+        if len(high) < period or len(low) < period:
+            return None, None, None, None, None, None
+        
+        # Calculate thresholds to get recent indices
+        thresholds = calculate_thresholds_with_extrema(close, period)
+        
+        if thresholds[7] is not None and thresholds[8] is not None:
+            # Use indices from threshold calculation
+            periods_since_high = thresholds[3]
+            periods_since_low = thresholds[4]
+            recent_high_idx = thresholds[7]
+            recent_low_idx = thresholds[8]
+        else:
+            # Fallback to standard calculation
+            recent_high, recent_low, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = calculate_extrema_with_indices(close, period)
+        
+        # Calculate Aroon values
+        aroon_up = ((period - periods_since_high) / period) * 100.0
+        aroon_down = ((period - periods_since_low) / period) * 100.0
+        
+        return aroon_up, aroon_down, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx
+        
+    except Exception as e:
+        print(f"Error in enhanced_aroon: {e}")
+        return None, None, None, None, None, None
+
+def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=None):
+    """
+    Analyze extrema across multiple timeframes.
+    """
+    global timeframe_extrema
+    
+    try:
+        # Analyze 1m timeframe
+        close_1m = [c["close"] for c in candles_1m]
+        high_1m = [c["high"] for c in candles_1m]
+        low_1m = [c["low"] for c in candles_1m]
+        
+        aroon_1m = enhanced_aroon(high_1m, low_1m, close_1m, period=14)
+        thresholds_1m = calculate_thresholds_with_extrema(close_1m, period=14)
+        
+        if aroon_1m[0] is not None and thresholds_1m[0] is not None:
+            timeframe_extrema['1m'] = {
+                'recent_high': high_1m[aroon_1m[4]] if aroon_1m[4] is not None else None,
+                'recent_low': low_1m[aroon_1m[5]] if aroon_1m[5] is not None else None,
+                'recent_high_idx': aroon_1m[4],
+                'recent_low_idx': aroon_1m[5],
+                'min_threshold': thresholds_1m[0],
+                'max_threshold': thresholds_1m[1],
+                'middle_threshold': thresholds_1m[2],
+                'aroon_up': aroon_1m[0],
+                'aroon_down': aroon_1m[1]
+            }
+        
+        # Analyze 3m timeframe if available
+        if candles_3m and len(candles_3m) >= 14:
+            close_3m = [c["close"] for c in candles_3m]
+            high_3m = [c["high"] for c in candles_3m]
+            low_3m = [c["low"] for c in candles_3m]
+            
+            aroon_3m = enhanced_aroon(high_3m, low_3m, close_3m, period=14)
+            thresholds_3m = calculate_thresholds_with_extrema(close_3m, period=14)
+            
+            if aroon_3m[0] is not None and thresholds_3m[0] is not None:
+                timeframe_extrema['3m'] = {
+                    'recent_high': high_3m[aroon_3m[4]] if aroon_3m[4] is not None else None,
+                    'recent_low': low_3m[aroon_3m[5]] if aroon_3m[5] is not None else None,
+                    'recent_high_idx': aroon_3m[4],
+                    'recent_low_idx': aroon_3m[5],
+                    'min_threshold': thresholds_3m[0],
+                    'max_threshold': thresholds_3m[1],
+                    'middle_threshold': thresholds_3m[2],
+                    'aroon_up': aroon_3m[0],
+                    'aroon_down': aroon_3m[1]
+                }
+        
+        # Analyze 5m timeframe if available
+        if candles_5m and len(candles_5m) >= 14:
+            close_5m = [c["close"] for c in candles_5m]
+            high_5m = [c["high"] for c in candles_5m]
+            low_5m = [c["low"] for c in candles_5m]
+            
+            aroon_5m = enhanced_aroon(high_5m, low_5m, close_5m, period=14)
+            thresholds_5m = calculate_thresholds_with_extrema(close_5m, period=14)
+            
+            if aroon_5m[0] is not None and thresholds_5m[0] is not None:
+                timeframe_extrema['5m'] = {
+                    'recent_high': high_5m[aroon_5m[4]] if aroon_5m[4] is not None else None,
+                    'recent_low': low_5m[aroon_5m[5]] if aroon_5m[5] is not None else None,
+                    'recent_high_idx': aroon_5m[4],
+                    'recent_low_idx': aroon_5m[5],
+                    'min_threshold': thresholds_5m[0],
+                    'max_threshold': thresholds_5m[1],
+                    'middle_threshold': thresholds_5m[2],
+                    'aroon_up': aroon_5m[0],
+                    'aroon_down': aroon_5m[1]
+                }
+        
+        return timeframe_extrema
+        
+    except Exception as e:
+        print(f"Error in analyze_multiple_timeframe_extrema: {e}")
+        return timeframe_extrema
+
 def calculate_momentum(candles, period=10):
-    """Calculate momentum indicator."""
     try:
         if not candles or len(candles) < period + 1:
             return None, 0.0, {"error": "Insufficient data for momentum analysis"}
         
         close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
         
-        # Calculate momentum (current price minus price N periods ago)
         momentum = np.zeros(len(close_prices))
         for i in range(period, len(close_prices)):
             momentum[i] = close_prices[i] - close_prices[i - period]
         
         current_momentum = float(momentum[-1])
-        
-        # Check if momentum is positive
         momentum_positive = current_momentum > 0
         
         details = {
@@ -543,17 +511,10 @@ def calculate_momentum(candles, period=10):
         return False, 0.0, {"error": str(e)}
 
 def generate_15s_data_from_1m(df_1m):
-    """
-    Generate 15-second OHLCV data from 1-minute data.
-    This function creates 4 15-second candles from each 1-minute candle.
-    """
     if df_1m is None or df_1m.empty:
         return None
     
-    # Create a new DataFrame for 15s data
     df_15s = pd.DataFrame()
-    
-    # For each 1-minute candle, create 4 15-second candles
     timestamps = []
     opens = []
     highs = []
@@ -562,21 +523,16 @@ def generate_15s_data_from_1m(df_1m):
     volumes = []
     
     for idx, row in df_1m.iterrows():
-        # Get the 1-minute candle data
         open_price = row['open']
         high_price = row['high']
         low_price = row['low']
         close_price = row['close']
         volume = row['volume']
         
-        # Create 4 15-second candles
         for i in range(4):
-            # Calculate timestamp for each 15-second candle
             timestamp = row['timestamp'] + datetime.timedelta(seconds=15 * i)
             timestamps.append(timestamp)
             
-            # For simplicity, distribute the OHLC and volume evenly
-            # In a real scenario, you might want to use a more sophisticated method
             if i == 0:
                 opens.append(open_price)
                 closes.append(open_price + (close_price - open_price) * 0.25)
@@ -586,19 +542,14 @@ def generate_15s_data_from_1m(df_1m):
             elif i == 2:
                 opens.append(open_price + (close_price - open_price) * 0.5)
                 closes.append(open_price + (close_price - open_price) * 0.75)
-            else:  # i == 3
+            else:
                 opens.append(open_price + (close_price - open_price) * 0.75)
                 closes.append(close_price)
             
-            # For high and low, we'll use the high and low of the 1-minute candle
-            # In a real scenario, you might want to distribute these more realistically
             highs.append(high_price)
             lows.append(low_price)
-            
-            # Distribute volume evenly
             volumes.append(volume / 4)
     
-    # Create the 15s DataFrame
     df_15s = pd.DataFrame({
         'timestamp': timestamps,
         'open': opens,
@@ -611,26 +562,17 @@ def generate_15s_data_from_1m(df_1m):
     return df_15s
 
 def analyze_momentum_15sec(candles_1m):
-    """
-    Analyze if momentum is positive for 15-second timeframe derived from 1-minute data.
-    """
     try:
         if not candles_1m:
             return {"error": "No 1m data provided"}
         
-        # Convert 1m candles to DataFrame
         df_1m = pd.DataFrame(candles_1m)
-        
-        # Convert timestamp to datetime in GMT+2 timezone
         df_1m['timestamp'] = pd.to_datetime(df_1m['time'], unit='s').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
         
-        # Generate 15s data from 1m data
         df_15s = generate_15s_data_from_1m(df_1m)
-        
         if df_15s is None or df_15s.empty:
             return {"error": "Failed to generate 15s data"}
         
-        # Convert DataFrame back to candles format
         candles_15s = []
         for idx, row in df_15s.iterrows():
             candles_15s.append({
@@ -643,7 +585,6 @@ def analyze_momentum_15sec(candles_1m):
                 "timeframe": "15s"
             })
         
-        # Calculate momentum for 15s
         momentum_positive, momentum_value, momentum_details = calculate_momentum(candles_15s, period=10)
         
         return {
@@ -659,54 +600,33 @@ def analyze_momentum_15sec(candles_1m):
         return {"error": str(e)}
 
 def analyze_linear_regression_forecast_15s(candles_1m):
-    """
-    Analyze linear regression forecast for 15-second timeframe derived from 1-minute data.
-    Forecast direction is enough (no threshold check).
-    """
     try:
         if not candles_1m:
             return {"error": "No 1m data provided"}
         
-        # Convert 1m candles to DataFrame
         df_1m = pd.DataFrame(candles_1m)
-        
-        # Convert timestamp to datetime in GMT+2 timezone
         df_1m['timestamp'] = pd.to_datetime(df_1m['time'], unit='s').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
         
-        # Generate 15s data from 1m data
         df_15s = generate_15s_data_from_1m(df_1m)
-        
         if df_15s is None or df_15s.empty:
             return {"error": "Failed to generate 15s data"}
         
-        # Extract close prices for linear regression
         close_prices = df_15s['close'].values
         n = len(close_prices)
         
-        # Need at least 2 points for linear regression
         if n < 2:
             return {"error": "Insufficient data for linear regression"}
         
-        # Create x values (time indices)
         x = np.arange(n)
-        
-        # Calculate linear regression coefficients
-        # y = mx + b where m is slope, b is intercept
         coeffs = np.polyfit(x, close_prices, 1)
         slope = coeffs[0]
         intercept = coeffs[1]
         
-        # Forecast next value (at index n)
         forecast_target = slope * n + intercept
         current_price = close_prices[-1]
-        
-        # Calculate percentage difference
         forecast_diff_pct = ((forecast_target - current_price) / current_price) * 100
-        
-        # Determine if forecast is up (positive)
         forecast_up = forecast_target > current_price
         
-        # Calculate R-squared to measure fit quality
         y_pred = slope * x + intercept
         ss_res = np.sum((close_prices - y_pred) ** 2)
         ss_tot = np.sum((close_prices - np.mean(close_prices)) ** 2)
@@ -731,80 +651,51 @@ def analyze_linear_regression_forecast_15s(candles_1m):
         return {"error": str(e)}
 
 def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0):
-    """
-    Calculate Linear Regression Channel similar to Pine Script implementation.
-    Returns upper and lower channel lines and channel break information.
-    """
     try:
         if not candles or len(candles) < period:
             return {"error": "Insufficient data for linear regression channel"}
         
-        # Extract close prices
         close_prices = np.array([candle["close"] for candle in candles[-period:]], dtype=np.float64)
         n = len(close_prices)
         
-        # Create x values (time indices)
         x = np.arange(n)
-        
-        # Calculate linear regression coefficients
         coeffs = np.polyfit(x, close_prices, 1)
         slope = coeffs[0]
         intercept = coeffs[1]
         
-        # Calculate regression line values
         regression_line = slope * x + intercept
-        
-        # Calculate standard deviation of residuals
         residuals = close_prices - regression_line
         std_dev = np.std(residuals)
         
-        # Calculate upper and lower channel lines
         upper_channel = regression_line + dev_multiplier * std_dev
         lower_channel = regression_line - dev_multiplier * std_dev
         
-        # Get current price and channel values at the most recent point
         current_price = close_prices[-1]
         current_upper = upper_channel[-1]
         current_lower = lower_channel[-1]
         
-        # Check for channel breaks
         above_upper = current_price > current_upper
         below_lower = current_price < current_lower
         
-        # Check for recent channel crossings and track their indices
-        # Expand the detection window to look at more history
-        detection_window = min(100, n-1)  # Look at up to 100 periods
-        
+        detection_window = min(100, n-1)
         below_lower_indices = []
         above_upper_indices = []
         
-        # Check if we crossed below the lower channel
         for i in range(detection_window):
             if close_prices[n-2-i] >= lower_channel[n-2-i] and close_prices[n-1-i] < lower_channel[n-1-i]:
                 below_lower_indices.append(n-1-i)
-        
-        # Check if we crossed above the upper channel
-        for i in range(detection_window):
             if close_prices[n-2-i] <= upper_channel[n-2-i] and close_prices[n-1-i] > upper_channel[n-1-i]:
                 above_upper_indices.append(n-1-i)
         
-        # Determine which crossing was most recent
         most_recent_below_lower = len(below_lower_indices) > 0
         most_recent_above_upper = len(above_upper_indices) > 0
         
-        # If both types of crossings occurred, find which was most recent
         if most_recent_below_lower and most_recent_above_upper:
             most_recent_below_lower_index = max(below_lower_indices)
             most_recent_above_upper_index = max(above_upper_indices)
-            
-            # The most recent crossing is the one with the higher index
             most_recent_below_lower = most_recent_below_lower_index > most_recent_above_upper_index
             most_recent_above_upper = most_recent_above_upper_index > most_recent_below_lower_index
         
-        # Determine the trading signal based on the most recent crossing
-        # According to the user's clarification:
-        # - When most recent was close below the lowest line (compared to close above the highest line), it's an up cycle
-        # - When most recent was close above the upper line, it's a down cycle
         up_cycle = most_recent_below_lower and not most_recent_above_upper
         
         return {
@@ -829,95 +720,28 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
         return {"error": str(e)}
 
 def analyze_linear_regression_channel_break(candles_1m):
-    """
-    Analyze linear regression channel break condition.
-    Returns True if the most recent occurrence between close below the lowest line and 
-    close above the highest line is close below the lowest line of channel (indicating up cycle).
-    """
     try:
         if not candles_1m:
             return {"error": "No 1m data provided"}
         
-        # Calculate linear regression channel
         lrc_result = calculate_linear_regression_channel(candles_1m, period=500, dev_multiplier=2.0)
         
         if "error" in lrc_result:
             return lrc_result
         
-        # The condition is met if up_cycle is True
         condition_met = lrc_result["up_cycle"]
         
-        # Create a dynamic description based on the actual analysis
         if lrc_result["most_recent_below_lower"] and not lrc_result["most_recent_above_upper"]:
             description = "Most recent occurrence was a close below the lowest line (indicating upward cycle)"
         elif lrc_result["most_recent_above_upper"] and not lrc_result["most_recent_below_lower"]:
             description = "Most recent occurrence was a close above the highest line (indicating downward cycle)"
         elif lrc_result["most_recent_below_lower"] and lrc_result["most_recent_above_upper"]:
-            # If both are true, check which happened more recently
             if lrc_result["up_cycle"]:
                 description = "Most recent occurrence was a close below the lowest line (indicating upward cycle)"
             else:
                 description = "Most recent occurrence was a close above the highest line (indicating downward cycle)"
         else:
-            # If no recent breaks detected, look for any breaks in the entire period
-            # This is a fallback to ensure we always find some breaks
-            close_prices = np.array([candle["close"] for candle in candles_1m[-500:]], dtype=np.float64)
-            n = len(close_prices)
-            
-            # Recalculate the channel lines
-            x = np.arange(n)
-            coeffs = np.polyfit(x, close_prices, 1)
-            slope = coeffs[0]
-            intercept = coeffs[1]
-            regression_line = slope * x + intercept
-            residuals = close_prices - regression_line
-            std_dev = np.std(residuals)
-            upper_channel = regression_line + 2.0 * std_dev
-            lower_channel = regression_line - 2.0 * std_dev
-            
-            # Look for any breaks in the entire period
-            below_lower_indices = []
-            above_upper_indices = []
-            
-            for i in range(1, n):
-                if close_prices[i-1] >= lower_channel[i-1] and close_prices[i] < lower_channel[i]:
-                    below_lower_indices.append(i)
-                if close_prices[i-1] <= upper_channel[i-1] and close_prices[i] > upper_channel[i]:
-                    above_upper_indices.append(i)
-            
-            if below_lower_indices and above_upper_indices:
-                # Find the most recent break
-                most_recent_below_lower_index = max(below_lower_indices)
-                most_recent_above_upper_index = max(above_upper_indices)
-                
-                if most_recent_below_lower_index > most_recent_above_upper_index:
-                    condition_met = True
-                    description = "Most recent occurrence in the entire period was a close below the lowest line (indicating upward cycle)"
-                else:
-                    condition_met = False
-                    description = "Most recent occurrence in the entire period was a close above the highest line (indicating downward cycle)"
-            elif below_lower_indices:
-                condition_met = True
-                description = "Most recent occurrence in the entire period was a close below the lowest line (indicating upward cycle)"
-            elif above_upper_indices:
-                condition_met = False
-                description = "Most recent occurrence in the entire period was a close above the highest line (indicating downward cycle)"
-            else:
-                # If still no breaks found, use the current position relative to the channel
-                if lrc_result["below_lower"]:
-                    condition_met = True
-                    description = "Currently below the lower channel (indicating upward cycle)"
-                elif lrc_result["above_upper"]:
-                    condition_met = False
-                    description = "Currently above the upper channel (indicating downward cycle)"
-                else:
-                    # As a last resort, use the slope of the regression line
-                    if lrc_result["slope"] > 0:
-                        condition_met = True
-                        description = "No channel breaks detected, but regression slope is positive (indicating upward trend)"
-                    else:
-                        condition_met = False
-                        description = "No channel breaks detected, and regression slope is negative or flat (indicating downward trend)"
+            description = "No recent channel breaks detected"
         
         return {
             "condition_met": condition_met,
@@ -937,101 +761,54 @@ def analyze_linear_regression_channel_break(candles_1m):
         return {"error": str(e)}
 
 def predict_prices_with_fft(candles, num_predictions=5, filter_ratio=0.8):
-    """
-    Predict future prices using Fast Fourier Transform.
-    Heavily modified for ultra short-term prediction (next minute only).
-    
-    Args:
-        candles: List of candle data with 'close' prices
-        num_predictions: Number of future values to predict (default: 5)
-        filter_ratio: Ratio of frequency components to keep (0.8 = keep top 80%)
-    
-    Returns:
-        Dictionary with prediction results
-    """
     try:
-        # Use only the most recent 15 candles for ultra short-term prediction
         if not candles or len(candles) < 10:
             return {"error": "Insufficient data for FFT prediction"}
         
-        # Extract only the most recent candles
         recent_candles = candles[-15:] if len(candles) > 15 else candles
         close_prices = np.array([candle["close"] for candle in recent_candles], dtype=np.float64)
         
-        # Use a very small window for detrending (3-5 candles)
         window_size = min(3, len(close_prices) // 3)
         if window_size < 3:
             window_size = 3
         
-        # Calculate moving average
         weights = np.ones(window_size) / window_size
         moving_avg = np.convolve(close_prices, weights, mode='valid')
-        
-        # Pad the moving average to match the original length
         padding = np.zeros(len(close_prices) - len(moving_avg))
         moving_avg = np.concatenate([padding, moving_avg])
         
-        # Detrend the data
         detrended = close_prices - moving_avg
-        
-        # Apply FFT
         fft_values = np.fft.fft(detrended)
         
-        # For ultra short-term prediction, keep most of the signal
         fft_abs = np.abs(fft_values)
-        threshold = np.max(fft_abs) * (1 - filter_ratio)  # Keep 80% of frequencies
-        
-        # Create a mask for frequencies above threshold
+        threshold = np.max(fft_abs) * (1 - filter_ratio)
         mask = fft_abs > threshold
-        
-        # Apply mask to filter out noise
         filtered_fft = fft_values * mask
         
-        # Predict just ONE step ahead
         extended_fft = np.zeros(len(filtered_fft) + 1, dtype=complex)
         extended_fft[:len(filtered_fft)] = filtered_fft
-        
-        # Apply Inverse FFT
         extended_detrended = np.fft.ifft(extended_fft).real
         
-        # Get the last moving average value
         last_ma_value = moving_avg[-1]
-        
-        # Calculate the next predicted value (just one step)
         next_pred_detrended = extended_detrended[-1]
         next_prediction = next_pred_detrended + last_ma_value
         
-        # Apply very strict constraints to prevent unrealistic predictions
         current_price = close_prices[-1]
-        
-        # Limit the maximum change to 0.1% for the next minute
-        max_change_pct = 0.001  # 0.1% maximum change
-        
-        # Calculate the percentage change
+        max_change_pct = 0.001
         change_pct = (next_prediction - current_price) / current_price
         
-        # Constrain the prediction
         if abs(change_pct) > max_change_pct:
-            # Keep the direction but limit the magnitude
             constrained_prediction = current_price * (1 + max_change_pct if change_pct > 0 else 1 - max_change_pct)
         else:
             constrained_prediction = next_prediction
         
-        # Create multiple predictions by slightly varying the constrained prediction
-        # This gives us the 5 values requested but keeps them very close together
         predictions = []
         for i in range(num_predictions):
-            # Small variations that decrease with each step
             variation = (1 - (i * 0.02)) if change_pct > 0 else (1 + (i * 0.02))
             predictions.append(constrained_prediction * variation)
         
-        # Calculate confidence based on the proportion of retained frequency components
         confidence = np.sum(mask) / len(mask)
-        
-        # Calculate prediction direction (up/down)
         prediction_direction = "Up" if predictions[0] > current_price else "Down"
-        
-        # Calculate percentage change for the first prediction
         pct_change = ((predictions[0] - current_price) / current_price) * 100
         
         return {
@@ -1044,7 +821,7 @@ def predict_prices_with_fft(candles, num_predictions=5, filter_ratio=0.8):
             "filter_ratio": filter_ratio,
             "window_size": window_size,
             "data_points": len(close_prices),
-            "max_change_pct": max_change_pct * 100  # Convert to percentage
+            "max_change_pct": max_change_pct * 100
         }
         
     except Exception as e:
@@ -1052,25 +829,16 @@ def predict_prices_with_fft(candles, num_predictions=5, filter_ratio=0.8):
         return {"error": str(e)}
 
 def analyze_fft_prediction_1m(candles_1m):
-    """
-    Analyze FFT prediction for 1-minute timeframe.
-    Modified for ultra short-term prediction (next minute).
-    Returns True if prediction is upward.
-    """
     try:
         if not candles_1m:
             return {"error": "No 1m data provided"}
         
-        # Use only the most recent 15 candles for ultra short-term prediction
         recent_candles = candles_1m[-15:] if len(candles_1m) > 15 else candles_1m
-        
-        # Predict next values using FFT with modified parameters
         fft_result = predict_prices_with_fft(recent_candles, num_predictions=5, filter_ratio=0.8)
         
         if "error" in fft_result:
             return fft_result
         
-        # The condition is met if prediction is upward
         condition_met = fft_result["prediction_direction"] == "Up"
         
         return {
@@ -1087,6 +855,479 @@ def analyze_fft_prediction_1m(candles_1m):
     except Exception as e:
         print(f"Error analyzing FFT prediction: {e}")
         return {"error": str(e)}
+
+def fft_cycle_phase(close, keep_ratio=0.10):
+    close = np.asarray(close, dtype=np.float64)
+    n = len(close)
+
+    if n < 16:
+        return 0.0, 0.0
+
+    detrended = close - np.mean(close)
+    fft_vals = np.fft.fft(detrended)
+    magnitudes = np.abs(fft_vals)
+
+    threshold = np.quantile(magnitudes, 1 - keep_ratio)
+    fft_vals[magnitudes < threshold] = 0
+
+    cycle = np.real(np.fft.ifft(fft_vals))
+
+    cycle_value = cycle[-1]
+    cycle_slope = cycle[-1] - cycle[-2]
+
+    return cycle_value, cycle_slope
+
+def ml_reversal_probability(features):
+    weights = np.array([1.5, 1.1, 0.9, 0.6])
+    bias = -0.20
+
+    z = np.dot(weights, features) + bias
+    probability = 1.0 / (1.0 + math.exp(-z))
+
+    return probability
+
+# =========================================================
+# FIXED FFT + AROON + ML REVERSAL ANALYSIS
+# =========================================================
+
+def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
+    global timeframe_extrema, current_major_trend, last_major_high, last_major_low
+    
+    try:
+        if len(candles) < 50:
+            return {"error": "Not enough candles", "condition_met": False}
+
+        close = [c["close"] for c in candles]
+        high = [c["high"] for c in candles]
+        low = [c["low"] for c in candles]
+        
+        current_time = datetime.datetime.now()
+        current_price = close[-1] if len(close) > 0 else 0
+        
+        # =====================================================
+        # CALCULATE REAL MIN/MAX THRESHOLDS FROM 1200 CANDLES
+        # =====================================================
+        # Use the last 1200 candles (or all available if less)
+        lookback_candles = min(1200, len(candles))
+        recent_candles = candles[-lookback_candles:]
+        
+        # Initialize thresholds with safe defaults
+        min_threshold = current_price * 0.99
+        max_threshold = current_price * 1.01
+        middle_threshold = current_price
+        
+        if len(recent_candles) > 0:
+            try:
+                # Extract close prices for threshold calculation
+                recent_closes = [c["close"] for c in recent_candles]
+                
+                if len(recent_closes) > 0:
+                    # Find argmin and argmax for min/max thresholds
+                    min_idx = np.argmin(recent_closes)
+                    max_idx = np.argmax(recent_closes)
+                    
+                    # Get actual min and max values
+                    min_threshold = recent_closes[min_idx]
+                    max_threshold = recent_closes[max_idx]
+                    
+                    # Calculate middle threshold (average of min and max)
+                    middle_threshold = (min_threshold + max_threshold) / 2
+            except Exception as e:
+                print(f"Error calculating thresholds: {e}")
+                # Keep default values
+        
+        # =====================================================
+        # MULTI-TIMEFRAME EXTREMA ANALYSIS
+        # =====================================================
+        extrema_analysis = {}
+        try:
+            extrema_analysis = analyze_multiple_timeframe_extrema(candles)
+        except Exception as e:
+            print(f"Error in multi-timeframe analysis: {e}")
+        
+        # Use 1m timeframe for Aroon and recent highs/lows
+        aroon_up = 50.0  # Default values
+        aroon_down = 50.0
+        recent_high = None
+        recent_low = None
+        
+        if '1m' in extrema_analysis and extrema_analysis['1m'].get('recent_high') is not None:
+            tf_data = extrema_analysis['1m']
+            aroon_up = tf_data.get('aroon_up', 50.0)
+            aroon_down = tf_data.get('aroon_down', 50.0)
+            recent_high = tf_data.get('recent_high')
+            recent_low = tf_data.get('recent_low')
+        else:
+            # Fallback to enhanced_aroon if extrema analysis failed
+            try:
+                aroon_result = enhanced_aroon(high, low, close, aroon_period)
+                if aroon_result and aroon_result[0] is not None:
+                    aroon_up, aroon_down, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = aroon_result
+                    if recent_high_idx is not None and recent_high_idx < len(high):
+                        recent_high = high[recent_high_idx]
+                    if recent_low_idx is not None and recent_low_idx < len(low):
+                        recent_low = low[recent_low_idx]
+            except Exception as e:
+                print(f"Error in Aroon calculation: {e}")
+        
+        # =====================================================
+        # FFT ANALYSIS
+        # =====================================================
+        cycle_value = 0.0
+        cycle_slope = 0.0
+        try:
+            cycle_value, cycle_slope = fft_cycle_phase(close)
+        except Exception as e:
+            print(f"Error in FFT analysis: {e}")
+        
+        # =====================================================
+        # ML PROBABILITY
+        # =====================================================
+        probability = 0.5  # Default neutral probability
+        try:
+            price_vs_cycle = current_price - cycle_value if cycle_value is not None else 0.0
+            aroon_diff = aroon_up - aroon_down
+            aroon_diff_normalized = aroon_diff / 100.0 if aroon_diff != 0 else 0.0
+            aroon_strength = max(aroon_up, aroon_down)
+            
+            features = np.array([
+                float(cycle_slope),
+                float(price_vs_cycle),
+                float(aroon_diff_normalized),
+                float(aroon_strength / 100.0)
+            ], dtype=np.float64)
+
+            probability = ml_reversal_probability(features)
+        except Exception as e:
+            print(f"Error in ML probability calculation: {e}")
+        
+        # =====================================================
+        # TREND DETECTION - CORRECTED
+        # =====================================================
+        # Determine Aroon trend - only UP or DOWN
+        aroon_trend = "UP" if aroon_up > aroon_down else "DOWN"
+        
+        # Check for strong trends
+        if aroon_up > 70 and aroon_down < 30:
+            aroon_trend_strength = "STRONG_UP"
+        elif aroon_down > 70 and aroon_up < 30:
+            aroon_trend_strength = "STRONG_DOWN"
+        else:
+            aroon_trend_strength = "WEAK"
+        
+        # Current trend based on multiple indicators
+        current_trend = "UP"
+        try:
+            trend_score = 0
+            if aroon_trend == "UP":
+                trend_score += 1
+            if float(cycle_slope) > 0:
+                trend_score += 1
+            if current_price > middle_threshold:
+                trend_score += 1
+            
+            current_trend = "UP" if trend_score >= 2 else "DOWN"
+        except Exception as e:
+            print(f"Error determining current trend: {e}")
+        
+        # Update major trend
+        try:
+            if current_major_trend == "UNKNOWN":
+                current_major_trend = current_trend
+            elif aroon_trend_strength == "STRONG_UP" and float(cycle_slope) > 0.05:
+                current_major_trend = "UP"
+            elif aroon_trend_strength == "STRONG_DOWN" and float(cycle_slope) < -0.05:
+                current_major_trend = "DOWN"
+        except Exception as e:
+            print(f"Error updating major trend: {e}")
+        
+        # =====================================================
+        # MARKET CYCLE POSITION
+        # =====================================================
+        market_cycle_position = 50
+        market_phase = "MIDDLE ZONE"
+        
+        try:
+            threshold_range = max_threshold - min_threshold
+            if threshold_range > 0:
+                market_cycle_position = ((current_price - min_threshold) / threshold_range) * 100
+            else:
+                market_cycle_position = 50
+            
+            market_cycle_position = max(0, min(100, market_cycle_position))
+            
+            # Market phase
+            if market_cycle_position > 70:
+                market_phase = "TOP ZONE"
+            elif market_cycle_position < 30:
+                market_phase = "BOTTOM ZONE"
+            else:
+                market_phase = "MIDDLE ZONE"
+        except Exception as e:
+            print(f"Error calculating market cycle: {e}")
+        
+        # =====================================================
+        # SUPPORT AND RESISTANCE
+        # =====================================================
+        resistance_level = max_threshold
+        support_level = min_threshold
+        
+        # Update major highs/lows
+        try:
+            if recent_high is not None and (last_major_high is None or recent_high > last_major_high):
+                last_major_high = recent_high
+            
+            if recent_low is not None and (last_major_low is None or recent_low < last_major_low):
+                last_major_low = recent_low
+        except Exception as e:
+            print(f"Error updating major highs/lows: {e}")
+        
+        # =====================================================
+        # POSITION DETECTION
+        # =====================================================
+        # Initialize position variables
+        support_distance = 0.0
+        resistance_distance = 0.0
+        support_distance_pct = 0.0
+        resistance_distance_pct = 0.0
+        near_support = False
+        near_resistance = False
+        in_middle_range = False
+        
+        try:
+            # Calculate percentage distance to support and resistance
+            if support_level is not None and support_level > 0:
+                support_distance = current_price - support_level
+                support_distance_pct = (support_distance / support_level) * 100
+                near_support = support_distance_pct >= 0 and support_distance_pct <= 0.5  # Increased range
+            
+            if resistance_level is not None and resistance_level > 0:
+                resistance_distance = resistance_level - current_price
+                resistance_distance_pct = (resistance_distance / resistance_level) * 100
+                near_resistance = resistance_distance_pct >= 0 and resistance_distance_pct <= 0.5  # Increased range
+            
+            # Check if in middle range
+            in_middle_range = not near_support and not near_resistance
+        except Exception as e:
+            print(f"Error in position detection: {e}")
+        
+        # =====================================================
+        # REVERSAL SIGNALS - CORRECTED LOGIC
+        # =====================================================
+        reversal_dip = False
+        reversal_top = False
+        
+        try:
+            # Reversal dip: Price near support, major trend was DOWN, now showing UP signals
+            reversal_dip = (
+                market_phase == "BOTTOM ZONE" and
+                aroon_up > 70 and  # Strong bullish Aroon
+                aroon_down < 30 and  # Weak bearish Aroon
+                cycle_slope > 0.01 and  # Positive cycle (lowered threshold)
+                probability > 0.6  # High reversal probability (lowered threshold)
+            )
+            
+            # Reversal top: Price near resistance, major trend was UP, now showing DOWN signals
+            reversal_top = (
+                market_phase == "TOP ZONE" and
+                aroon_down > 70 and  # Strong bearish Aroon
+                aroon_up < 30 and  # Weak bullish Aroon
+                cycle_slope < -0.01 and  # Negative cycle (lowered threshold)
+                probability > 0.6  # High reversal probability (lowered threshold)
+            )
+        except Exception as e:
+            print(f"Error in reversal detection: {e}")
+        
+        # =====================================================
+        # CONTINUATION SIGNALS
+        # =====================================================
+        up_continuation = False
+        down_continuation = False
+        
+        try:
+            # Up continuation: Price has broken resistance, strong UP signals
+            up_continuation = (
+                current_trend == "UP" and
+                aroon_up > 70 and  # Strong bullish Aroon
+                current_price > resistance_level * 0.98 and  # Near or above resistance
+                cycle_slope > 0  # Positive cycle
+            )
+            
+            # Down continuation: Price has broken support, strong DOWN signals
+            down_continuation = (
+                current_trend == "DOWN" and
+                aroon_down > 70 and  # Strong bearish Aroon
+                current_price < support_level * 1.02 and  # Near or below support
+                cycle_slope < 0  # Negative cycle
+            )
+        except Exception as e:
+            print(f"Error in continuation detection: {e}")
+        
+        # =====================================================
+        # SIGNAL GENERATION - REVISED LOGIC
+        # =====================================================
+        condition_met = False
+        signal = "NO TRADE"
+        signal_reason = ""
+        
+        try:
+            # Priority 1: Major reversals (strongest signals)
+            if reversal_dip:
+                signal = "LONG"
+                signal_reason = "REVERSAL DIP (BOTTOM ZONE WITH STRONG UP SIGNALS)"
+                condition_met = True
+            elif reversal_top:
+                signal = "SHORT"
+                signal_reason = "REVERSAL TOP (TOP ZONE WITH STRONG DOWN SIGNALS)"
+                condition_met = False  # Always false for top reversal
+            
+            # Priority 2: Strong Aroon signals regardless of zone
+            elif aroon_up > 70 and aroon_down < 30:
+                signal = "LONG"
+                signal_reason = "STRONG AROON UP SIGNAL"
+                condition_met = True
+            elif aroon_down > 70 and aroon_up < 30:
+                signal = "SHORT"
+                signal_reason = "STRONG AROON DOWN SIGNAL"
+                condition_met = False  # Always false for down signals
+            
+            # Priority 3: Continuations (momentum signals)
+            elif up_continuation:
+                signal = "LONG"
+                signal_reason = "UP CONTINUATION (BREAKING RESISTANCE)"
+                condition_met = True
+            elif down_continuation:
+                signal = "SHORT"
+                signal_reason = "DOWN CONTINUATION (BREAKING SUPPORT)"
+                condition_met = False  # Always false for down signals
+            
+            # Priority 4: Bottom zone with positive indicators
+            elif market_phase == "BOTTOM ZONE" and (
+                (aroon_up > aroon_down and cycle_slope > 0) or
+                (current_trend == "UP" and probability > 0.6)
+            ):
+                signal = "LONG"
+                signal_reason = "BOTTOM ZONE WITH POSITIVE INDICATORS"
+                condition_met = True
+            
+            # Priority 5: General upward trend
+            elif current_trend == "UP" and aroon_up > 60:
+                signal = "LONG"
+                signal_reason = "GENERAL UPWARD TREND"
+                condition_met = True
+                
+        except Exception as e:
+            print(f"Error in signal generation: {e}")
+        
+        # =====================================================
+        # FORECAST CALCULATION
+        # =====================================================
+        forecast_pct = 0.0
+        forecast_move = 0.0
+        reversal_forecast = current_price
+        
+        try:
+            if signal == "LONG":
+                # Calculate forecast for LONG
+                recent_price_data = close[-10:] if len(close) >= 10 else close
+                if len(recent_price_data) > 1:
+                    recent_volatility = np.std(recent_price_data)
+                else:
+                    recent_volatility = current_price * 0.001
+                
+                base_move = min(recent_volatility, current_price * 0.005)
+                aroon_factor = aroon_up / 100.0 if aroon_up > 0 else 0.5
+                confidence = probability if probability > 0 else 0.5
+                cycle_factor = 1 + (abs(cycle_slope) * 0.001)
+                position_factor = 1.5 if near_support else 1.0
+                
+                forecast_move = base_move * aroon_factor * confidence * cycle_factor * position_factor
+                
+                max_move = current_price * 0.01
+                min_move = current_price * 0.0005
+                forecast_move = max(min(forecast_move, max_move), min_move)
+                
+                reversal_forecast = current_price + forecast_move
+                forecast_pct = (forecast_move / current_price) * 100 if current_price > 0 else 0
+                
+            elif signal == "SHORT":
+                # Similar calculation for SHORT
+                recent_price_data = close[-10:] if len(close) >= 10 else close
+                if len(recent_price_data) > 1:
+                    recent_volatility = np.std(recent_price_data)
+                else:
+                    recent_volatility = current_price * 0.001
+                
+                base_move = min(recent_volatility, current_price * 0.005)
+                aroon_factor = aroon_down / 100.0 if aroon_down > 0 else 0.5
+                confidence = probability if probability > 0 else 0.5
+                cycle_factor = 1 + (abs(cycle_slope) * 0.001)
+                position_factor = 1.5 if near_resistance else 1.0
+                
+                forecast_move = base_move * aroon_factor * confidence * cycle_factor * position_factor
+                
+                max_move = current_price * 0.01
+                min_move = current_price * 0.0005
+                forecast_move = max(min(forecast_move, max_move), min_move)
+                
+                reversal_forecast = current_price - forecast_move
+                forecast_pct = (forecast_move / current_price) * 100 if current_price > 0 else 0
+                
+        except Exception as e:
+            print(f"Error in forecast calculation: {e}")
+        
+        # =====================================================
+        # RETURN RESULTS
+        # =====================================================
+        return {
+            "signal": f"{signal} ({signal_reason})" if signal != "NO TRADE" else "NO TRADE",
+            "condition_met": condition_met,
+            "probability": round(probability, 4),
+            "cycle_slope": round(cycle_slope, 6),
+            "price_vs_cycle": round(price_vs_cycle, 6) if 'price_vs_cycle' in locals() else 0.0,
+            "aroon_up": round(aroon_up, 2),
+            "aroon_down": round(aroon_down, 2),
+            "aroon_trend": aroon_trend,
+            "aroon_trend_strength": aroon_trend_strength,
+            "current_trend": current_trend,
+            "current_major_trend": current_major_trend,
+            "market_phase": market_phase,
+            "market_cycle_position": round(market_cycle_position, 2),
+            "current_price": round(current_price, 2),
+            "support_level": round(support_level, 2) if support_level is not None else None,
+            "resistance_level": round(resistance_level, 2) if resistance_level is not None else None,
+            "middle_threshold": round(middle_threshold, 2) if middle_threshold is not None else None,
+            "min_threshold": round(min_threshold, 2) if min_threshold is not None else None,
+            "max_threshold": round(max_threshold, 2) if max_threshold is not None else None,
+            "support_distance": round(support_distance, 2),
+            "resistance_distance": round(resistance_distance, 2),
+            "support_distance_pct": round(support_distance_pct, 3),
+            "resistance_distance_pct": round(resistance_distance_pct, 3),
+            "near_support": near_support,
+            "near_resistance": near_resistance,
+            "in_middle_range": in_middle_range,
+            "reversal_forecast": round(reversal_forecast, 2),
+            "forecast_percentage": round(forecast_pct, 4),
+            "recent_high": round(recent_high, 2) if recent_high is not None else None,
+            "recent_low": round(recent_low, 2) if recent_low is not None else None,
+            "last_major_high": round(last_major_high, 2) if last_major_high is not None else None,
+            "last_major_low": round(last_major_low, 2) if last_major_low is not None else None,
+            "reversal_dip": reversal_dip,
+            "reversal_top": reversal_top,
+            "up_continuation": up_continuation,
+            "down_continuation": down_continuation,
+            "multi_timeframe_analysis": extrema_analysis
+        }
+        
+    except Exception as e:
+        print(f"Error in analyze_fft_aroon_ml_reversal: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "condition_met": False}
+
+# =========================================================
+# MAIN TRADING LOOP
+# =========================================================
 
 # Initialize lot size info
 lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
@@ -1139,10 +1380,9 @@ try:
                 entry_datetime = current_local_time
                 print(f"Entry Datetime set to current time: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # Fetch candles for all timeframes
-        candle_map = fetch_candles_in_parallel(['1m'])
+        # Fetch candles for multiple timeframes
+        candle_map = fetch_candles_in_parallel(['1m', '3m', '5m'])
         
-        # Also fetch 1m candles for 15s analysis
         candles_1m = get_candles(TRADE_SYMBOL, '1m', limit=1200)
         
         if not candle_map.get('1m'):
@@ -1150,7 +1390,7 @@ try:
         if current_price == Decimal('0.0'):
             print(f"Warning: Current {TRADE_SYMBOL} price is {current_price:.25f}. API may be failing.")
 
-        # Initialize all condition results - Updated with remaining conditions
+        # Initialize all condition results
         conditions_status = {
             "momentum_positive_1m": False,
             "momentum_positive_15sec": False,
@@ -1245,8 +1485,8 @@ try:
             print(f"Error analyzing FFT prediction: {fft_prediction_result['error']}")
             print(f"Condition Met: {conditions_status['fft_prediction_1m']}")
             
-        # Condition 6: FFT + Aroon + ML Reversal (ENHANCED)
-        print("\n--- Condition 6: FFT + Aroon + ML Reversal (ENHANCED) ---")
+        # Condition 6: FFT + Aroon + ML Reversal (FIXED)
+        print("\n--- Condition 6: FFT + Aroon + ML Reversal (FIXED) ---")
         fft_aroon_ml_result = analyze_fft_aroon_ml_reversal(candles_1m)
         if 'error' not in fft_aroon_ml_result:
             conditions_status["fft_aroon_ml_reversal"] = fft_aroon_ml_result['condition_met']
@@ -1256,16 +1496,30 @@ try:
             print(f"Price vs Cycle: {fft_aroon_ml_result['price_vs_cycle']}")
             print(f"Aroon Up: {fft_aroon_ml_result['aroon_up']}")
             print(f"Aroon Down: {fft_aroon_ml_result['aroon_down']}")
+            print(f"Aroon Trend: {fft_aroon_ml_result['aroon_trend']}")
             print(f"Current Trend: {fft_aroon_ml_result['current_trend']}")
-            print(f"Reversal Type: {fft_aroon_ml_result['reversal_type']}")
+            print(f"Current Major Trend: {fft_aroon_ml_result['current_major_trend']}")
+            print(f"Market Phase: {fft_aroon_ml_result['market_phase']}")
+            print(f"Market Cycle Position: {fft_aroon_ml_result['market_cycle_position']}%")
             print(f"Reversal Forecast: {fft_aroon_ml_result['reversal_forecast']}")
-            print(f"Trend Exhaustion: {fft_aroon_ml_result['trend_exhaustion']}")
-            print(f"New Trend Emerging: {fft_aroon_ml_result['new_trend_emerging']}")
-            print(f"Reversal Confirmed: {fft_aroon_ml_result['reversal_confirmed']}")
-            print(f"Last Reversal Type: {fft_aroon_ml_result['last_reversal_type']}")
-            print(f"Last Reversal Time: {fft_aroon_ml_result['last_reversal_time']}")
-            print(f"Incoming Reversal Type: {fft_aroon_ml_result['incoming_reversal_type']}")
+            print(f"Recent High: {fft_aroon_ml_result['recent_high']}")
+            print(f"Recent Low: {fft_aroon_ml_result['recent_low']}")
+            print(f"Min Threshold: {fft_aroon_ml_result['min_threshold']}")
+            print(f"Max Threshold: {fft_aroon_ml_result['max_threshold']}")
+            print(f"Middle Threshold: {fft_aroon_ml_result['middle_threshold']}")
+            print(f"Resistance Level: {fft_aroon_ml_result['resistance_level']}")
+            print(f"Support Level: {fft_aroon_ml_result['support_level']}")
+            print(f"Last Major High: {fft_aroon_ml_result['last_major_high']}")
+            print(f"Last Major Low: {fft_aroon_ml_result['last_major_low']}")
             print(f"Condition Met: {conditions_status['fft_aroon_ml_reversal']}")
+            
+            # Show multi-timeframe analysis
+            if 'multi_timeframe_analysis' in fft_aroon_ml_result:
+                print("\nMulti-Timeframe Analysis:")
+                for tf, data in fft_aroon_ml_result['multi_timeframe_analysis'].items():
+                    if data and data['recent_high'] is not None:
+                        print(f"  {tf}: High={data['recent_high']:.2f}, Low={data['recent_low']:.2f}, "
+                              f"Aroon Up={data['aroon_up']:.2f}, Aroon Down={data['aroon_down']:.2f}")
         else:
             print(f"Error analyzing FFT + Aroon + ML Reversal: {fft_aroon_ml_result['error']}")
             print(f"Condition Met: {conditions_status['fft_aroon_ml_reversal']}")
@@ -1299,7 +1553,7 @@ try:
                 current_value_in_usdc = Decimal('0.0')
             print(f"Current BTC Balance Value in USDC: {current_value_in_usdc:.25f}")
 
-            target_value = initial_investment * Decimal('1.0035')  # 0.35% profit target
+            target_value = initial_investment * Decimal('1.0035')
             entry_time_str = entry_datetime.strftime("%H:%M") if entry_datetime else "Unknown"
             time_span = (current_local_time - entry_datetime) if entry_datetime else None
             if time_span:
@@ -1336,13 +1590,8 @@ try:
 
             # Percentage Price Differences
             if entry_price > Decimal('0') and target_price > entry_price:
-                # Entry to Current percentage change
                 entry_to_current_pct = ((current_price - entry_price) / entry_price) * Decimal('100')
-                
-                # Current to Target percentage change (what we need to gain)
                 current_to_target_pct = ((target_price - current_price) / current_price) * Decimal('100')
-                
-                # Entry to Target percentage change (should be 0.35%)
                 entry_to_target_pct = ((target_price - entry_price) / entry_price) * Decimal('100')
                 
                 print(f"Entry Price: {entry_price:.2f}")
@@ -1351,11 +1600,7 @@ try:
                 print(f"Entry to Current: {entry_to_current_pct:.2f}%")
                 print(f"Current to Target: {current_to_target_pct:.2f}%")
                 print(f"Entry to Target: {entry_to_target_pct:.2f}%")
-                
             else:
-                entry_to_current_pct = Decimal('0.0')
-                current_to_target_pct = Decimal('0.0')
-                entry_to_target_pct = Decimal('0.0')
                 print("Error: Invalid entry or target price for percentage calculations.")
 
             print(f"Price Change from Entry: {entry_to_current_pct:.2f}%")
@@ -1393,7 +1638,7 @@ try:
                     if entry_price is not None and quantity_bought is not None and cost is not None:
                         initial_investment = cost
                         print(f"BTC was bought at entry price of {entry_price:.25f} USDC for quantity: {quantity_bought:.25f} BTC, Cost: {cost:.25f} USDC")
-                        print(f"Entry Datetime: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+                        print(f"Entry Datetime: {entry_datetime.strftime('%Y-%m-d %H:%M:%S')}")
                         position_open = True
                         print(f"New position opened with {cost:.25f} USDC at price {entry_price:.25f}.")
                         usdc_balance = get_balance('USDC')
@@ -1417,7 +1662,6 @@ try:
 
 except KeyboardInterrupt:
     print("\nBot stopped by user. Exiting gracefully...")
-    # Save any important state before exiting
     if position_open:
         print(f"Position is currently open with entry price: {entry_price:.25f}")
         print(f"Current profit/loss: {((asset_balance * current_price) - initial_investment):.25f} USDC")
