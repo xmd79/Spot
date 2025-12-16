@@ -272,8 +272,12 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
         print("Invalid current price for exit condition check.")
         return False
     current_value = asset_balance * current_price
-    target_value = initial_investment * Decimal('1.0075')  # Changed from 1.0035 to 1.0075 for 0.75% profit
+    
+    # Calculate the target value accounting for fees
+    # To achieve 0.75% net profit after 0.22% fees, we need 0.75% + 0.22% = 0.97% gross profit
+    target_value = initial_investment * Decimal('1.0097')  # 0.97% gross profit for 0.75% net profit
     target_price = target_value / asset_balance
+    
     print(f"Exit Check: Current Price: {current_price:.25f}, Target Price: {target_price:.25f}, Current Value: {current_value:.25f}, Target Value: {target_value:.25f}")
     return current_price >= target_price
 
@@ -1930,7 +1934,9 @@ try:
                 current_value_in_usdc = Decimal('0.0')
             print(f"Current BTC Balance Value in USDC: {current_value_in_usdc:.25f}")
 
-            target_value = initial_investment * Decimal('1.0075')  # Updated for 0.75% profit target
+            # Calculate the target value accounting for fees
+            # To achieve 0.75% net profit after 0.22% fees, we need 0.75% + 0.22% = 0.97% gross profit
+            target_value = initial_investment * Decimal('1.0097')  # 0.97% gross profit for 0.75% net profit
             entry_time_str = entry_datetime.strftime("%H:%M") if entry_datetime else "Unknown"
             time_span = (current_local_time - entry_datetime) if entry_datetime else None
             time_span_str = "Unknown"
@@ -1956,13 +1962,13 @@ try:
                 value_change_percentage = Decimal('0.0')
             print(f"Value Change Percentage from Initial Investment: {value_change_percentage:.25f}%")
 
-            # Price for 0.75% Profit Target
+            # Price for 0.75% Net Profit Target (after fees)
             if asset_balance > Decimal('0'):
                 target_price = target_value / asset_balance
             else:
                 target_price = Decimal('0.0')
                 print("Error: BTC balance is zero or negative. Target price set to 0.")
-            print(f"Price for Profit Target: {target_price:.25f}")
+            print(f"Price for 0.75% Net Profit Target (after fees): {target_price:.25f}")
 
             # Percentage Price Differences
             if entry_price > Decimal('0') and target_price > entry_price:
@@ -1984,15 +1990,14 @@ try:
             print()
 
             if check_exit_condition(initial_investment, asset_balance, entry_price):
-                print("Target profit of 0.75% reached or exceeded. Initiating exit...")
-                # Fixed syntax error: added missing closing parenthesis
+                print("Target net profit of 0.75% (after fees) reached or exceeded. Initiating exit...")
                 if sell_asset(float(asset_balance)):
                     exit_usdc_balance = get_balance('USDC')
                     profit = exit_usdc_balance - initial_investment
                     profit_percentage = (profit / initial_investment) * Decimal('100') if initial_investment > Decimal('0.0') else Decimal('0.0')
                     print(f"Position closed. Sold BTC for USDC: {exit_usdc_balance:.25f}")
                     print(f"Trade log: Time: {current_local_time_str}, Entry Price: {entry_price:.25f}, Exit Balance: {exit_usdc_balance:.25f}")
-                    print(f"Trade log: Time: {current_local_time_str}, Entry Price: {entry_price:.25f}, Exit Balance: {exit_usdc_balance:.25f}, Profit: {profit:.25f} Profit Percentage: {profit_percentage:.25f}%")
+                    print(f"Trade log: Time: {current_local_time_str}, Entry Price: {entry_price:.25f}, Exit Balance: {exit_usdc_balance:.25f}, Profit: {profit:.25f} Net Profit Percentage: {profit_percentage:.25f}%")
                     position_open = False
                     initial_investment = Decimal('0.0')
                     asset_balance = Decimal('0.0')
@@ -2015,7 +2020,6 @@ try:
                     if entry_price is not None and quantity_bought is not None and cost is not None:
                         initial_investment = cost
                         print(f"BTC was bought at entry price of {entry_price:.25f} USDC for quantity: {quantity_bought:.25f} BTC, Cost: {cost:.25f} USDC")
-                        # Fixed syntax error: added missing closing parenthesis
                         print(f"Entry Datetime: {entry_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
                         position_open = True
                         print(f"New position opened with {cost:.25f} USDC at price {entry_price:.25f}.")
