@@ -33,7 +33,7 @@ with open("api.txt", "r") as f:
 client = BinanceClient(api_key, api_secret, requests_params={"timeout": 30})
 
 # Trading Configuration
-PROFIT_TARGET_PERCENT = 0.35  # 0.35% profit target
+PROFIT_TARGET_PERCENT = 0.75  # Changed from 0.35% to 0.75% profit target
 TOTAL_FEE_PERCENT = 0.22  # Total fee percentage
 MIN_TRADE_AMOUNT = 10
 
@@ -272,7 +272,7 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
         print("Invalid current price for exit condition check.")
         return False
     current_value = asset_balance * current_price
-    target_value = initial_investment * Decimal('1.0035')
+    target_value = initial_investment * Decimal('1.0075')  # Changed from 1.0035 to 1.0075 for 0.75% profit
     target_price = target_value / asset_balance
     print(f"Exit Check: Current Price: {current_price:.25f}, Target Price: {target_price:.25f}, Current Value: {current_value:.25f}, Target Value: {target_value:.25f}")
     return current_price >= target_price
@@ -375,7 +375,7 @@ def analyze_sma_cascade(candles):
         if None in [current_sma7, current_sma9, current_sma12, current_sma17, current_sma21, current_sma27, current_sma200]:
             return {"error": "Insufficient data for SMA calculation", "condition_met": False}
         
-        # Check the cascade condition
+        # Check cascade condition
         condition_met = (
             current_close < current_sma7 and
             current_sma7 < current_sma9 and
@@ -1930,7 +1930,7 @@ try:
                 current_value_in_usdc = Decimal('0.0')
             print(f"Current BTC Balance Value in USDC: {current_value_in_usdc:.25f}")
 
-            target_value = initial_investment * Decimal('1.0035')
+            target_value = initial_investment * Decimal('1.0075')  # Updated for 0.75% profit target
             entry_time_str = entry_datetime.strftime("%H:%M") if entry_datetime else "Unknown"
             time_span = (current_local_time - entry_datetime) if entry_datetime else None
             time_span_str = "Unknown"
@@ -1956,13 +1956,13 @@ try:
                 value_change_percentage = Decimal('0.0')
             print(f"Value Change Percentage from Initial Investment: {value_change_percentage:.25f}%")
 
-            # Price for 0.35% Profit Target
+            # Price for 0.75% Profit Target
             if asset_balance > Decimal('0'):
                 target_price = target_value / asset_balance
             else:
                 target_price = Decimal('0.0')
                 print("Error: BTC balance is zero or negative. Target price set to 0.")
-            print(f"Price for 0.35% Profit Target: {target_price:.25f}")
+            print(f"Price for Profit Target: {target_price:.25f}")
 
             # Percentage Price Differences
             if entry_price > Decimal('0') and target_price > entry_price:
@@ -1984,7 +1984,7 @@ try:
             print()
 
             if check_exit_condition(initial_investment, asset_balance, entry_price):
-                print("Target profit of 0.35% reached or exceeded. Initiating exit...")
+                print("Target profit of 0.75% reached or exceeded. Initiating exit...")
                 # Fixed syntax error: added missing closing parenthesis
                 if sell_asset(float(asset_balance)):
                     exit_usdc_balance = get_balance('USDC')
