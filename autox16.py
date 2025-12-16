@@ -50,7 +50,7 @@ CONFIG = {
         "double_bottom_pattern_1m": True,
         "sma_cascade_condition": True,  # New condition for SMA cascade
     },
-    "min_conditions_met": 7
+    "min_conditions_met": 9
 }
 
 # Global variables for market state tracking
