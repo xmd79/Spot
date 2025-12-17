@@ -74,15 +74,13 @@ timeframe_extrema = {
 # UTILITY FUNCTIONS
 # =========================================================
 
-def log_signal_data(current_time, current_price, conditions_status, signal_details):
+def log_signal_data(current_time, current_price):
     """
     Log signal data to a text file when all conditions are met.
     
     Args:
         current_time: Current datetime
         current_price: Current price of the asset
-        conditions_status: Dictionary with status of all conditions
-        signal_details: Dictionary with additional signal details
     """
     try:
         # Log file in the same directory as the script
@@ -91,22 +89,8 @@ def log_signal_data(current_time, current_price, conditions_status, signal_detai
         # Format the timestamp
         timestamp = current_time.strftime("%Y-%m-%d %H:%M:%S")
         
-        # Prepare the log entry
-        log_entry = f"\n{'='*80}\n"
-        log_entry += f"SIGNAL TRIGGERED AT: {timestamp}\n"
-        log_entry += f"{'='*80}\n"
-        log_entry += f"CURRENT PRICE: {current_price:.25f}\n"
-        log_entry += f"\nCONDITIONS STATUS:\n"
-        
-        for condition_name, status in conditions_status.items():
-            status_str = "TRUE" if status else "FALSE"
-            log_entry += f"  {condition_name}: {status_str}\n"
-        
-        log_entry += f"\nSIGNAL DETAILS:\n"
-        for key, value in signal_details.items():
-            log_entry += f"  {key}: {value}\n"
-        
-        log_entry += f"\n{'='*80}\n"
+        # Prepare the log entry with only timestamp and price
+        log_entry = f"{timestamp} - Signal Triggered at Price: {current_price:.25f}\n"
         
         # Write to the log file
         with open(log_file, "a") as f:
@@ -489,7 +473,7 @@ def calculate_thresholds_with_extrema(close_prices, period=14, minimum_percentag
     """
     try:
         if len(close_prices) < period:
-            return None, None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None, None
         
         # Calculate recent extrema with indices
         recent_high, recent_low, periods_since_high, periods_since_low, high_idx, low_idx = calculate_extrema_with_indices(close_prices, period)
@@ -1968,19 +1952,6 @@ try:
         all_conditions_met = all(conditions_status.values())
         print(f"\nAll Conditions Met for Entry: {'Yes' if all_conditions_met else 'No'}")
 
-        # Prepare signal details for logging
-        signal_details = {
-            "momentum_1m_value": momentum_1m_value,
-            "momentum_15s_value": momentum_15s_result.get('current_momentum', 'N/A'),
-            "double_bottom_15s_pattern": double_bottom_15s_result.get('pattern_description', 'N/A'),
-            "lrc_break_description": lrc_break_result.get('description', 'N/A'),
-            "fft_prediction_direction": fft_prediction_result.get('prediction_direction', 'N/A'),
-            "fft_aroon_ml_signal": fft_aroon_ml_result.get('signal', 'N/A'),
-            "volume_bias": volume_bias_result.get('volume_bias', 'N/A'),
-            "double_bottom_1m_pattern": double_bottom_1m_result.get('pattern_description', 'N/A'),
-            "sma_cascade_status": "Met" if sma_cascade_result.get('condition_met', False) else "Not Met"
-        }
-
         if position_open:
             print()
             print("Current In-Trade Status:")
@@ -2068,8 +2039,8 @@ try:
 
             # Check if all conditions are met for entry
             if all_conditions_met:
-                # Log signal data before executing trade
-                log_signal_data(current_local_time, current_price, conditions_status, signal_details)
+                # Log signal data before executing trade - only timestamp and price
+                log_signal_data(current_local_time, current_price)
                 
                 usdc_balance = get_balance('USDC')
                 if usdc_balance > Decimal('0'):
