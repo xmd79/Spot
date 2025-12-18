@@ -608,7 +608,7 @@ def calculate_extrema_with_indices(prices, period=14):
     Calculate recent highs and lows with their indices using argmax/argmin.
     """
     if len(prices) < period:
-        return None, None, None, None
+        return None, None, None, None, None, None
     
     # Get recent window
     recent_prices = prices[-period:]
@@ -638,13 +638,13 @@ def calculate_thresholds_with_extrema(close_prices, period=14):
     """
     try:
         if len(close_prices) < period:
-            return None, None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         
         # Calculate recent extrema with indices
         recent_high, recent_low, periods_since_high, periods_since_low, high_idx, low_idx = calculate_extrema_with_indices(close_prices, period)
         
         if recent_high is None or recent_low is None:
-            return None, None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         
         # Calculate thresholds based on recent extrema
         min_threshold = recent_low
@@ -665,7 +665,7 @@ def calculate_thresholds_with_extrema(close_prices, period=14):
         
     except Exception as e:
         print(f"Error in calculate_thresholds_with_extrema: {e}")
-        return None, None, None, None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None
 
 def enhanced_aroon(high, low, close, period=14):
     """
@@ -678,24 +678,29 @@ def enhanced_aroon(high, low, close, period=14):
         # Calculate thresholds to get recent indices
         thresholds = calculate_thresholds_with_extrema(close, period)
         
-        if thresholds[6] is not None and thresholds[7] is not None:
+        # Check if thresholds calculation was successful and has enough elements
+        if thresholds and len(thresholds) >= 7 and thresholds[5] is not None and thresholds[6] is not None:
             # Use indices from threshold calculation
             periods_since_high = thresholds[3]
             periods_since_low = thresholds[4]
-            recent_high_idx = thresholds[6]
-            recent_low_idx = thresholds[7]
+            recent_high_idx = thresholds[5]
+            recent_low_idx = thresholds[6]
         else:
             # Fallback to standard calculation
-            recent_high, recent_low, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = calculate_extrema_with_indices(close, period)
+            _, _, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = calculate_extrema_with_indices(close, period)
         
-        # Calculate Aroon values
-        aroon_up = ((period - periods_since_high) / period) * 100.0
-        aroon_down = ((period - periods_since_low) / period) * 100.0
+        # Calculate Aroon values using the proper formula
+        # Aroon Up = ((period - periods_since_high) / period) * 100
+        # Aroon Down = ((period - periods_since_low) / period) * 100
+        aroon_up = ((period - periods_since_high) / period) * 100
+        aroon_down = ((period - periods_since_low) / period) * 100
         
         return aroon_up, aroon_down, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx
         
     except Exception as e:
         print(f"Error in enhanced_aroon: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None, None, None, None, None
 
 def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=None):
@@ -711,17 +716,17 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
         low_1m = [c["low"] for c in candles_1m]
         
         aroon_1m = enhanced_aroon(high_1m, low_1m, close_1m, period=14)
-        thresholds_1m = calculate_thresholds_with_extrema(close_1m, period=14)
         
-        if aroon_1m[0] is not None and thresholds_1m[0] is not None:
+        if aroon_1m[0] is not None:
+            # Get recent high and low values directly from the high/low arrays with bounds checking
+            recent_high = high_1m[aroon_1m[4]] if aroon_1m[4] is not None and 0 <= aroon_1m[4] < len(high_1m) else None
+            recent_low = low_1m[aroon_1m[5]] if aroon_1m[5] is not None and 0 <= aroon_1m[5] < len(low_1m) else None
+            
             timeframe_extrema['1m'] = {
-                'recent_high': high_1m[aroon_1m[4]] if aroon_1m[4] is not None else None,
-                'recent_low': low_1m[aroon_1m[5]] if aroon_1m[5] is not None else None,
+                'recent_high': recent_high,
+                'recent_low': recent_low,
                 'recent_high_idx': aroon_1m[4],
                 'recent_low_idx': aroon_1m[5],
-                'min_threshold': thresholds_1m[0],
-                'max_threshold': thresholds_1m[1],
-                'middle_threshold': thresholds_1m[2],
                 'aroon_up': aroon_1m[0],
                 'aroon_down': aroon_1m[1]
             }
@@ -733,17 +738,17 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
             low_3m = [c["low"] for c in candles_3m]
             
             aroon_3m = enhanced_aroon(high_3m, low_3m, close_3m, period=14)
-            thresholds_3m = calculate_thresholds_with_extrema(close_3m, period=14)
             
-            if aroon_3m[0] is not None and thresholds_3m[0] is not None:
+            if aroon_3m[0] is not None:
+                # Get recent high and low values directly from the high/low arrays with bounds checking
+                recent_high = high_3m[aroon_3m[4]] if aroon_3m[4] is not None and 0 <= aroon_3m[4] < len(high_3m) else None
+                recent_low = low_3m[aroon_3m[5]] if aroon_3m[5] is not None and 0 <= aroon_3m[5] < len(low_3m) else None
+                
                 timeframe_extrema['3m'] = {
-                    'recent_high': high_3m[aroon_3m[4]] if aroon_3m[4] is not None else None,
-                    'recent_low': low_3m[aroon_3m[5]] if aroon_3m[5] is not None else None,
+                    'recent_high': recent_high,
+                    'recent_low': recent_low,
                     'recent_high_idx': aroon_3m[4],
                     'recent_low_idx': aroon_3m[5],
-                    'min_threshold': thresholds_3m[0],
-                    'max_threshold': thresholds_3m[1],
-                    'middle_threshold': thresholds_3m[2],
                     'aroon_up': aroon_3m[0],
                     'aroon_down': aroon_3m[1]
                 }
@@ -755,17 +760,17 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
             low_5m = [c["low"] for c in candles_5m]
             
             aroon_5m = enhanced_aroon(high_5m, low_5m, close_5m, period=14)
-            thresholds_5m = calculate_thresholds_with_extrema(close_5m, period=14)
             
-            if aroon_5m[0] is not None and thresholds_5m[0] is not None:
+            if aroon_5m[0] is not None:
+                # Get recent high and low values directly from the high/low arrays with bounds checking
+                recent_high = high_5m[aroon_5m[4]] if aroon_5m[4] is not None and 0 <= aroon_5m[4] < len(high_5m) else None
+                recent_low = low_5m[aroon_5m[5]] if aroon_5m[5] is not None and 0 <= aroon_5m[5] < len(low_5m) else None
+                
                 timeframe_extrema['5m'] = {
-                    'recent_high': high_5m[aroon_5m[4]] if aroon_5m[4] is not None else None,
-                    'recent_low': low_5m[aroon_5m[5]] if aroon_5m[5] is not None else None,
+                    'recent_high': recent_high,
+                    'recent_low': recent_low,
                     'recent_high_idx': aroon_5m[4],
                     'recent_low_idx': aroon_5m[5],
-                    'min_threshold': thresholds_5m[0],
-                    'max_threshold': thresholds_5m[1],
-                    'middle_threshold': thresholds_5m[2],
                     'aroon_up': aroon_5m[0],
                     'aroon_down': aroon_5m[1]
                 }
@@ -774,6 +779,8 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
         
     except Exception as e:
         print(f"Error in analyze_multiple_timeframe_extrema: {e}")
+        import traceback
+        traceback.print_exc()
         return timeframe_extrema
 
 def calculate_momentum(candles, period=10):
@@ -1247,9 +1254,9 @@ def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
                 aroon_result = enhanced_aroon(high, low, close, aroon_period)
                 if aroon_result and aroon_result[0] is not None:
                     aroon_up, aroon_down, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = aroon_result
-                    if recent_high_idx is not None and recent_high_idx < len(high):
+                    if recent_high_idx is not None and 0 <= recent_high_idx < len(high):
                         recent_high = high[recent_high_idx]
-                    if recent_low_idx is not None and recent_low_idx < len(low):
+                    if recent_low_idx is not None and 0 <= recent_low_idx < len(low):
                         recent_low = low[recent_low_idx]
             except Exception as e:
                 print(f"Error in Aroon calculation: {e}")
@@ -1564,7 +1571,7 @@ def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
         # RETURN RESULTS
         # =====================================================
         return {
-            "signal": f"{signal} ({signal_reason})" if signal != "NO TRADE" else "NO TRADE",
+            "signal": signal,
             "condition_met": condition_met,
             "probability": round(probability, 4),
             "cycle_slope": round(cycle_slope, 6),
@@ -2025,7 +2032,7 @@ try:
                 print(f"Current USDC balance found: {usdc_balance:.25f}")
             else:
                 print("No USDC balance available.")
-            print(f"Current BTC balance: {asset_balance:.25f} BTC")
+            print(f"Current BTC balance: {asset_balance:.25f}")
 
             # Check if all conditions are met for entry
             if all_conditions_met:
