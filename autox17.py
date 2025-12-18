@@ -367,12 +367,12 @@ def analyze_volume_bias(candles):
         return {"error": str(e), "condition_met": False}
 
 # =========================================================
-# SMA CASCADE ANALYSIS FUNCTION
+# UPDATED SMA CASCADE ANALYSIS FUNCTION
 # =========================================================
 
-def analyze_sma_cascade(candles):
+def analyze_sma_cascade_updated(candles):
     """
-    Analyze SMA cascade condition: close < SMA7 < SMA9 < SMA12 < SMA17 < SMA21 < SMA27 < SMA200
+    Analyze the updated SMA cascade condition: close < SMA5 < SMA7 < SMA9 < SMA12
     
     Args:
         candles: List of candle data
@@ -381,61 +381,49 @@ def analyze_sma_cascade(candles):
         Dictionary with SMA analysis results
     """
     try:
-        if not candles or len(candles) < 200:
+        if not candles or len(candles) < 12:
             return {"error": "Insufficient data for SMA analysis", "condition_met": False}
         
         # Extract close prices
         close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
         
         # Calculate SMAs
+        sma5 = talib.SMA(close_prices, timeperiod=5)
         sma7 = talib.SMA(close_prices, timeperiod=7)
         sma9 = talib.SMA(close_prices, timeperiod=9)
         sma12 = talib.SMA(close_prices, timeperiod=12)
-        sma17 = talib.SMA(close_prices, timeperiod=17)
-        sma21 = talib.SMA(close_prices, timeperiod=21)
-        sma27 = talib.SMA(close_prices, timeperiod=27)
-        sma200 = talib.SMA(close_prices, timeperiod=200)
         
         # Get current values
         current_close = close_prices[-1]
+        current_sma5 = sma5[-1] if not np.isnan(sma5[-1]) else None
         current_sma7 = sma7[-1] if not np.isnan(sma7[-1]) else None
         current_sma9 = sma9[-1] if not np.isnan(sma9[-1]) else None
         current_sma12 = sma12[-1] if not np.isnan(sma12[-1]) else None
-        current_sma17 = sma17[-1] if not np.isnan(sma17[-1]) else None
-        current_sma21 = sma21[-1] if not np.isnan(sma21[-1]) else None
-        current_sma27 = sma27[-1] if not np.isnan(sma27[-1]) else None
-        current_sma200 = sma200[-1] if not np.isnan(sma200[-1]) else None
         
         # Check if all SMAs are valid
-        if None in [current_sma7, current_sma9, current_sma12, current_sma17, current_sma21, current_sma27, current_sma200]:
+        if None in [current_sma5, current_sma7, current_sma9, current_sma12]:
             return {"error": "Insufficient data for SMA calculation", "condition_met": False}
         
         # Check cascade condition
         condition_met = (
-            current_close < current_sma7 and
+            current_close < current_sma5 and
+            current_sma5 < current_sma7 and
             current_sma7 < current_sma9 and
-            current_sma9 < current_sma12 and
-            current_sma12 < current_sma17 and
-            current_sma17 < current_sma21 and
-            current_sma21 < current_sma27 and
-            current_sma27 < current_sma200
+            current_sma9 < current_sma12
         )
         
         return {
             "condition_met": condition_met,
             "current_close": current_close,
+            "sma5": current_sma5,
             "sma7": current_sma7,
             "sma9": current_sma9,
             "sma12": current_sma12,
-            "sma17": current_sma17,
-            "sma21": current_sma21,
-            "sma27": current_sma27,
-            "sma200": current_sma200,
-            "cascade_description": "close < SMA7 < SMA9 < SMA12 < SMA17 < SMA21 < SMA27 < SMA200"
+            "cascade_description": "close < SMA5 < SMA7 < SMA9 < SMA12"
         }
         
     except Exception as e:
-        print(f"Error in analyze_sma_cascade: {e}")
+        print(f"Error in analyze_sma_cascade_updated: {e}")
         return {"error": str(e), "condition_met": False}
 
 # =========================================================
@@ -1901,19 +1889,16 @@ try:
             print(f"Error analyzing thresholds (5m): {thresholds_5m_result['error']}")
             print(f"Condition Met: {conditions_status['thresholds_5m']}")
 
-        # Condition 11: SMA Cascade Condition
-        print("\n--- Condition 11: SMA Cascade Condition ---")
-        sma_cascade_result = analyze_sma_cascade(candles_1m)
+        # Condition 11: SMA Cascade Condition (UPDATED)
+        print("\n--- Condition 11: SMA Cascade Condition (UPDATED) ---")
+        sma_cascade_result = analyze_sma_cascade_updated(candles_1m)
         if 'error' not in sma_cascade_result:
             conditions_status["sma_cascade_condition"] = sma_cascade_result['condition_met']
             print(f"Current Close: {sma_cascade_result['current_close']:.2f}")
+            print(f"SMA5: {sma_cascade_result['sma5']:.2f}")
             print(f"SMA7: {sma_cascade_result['sma7']:.2f}")
             print(f"SMA9: {sma_cascade_result['sma9']:.2f}")
             print(f"SMA12: {sma_cascade_result['sma12']:.2f}")
-            print(f"SMA17: {sma_cascade_result['sma17']:.2f}")
-            print(f"SMA21: {sma_cascade_result['sma21']:.2f}")
-            print(f"SMA27: {sma_cascade_result['sma27']:.2f}")
-            print(f"SMA200: {sma_cascade_result['sma200']:.2f}")
             print(f"Cascade Description: {sma_cascade_result['cascade_description']}")
             print(f"Condition Met: {conditions_status['sma_cascade_condition']}")
         else:
