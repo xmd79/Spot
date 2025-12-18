@@ -10,6 +10,7 @@ import math
 from decimal import Decimal, getcontext
 import pandas as pd
 import warnings
+import os
 
 # Set Decimal precision to 25
 getcontext().prec = 25
@@ -42,15 +43,17 @@ CONFIG = {
     "conditions": {
         "momentum_positive_1m": True,
         "momentum_positive_15sec": True,
-        "double_bottom_pattern_15s": True,
+        "thresholds_15s": True,  # Replaced double_bottom_pattern_15s
         "linear_regression_channel_break": True,
         "fft_prediction_1m": True,
         "fft_aroon_ml_reversal": True,
-        "volume_bias_condition": True,  # New condition to replace ema_crossover_orderflow
-        "double_bottom_pattern_1m": True,
-        "sma_cascade_condition": True,  # New condition for SMA cascade
+        "volume_bias_condition": True,
+        "thresholds_1m": True,  # Replaced double_bottom_pattern_1m
+        "thresholds_3m": True,  # New condition for 3m timeframe
+        "thresholds_5m": True,  # New condition for 5m timeframe
+        "sma_cascade_condition": True,
     },
-    "min_conditions_met": 9
+    "min_conditions_met": 11  # Updated to 11 conditions
 }
 
 # Global variables for market state tracking
@@ -73,33 +76,6 @@ timeframe_extrema = {
 # =========================================================
 # UTILITY FUNCTIONS
 # =========================================================
-
-def log_signal_data(current_time, current_price):
-    """
-    Log signal data to a text file when all conditions are met.
-    
-    Args:
-        current_time: Current datetime
-        current_price: Current price of the asset
-    """
-    try:
-        # Log file in the same directory as the script
-        log_file = "signals.txt"
-        
-        # Format the timestamp
-        timestamp = current_time.strftime("%Y-%m-%d %H:%M:%S")
-        
-        # Prepare the log entry with only timestamp and price
-        log_entry = f"{timestamp} - Signal Triggered at Price: {current_price:.25f}\n"
-        
-        # Write to the log file
-        with open(log_file, "a") as f:
-            f.write(log_entry)
-        
-        print(f"Signal data logged to {log_file}")
-        
-    except Exception as e:
-        print(f"Error logging signal data: {e}")
 
 def get_symbol_lot_size_info(symbol):
     try:
@@ -308,6 +284,34 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
     print(f"Exit Check: Current Price: {current_price:.25f}, Target Price: {target_price:.25f}, Current Value: {current_value:.25f}, Target Value: {target_value:.25f}")
     return current_price >= target_price
 
+def save_signal_to_file(signal_data):
+    """
+    Save signal data to a file when all conditions are met.
+    
+    Args:
+        signal_data: Dictionary containing signal information
+    """
+    try:
+        # Create the file if it doesn't exist
+        if not os.path.exists("signals.txt"):
+            with open("signals.txt", "w") as f:
+                f.write("TIMESTAMP,SYMBOL,PRICE,SIGNAL,CONDITIONS_MET\n")
+        
+        # Format the data for CSV
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        symbol = TRADE_SYMBOL
+        price = signal_data.get("current_price", "N/A")
+        signal = signal_data.get("signal", "N/A")
+        conditions_met = signal_data.get("conditions_met", "N/A")
+        
+        # Write to file
+        with open("signals.txt", "a") as f:
+            f.write(f"{timestamp},{symbol},{price},{signal},{conditions_met}\n")
+        
+        print(f"Signal saved to signals.txt: {timestamp} - {signal}")
+    except Exception as e:
+        print(f"Error saving signal to file: {e}")
+
 # =========================================================
 # VOLUME BIAS ANALYSIS FUNCTION
 # =========================================================
@@ -435,6 +439,167 @@ def analyze_sma_cascade(candles):
         return {"error": str(e), "condition_met": False}
 
 # =========================================================
+# NEW THRESHOLDS ANALYSIS FUNCTION
+# =========================================================
+
+def analyze_thresholds_by_timeframe(candles, timeframe):
+    """
+    Analyze price position relative to calculated thresholds for a specific timeframe.
+    
+    Args:
+        candles: List of candle data
+        timeframe: String identifier for the timeframe
+        
+    Returns:
+        Dictionary with analysis results for the specified timeframe
+    """
+    try:
+        if not candles:
+            return {"error": f"No {timeframe} data provided", "condition_met": False}
+        
+        # Extract close prices
+        close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
+        
+        if len(close_prices) < 14:
+            return {"error": f"Insufficient data for {timeframe} analysis", "condition_met": False}
+        
+        # Find argmin and argmax in the last 1200 values (or all if less)
+        lookback = min(1200, len(close_prices))
+        recent_closes = close_prices[-lookback:]
+        
+        # Find indices of min and max in the recent window
+        min_idx = np.argmin(recent_closes)
+        max_idx = np.argmax(recent_closes)
+        
+        # Calculate actual indices in the full array
+        actual_min_idx = len(close_prices) - lookback + min_idx
+        actual_max_idx = len(close_prices) - lookback + max_idx
+        
+        # Get values
+        min_value = recent_closes[min_idx]
+        max_value = recent_closes[max_idx]
+        
+        # Get current price
+        current_price = close_prices[-1]
+        
+        # Calculate the hilo range between argmin and argmax
+        hilo_range = max_value - min_value
+        
+        # Calculate distance from current price to min and max
+        dist_to_min = current_price - min_value
+        dist_to_max = max_value - current_price
+        
+        # Calculate percentage distances
+        percent_to_min = (dist_to_min / hilo_range) * 100 if hilo_range > 0 else 0
+        percent_to_max = (dist_to_max / hilo_range) * 100 if hilo_range > 0 else 0
+        
+        # Condition is met if dist_to_min < dist_to_max
+        condition_met = dist_to_min < dist_to_max
+        
+        return {
+            "timeframe": timeframe,
+            "condition_met": condition_met,
+            "current_price": current_price,
+            "min_value": min_value,
+            "max_value": max_value,
+            "min_idx": actual_min_idx,
+            "max_idx": actual_max_idx,
+            "hilo_range": hilo_range,
+            "dist_to_min": dist_to_min,
+            "dist_to_max": dist_to_max,
+            "percent_to_min": percent_to_min,
+            "percent_to_max": percent_to_max,
+            "description": f"Distance to min ({dist_to_min:.2f}) is {'less than' if condition_met else 'greater than'} distance to max ({dist_to_max:.2f})"
+        }
+        
+    except Exception as e:
+        print(f"Error analyzing thresholds ({timeframe}): {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "condition_met": False}
+
+def analyze_thresholds_15s(candles_1m):
+    """
+    Analyze price position relative to calculated thresholds in 15-second timeframe.
+    
+    Args:
+        candles_1m: List of 1-minute candle data
+        
+    Returns:
+        Dictionary with analysis results for 15s timeframe
+    """
+    try:
+        if not candles_1m:
+            return {"error": "No 1m data provided", "condition_met": False}
+        
+        df_1m = pd.DataFrame(candles_1m)
+        df_1m['timestamp'] = pd.to_datetime(df_1m['time'], unit='s').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
+        
+        df_15s = generate_15s_data_from_1m(df_1m)
+        if df_15s is None or df_15s.empty:
+            return {"error": "Failed to generate 15s data", "condition_met": False}
+        
+        candles_15s = []
+        for idx, row in df_15s.iterrows():
+            candles_15s.append({
+                "time": int(row['timestamp'].timestamp()),
+                "open": float(row['open']),
+                "high": float(row['high']),
+                "low": float(row['low']),
+                "close": float(row['close']),
+                "volume": float(row['volume']),
+                "timeframe": "15s"
+            })
+        
+        # Call the threshold analysis function for 15s timeframe
+        return analyze_thresholds_by_timeframe(candles_15s, "15s")
+        
+    except Exception as e:
+        print(f"Error analyzing thresholds (15s): {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "condition_met": False}
+
+def analyze_thresholds_1m(candles_1m):
+    """
+    Analyze price position relative to calculated thresholds in 1-minute timeframe.
+    
+    Args:
+        candles_1m: List of 1-minute candle data
+        
+    Returns:
+        Dictionary with analysis results for 1m timeframe
+    """
+    # Call the threshold analysis function for 1m timeframe
+    return analyze_thresholds_by_timeframe(candles_1m, "1m")
+
+def analyze_thresholds_3m(candles_3m):
+    """
+    Analyze price position relative to calculated thresholds in 3-minute timeframe.
+    
+    Args:
+        candles_3m: List of 3-minute candle data
+        
+    Returns:
+        Dictionary with analysis results for 3m timeframe
+    """
+    # Call the threshold analysis function for 3m timeframe
+    return analyze_thresholds_by_timeframe(candles_3m, "3m")
+
+def analyze_thresholds_5m(candles_5m):
+    """
+    Analyze price position relative to calculated thresholds in 5-minute timeframe.
+    
+    Args:
+        candles_5m: List of 5-minute candle data
+        
+    Returns:
+        Dictionary with analysis results for 5m timeframe
+    """
+    # Call the threshold analysis function for 5m timeframe
+    return analyze_thresholds_by_timeframe(candles_5m, "5m")
+
+# =========================================================
 # ENHANCED TECHNICAL ANALYSIS FUNCTIONS
 # =========================================================
 
@@ -467,13 +632,13 @@ def calculate_extrema_with_indices(prices, period=14):
     
     return recent_high, recent_low, periods_since_high, periods_since_low, actual_high_idx, actual_low_idx
 
-def calculate_thresholds_with_extrema(close_prices, period=14, minimum_percentage=3, maximum_percentage=3):
+def calculate_thresholds_with_extrema(close_prices, period=14):
     """
     Calculate thresholds using recent extrema with indices.
     """
     try:
         if len(close_prices) < period:
-            return None, None, None, None, None, None, None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None, None
         
         # Calculate recent extrema with indices
         recent_high, recent_low, periods_since_high, periods_since_low, high_idx, low_idx = calculate_extrema_with_indices(close_prices, period)
@@ -482,41 +647,11 @@ def calculate_thresholds_with_extrema(close_prices, period=14, minimum_percentag
             return None, None, None, None, None, None, None, None, None, None
         
         # Calculate thresholds based on recent extrema
-        min_percentage = Decimal(str(minimum_percentage)) / Decimal('100')
-        max_percentage = Decimal(str(maximum_percentage)) / Decimal('100')
+        min_threshold = recent_low
+        max_threshold = recent_high
         
         # Middle threshold (average of recent high and low)
-        middle_threshold = Decimal(str((recent_high + recent_low) / 2))
-        
-        # Dynamic thresholds based on volatility
-        recent_range = recent_high - recent_low
-        min_threshold = Decimal(str(recent_low - (recent_range * float(min_percentage))))
-        max_threshold = Decimal(str(recent_high + (recent_range * float(max_percentage))))
-        
-        # Calculate momentum
-        close_array = np.array(close_prices, dtype=np.float64)
-        momentum = talib.MOM(close_array, timeperiod=period)
-        
-        # Find momentum extremes
-        if len(momentum) >= period:
-            recent_momentum = momentum[-period:]
-            recent_max_momentum_idx = np.argmax(recent_momentum)
-            recent_min_momentum_idx = np.argmin(recent_momentum)
-            recent_max_momentum = Decimal(str(momentum[len(momentum) - period + recent_max_momentum_idx]))
-            recent_min_momentum = Decimal(str(momentum[len(momentum) - period + recent_min_momentum_idx]))
-        else:
-            recent_max_momentum = Decimal(str(np.nanmax(momentum)))
-            recent_min_momentum = Decimal(str(np.nanmin(momentum)))
-        
-        current_momentum = Decimal(str(momentum[-1])) if len(momentum) > 0 else Decimal('0')
-        
-        # Calculate momentum percentages
-        if recent_max_momentum != recent_min_momentum:
-            percent_to_min_momentum = (recent_max_momentum - current_momentum) / (recent_max_momentum - recent_min_momentum) * Decimal('100')
-            percent_to_max_momentum = (current_momentum - recent_min_momentum) / (recent_max_momentum - recent_min_momentum) * Decimal('100')
-        else:
-            percent_to_min_momentum = Decimal('50')
-            percent_to_max_momentum = Decimal('50')
+        middle_threshold = (recent_high + recent_low) / 2
         
         return (
             min_threshold, 
@@ -524,8 +659,6 @@ def calculate_thresholds_with_extrema(close_prices, period=14, minimum_percentag
             middle_threshold,
             periods_since_high,
             periods_since_low,
-            percent_to_min_momentum,
-            percent_to_max_momentum,
             high_idx,
             low_idx
         )
@@ -545,12 +678,12 @@ def enhanced_aroon(high, low, close, period=14):
         # Calculate thresholds to get recent indices
         thresholds = calculate_thresholds_with_extrema(close, period)
         
-        if thresholds[7] is not None and thresholds[8] is not None:
+        if thresholds[6] is not None and thresholds[7] is not None:
             # Use indices from threshold calculation
             periods_since_high = thresholds[3]
             periods_since_low = thresholds[4]
-            recent_high_idx = thresholds[7]
-            recent_low_idx = thresholds[8]
+            recent_high_idx = thresholds[6]
+            recent_low_idx = thresholds[7]
         else:
             # Fallback to standard calculation
             recent_high, recent_low, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = calculate_extrema_with_indices(close, period)
@@ -758,202 +891,6 @@ def analyze_momentum_15sec(candles_1m):
     except Exception as e:
         print(f"Error analyzing momentum (15s): {e}")
         return {"error": str(e)}
-
-def analyze_double_bottom_pattern(candles, timeframe="15s"):
-    """
-    Analyze double bottom and double top patterns in the given candle data.
-    
-    Args:
-        candles: List of candle data
-        timeframe: Timeframe identifier for output
-        
-    Returns:
-        Dictionary with analysis results and pattern detection
-    """
-    try:
-        if not candles or len(candles) < 20:
-            return {"error": "Insufficient data for pattern analysis", "condition_met": False}
-        
-        # Extract close prices
-        close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
-        low_prices = np.array([candle["low"] for candle in candles], dtype=np.float64)
-        high_prices = np.array([candle["high"] for candle in candles], dtype=np.float64)
-        
-        # Find argmin and argmax in the last 1200 values (or all if less)
-        lookback = min(1200, len(close_prices))
-        recent_closes = close_prices[-lookback:]
-        recent_lows = low_prices[-lookback:]
-        recent_highs = high_prices[-lookback:]
-        
-        # Find indices of min and max in the recent window
-        min_idx = np.argmin(recent_lows)
-        max_idx = np.argmax(recent_highs)
-        
-        # Calculate actual indices in the full array
-        actual_min_idx = len(close_prices) - lookback + min_idx
-        actual_max_idx = len(close_prices) - lookback + max_idx
-        
-        # Get values
-        min_value = recent_lows[min_idx]
-        max_value = recent_highs[max_idx]
-        
-        # Determine which is more recent
-        current_idx = len(close_prices) - 1
-        periods_since_min = current_idx - actual_min_idx
-        periods_since_max = current_idx - actual_max_idx
-        
-        # Initialize result variables
-        double_bottom = False
-        double_top = False
-        condition_met = False
-        pattern_description = "No pattern detected"
-        
-        # Check if min is more recent than max (potential double bottom)
-        if periods_since_min < periods_since_max:
-            # Look for the second lowest dip after argmin (not the last low)
-            # Find all dips after the first min
-            dips_after_min = []
-            for i in range(actual_min_idx + 1, len(close_prices)):
-                dips_after_min.append(recent_lows[i - (len(close_prices) - lookback)])
-            
-            # Find the second lowest dip (not the last low)
-            if len(dips_after_min) > 1:
-                # Sort the dips to find the second lowest
-                sorted_dips = sorted(dips_after_min)
-                # The second lowest dip (not the absolute lowest which would be min_value)
-                second_lowest_dip = sorted_dips[1] if len(sorted_dips) > 1 else sorted_dips[0]
-                
-                # Find the index of this second lowest dip
-                second_lowest_idx = None
-                for i in range(actual_min_idx + 1, len(close_prices)):
-                    if abs(recent_lows[i - (len(close_prices) - lookback)] - second_lowest_dip) < 0.0001:  # Small tolerance for floating point comparison
-                        second_lowest_idx = i
-                        break
-                
-                if second_lowest_idx is not None:
-                    # Calculate the percentage difference between the two lows
-                    low_diff_pct = ((second_lowest_dip - min_value) / min_value) * 100 if min_value > 0 else 0
-                    
-                    double_bottom = True
-                    condition_met = True
-                    pattern_description = f"Double bottom pattern detected. First low: {min_value:.2f} at index {actual_min_idx}, Second low: {second_lowest_dip:.2f} at index {second_lowest_idx}, Difference: {low_diff_pct:.2f}%"
-        
-        # Check if max is more recent than min (potential double top)
-        elif periods_since_max < periods_since_min:
-            # Look for the second highest peak after argmax (not the last high)
-            # Find all peaks after the first max
-            peaks_after_max = []
-            for i in range(actual_max_idx + 1, len(close_prices)):
-                peaks_after_max.append(recent_highs[i - (len(close_prices) - lookback)])
-            
-            # Find the second highest peak (not the last high)
-            if len(peaks_after_max) > 1:
-                # Sort the peaks to find the second highest
-                sorted_peaks = sorted(peaks_after_max, reverse=True)
-                # The second highest peak (not the absolute highest which would be max_value)
-                second_highest_peak = sorted_peaks[1] if len(sorted_peaks) > 1 else sorted_peaks[0]
-                
-                # Find the index of this second highest peak
-                second_highest_idx = None
-                for i in range(actual_max_idx + 1, len(close_prices)):
-                    if abs(recent_highs[i - (len(close_prices) - lookback)] - second_highest_peak) < 0.0001:  # Small tolerance for floating point comparison
-                        second_highest_idx = i
-                        break
-                
-                if second_highest_idx is not None:
-                    # Calculate the percentage difference between the two highs
-                    high_diff_pct = ((max_value - second_highest_peak) / max_value) * 100 if max_value > 0 else 0
-                    
-                    double_top = True
-                    condition_met = False  # Always false for double top
-                    pattern_description = f"Double top pattern detected. First high: {max_value:.2f} at index {actual_max_idx}, Second high: {second_highest_peak:.2f} at index {second_highest_idx}, Difference: {high_diff_pct:.2f}%"
-        
-        return {
-            "timeframe": timeframe,
-            "condition_met": condition_met,
-            "double_bottom": double_bottom,
-            "double_top": double_top,
-            "pattern_description": pattern_description,
-            "min_value": min_value,
-            "max_value": max_value,
-            "min_idx": actual_min_idx,
-            "max_idx": actual_max_idx,
-            "periods_since_min": periods_since_min,
-            "periods_since_max": periods_since_max,
-            "current_price": close_prices[-1],
-            "lookback_period": lookback
-        }
-        
-    except Exception as e:
-        print(f"Error in analyze_double_bottom_pattern: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "condition_met": False}
-
-def analyze_double_bottom_pattern_15s(candles_1m):
-    """
-    Analyze double bottom pattern in 15-second timeframe.
-    
-    Args:
-        candles_1m: List of 1-minute candle data
-        
-    Returns:
-        Dictionary with analysis results for 15s timeframe
-    """
-    try:
-        if not candles_1m:
-            return {"error": "No 1m data provided", "condition_met": False}
-        
-        df_1m = pd.DataFrame(candles_1m)
-        df_1m['timestamp'] = pd.to_datetime(df_1m['time'], unit='s').dt.tz_localize('UTC').dt.tz_convert(LOCAL_TIMEZONE)
-        
-        df_15s = generate_15s_data_from_1m(df_1m)
-        if df_15s is None or df_15s.empty:
-            return {"error": "Failed to generate 15s data", "condition_met": False}
-        
-        candles_15s = []
-        for idx, row in df_15s.iterrows():
-            candles_15s.append({
-                "time": int(row['timestamp'].timestamp()),
-                "open": float(row['open']),
-                "high": float(row['high']),
-                "low": float(row['low']),
-                "close": float(row['close']),
-                "volume": float(row['volume']),
-                "timeframe": "15s"
-            })
-        
-        # Call the general pattern analysis function with 15s candles
-        return analyze_double_bottom_pattern(candles_15s, "15s")
-        
-    except Exception as e:
-        print(f"Error analyzing double bottom pattern (15s): {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "condition_met": False}
-
-def analyze_double_bottom_pattern_1m(candles_1m):
-    """
-    Analyze double bottom pattern in 1-minute timeframe.
-    
-    Args:
-        candles_1m: List of 1-minute candle data
-        
-    Returns:
-        Dictionary with analysis results for 1m timeframe
-    """
-    try:
-        if not candles_1m:
-            return {"error": "No 1m data provided", "condition_met": False}
-        
-        # Call the general pattern analysis function with 1m candles
-        return analyze_double_bottom_pattern(candles_1m, "1m")
-        
-    except Exception as e:
-        print(f"Error analyzing double bottom pattern (1m): {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "condition_met": False}
 
 def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0):
     try:
@@ -1741,13 +1678,15 @@ try:
         conditions_status = {
             "momentum_positive_1m": False,
             "momentum_positive_15sec": False,
-            "double_bottom_pattern_15s": False,
+            "thresholds_15s": False,  # Replaced double_bottom_pattern_15s
             "linear_regression_channel_break": False,
             "fft_prediction_1m": False,
             "fft_aroon_ml_reversal": False,
-            "volume_bias_condition": False,  # New condition to replace ema_crossover_orderflow
-            "double_bottom_pattern_1m": False,
-            "sma_cascade_condition": False,  # New condition for SMA cascade
+            "volume_bias_condition": False,
+            "thresholds_1m": False,  # Replaced double_bottom_pattern_1m
+            "thresholds_3m": False,  # New condition for 3m timeframe
+            "thresholds_5m": False,  # New condition for 5m timeframe
+            "sma_cascade_condition": False,
         }
 
         # Print conditions in order
@@ -1781,24 +1720,25 @@ try:
             print(f"Error analyzing momentum (15s): {momentum_15s_result['error']}")
             print(f"Condition Met: {conditions_status['momentum_positive_15sec']}")
         
-        # Condition 3: Double Bottom Pattern (15s)
-        print("\n--- Condition 3: Double Bottom Pattern (15s) ---")
-        double_bottom_15s_result = analyze_double_bottom_pattern_15s(candles_1m)
-        if 'error' not in double_bottom_15s_result:
-            conditions_status["double_bottom_pattern_15s"] = double_bottom_15s_result['condition_met']
-            print(f"Timeframe: {double_bottom_15s_result['timeframe']}")
-            print(f"Current Price: {double_bottom_15s_result['current_price']:.2f}")
-            print(f"Min Value: {double_bottom_15s_result['min_value']:.2f} at index {double_bottom_15s_result['min_idx']}")
-            print(f"Max Value: {double_bottom_15s_result['max_value']:.2f} at index {double_bottom_15s_result['max_idx']}")
-            print(f"Periods Since Min: {double_bottom_15s_result['periods_since_min']}")
-            print(f"Periods Since Max: {double_bottom_15s_result['periods_since_max']}")
-            print(f"Double Bottom: {double_bottom_15s_result['double_bottom']}")
-            print(f"Double Top: {double_bottom_15s_result['double_top']}")
-            print(f"Pattern Description: {double_bottom_15s_result['pattern_description']}")
-            print(f"Condition Met: {conditions_status['double_bottom_pattern_15s']}")
+        # Condition 3: Thresholds Analysis (15s)
+        print("\n--- Condition 3: Thresholds Analysis (15s) ---")
+        thresholds_15s_result = analyze_thresholds_15s(candles_1m)
+        if 'error' not in thresholds_15s_result:
+            conditions_status["thresholds_15s"] = thresholds_15s_result['condition_met']
+            print(f"Timeframe: {thresholds_15s_result['timeframe']}")
+            print(f"Current Price: {thresholds_15s_result['current_price']:.2f}")
+            print(f"Min Value: {thresholds_15s_result['min_value']:.2f} at index {thresholds_15s_result['min_idx']}")
+            print(f"Max Value: {thresholds_15s_result['max_value']:.2f} at index {thresholds_15s_result['max_idx']}")
+            print(f"HiLo Range: {thresholds_15s_result['hilo_range']:.2f}")
+            print(f"Distance to Min: {thresholds_15s_result['dist_to_min']:.2f}")
+            print(f"Distance to Max: {thresholds_15s_result['dist_to_max']:.2f}")
+            print(f"Percent to Min: {thresholds_15s_result['percent_to_min']:.2f}%")
+            print(f"Percent to Max: {thresholds_15s_result['percent_to_max']:.2f}%")
+            print(f"Description: {thresholds_15s_result['description']}")
+            print(f"Condition Met: {conditions_status['thresholds_15s']}")
         else:
-            print(f"Error analyzing double bottom pattern (15s): {double_bottom_15s_result['error']}")
-            print(f"Condition Met: {conditions_status['double_bottom_pattern_15s']}")
+            print(f"Error analyzing thresholds (15s): {thresholds_15s_result['error']}")
+            print(f"Condition Met: {conditions_status['thresholds_15s']}")
         
         # Condition 4: Linear Regression Channel Break
         print("\n--- Condition 4: Linear Regression Channel Break ---")
@@ -1894,27 +1834,68 @@ try:
             print(f"Error analyzing volume bias: {volume_bias_result['error']}")
             print(f"Condition Met: {conditions_status['volume_bias_condition']}")
 
-        # Condition 8: Double Bottom Pattern (1m)
-        print("\n--- Condition 8: Double Bottom Pattern (1m) ---")
-        double_bottom_1m_result = analyze_double_bottom_pattern_1m(candles_1m)
-        if 'error' not in double_bottom_1m_result:
-            conditions_status["double_bottom_pattern_1m"] = double_bottom_1m_result['condition_met']
-            print(f"Timeframe: {double_bottom_1m_result['timeframe']}")
-            print(f"Current Price: {double_bottom_1m_result['current_price']:.2f}")
-            print(f"Min Value: {double_bottom_1m_result['min_value']:.2f} at index {double_bottom_1m_result['min_idx']}")
-            print(f"Max Value: {double_bottom_1m_result['max_value']:.2f} at index {double_bottom_1m_result['max_idx']}")
-            print(f"Periods Since Min: {double_bottom_1m_result['periods_since_min']}")
-            print(f"Periods Since Max: {double_bottom_1m_result['periods_since_max']}")
-            print(f"Double Bottom: {double_bottom_1m_result['double_bottom']}")
-            print(f"Double Top: {double_bottom_1m_result['double_top']}")
-            print(f"Pattern Description: {double_bottom_1m_result['pattern_description']}")
-            print(f"Condition Met: {conditions_status['double_bottom_pattern_1m']}")
+        # Condition 8: Thresholds Analysis (1m)
+        print("\n--- Condition 8: Thresholds Analysis (1m) ---")
+        thresholds_1m_result = analyze_thresholds_1m(candles_1m)
+        if 'error' not in thresholds_1m_result:
+            conditions_status["thresholds_1m"] = thresholds_1m_result['condition_met']
+            print(f"Timeframe: {thresholds_1m_result['timeframe']}")
+            print(f"Current Price: {thresholds_1m_result['current_price']:.2f}")
+            print(f"Min Value: {thresholds_1m_result['min_value']:.2f} at index {thresholds_1m_result['min_idx']}")
+            print(f"Max Value: {thresholds_1m_result['max_value']:.2f} at index {thresholds_1m_result['max_idx']}")
+            print(f"HiLo Range: {thresholds_1m_result['hilo_range']:.2f}")
+            print(f"Distance to Min: {thresholds_1m_result['dist_to_min']:.2f}")
+            print(f"Distance to Max: {thresholds_1m_result['dist_to_max']:.2f}")
+            print(f"Percent to Min: {thresholds_1m_result['percent_to_min']:.2f}%")
+            print(f"Percent to Max: {thresholds_1m_result['percent_to_max']:.2f}%")
+            print(f"Description: {thresholds_1m_result['description']}")
+            print(f"Condition Met: {conditions_status['thresholds_1m']}")
         else:
-            print(f"Error analyzing double bottom pattern (1m): {double_bottom_1m_result['error']}")
-            print(f"Condition Met: {conditions_status['double_bottom_pattern_1m']}")
+            print(f"Error analyzing thresholds (1m): {thresholds_1m_result['error']}")
+            print(f"Condition Met: {conditions_status['thresholds_1m']}")
+            
+        # Condition 9: Thresholds Analysis (3m)
+        print("\n--- Condition 9: Thresholds Analysis (3m) ---")
+        thresholds_3m_result = analyze_thresholds_3m(candle_map.get('3m', []))
+        if 'error' not in thresholds_3m_result:
+            conditions_status["thresholds_3m"] = thresholds_3m_result['condition_met']
+            print(f"Timeframe: {thresholds_3m_result['timeframe']}")
+            print(f"Current Price: {thresholds_3m_result['current_price']:.2f}")
+            print(f"Min Value: {thresholds_3m_result['min_value']:.2f} at index {thresholds_3m_result['min_idx']}")
+            print(f"Max Value: {thresholds_3m_result['max_value']:.2f} at index {thresholds_3m_result['max_idx']}")
+            print(f"HiLo Range: {thresholds_3m_result['hilo_range']:.2f}")
+            print(f"Distance to Min: {thresholds_3m_result['dist_to_min']:.2f}")
+            print(f"Distance to Max: {thresholds_3m_result['dist_to_max']:.2f}")
+            print(f"Percent to Min: {thresholds_3m_result['percent_to_min']:.2f}%")
+            print(f"Percent to Max: {thresholds_3m_result['percent_to_max']:.2f}%")
+            print(f"Description: {thresholds_3m_result['description']}")
+            print(f"Condition Met: {conditions_status['thresholds_3m']}")
+        else:
+            print(f"Error analyzing thresholds (3m): {thresholds_3m_result['error']}")
+            print(f"Condition Met: {conditions_status['thresholds_3m']}")
+            
+        # Condition 10: Thresholds Analysis (5m)
+        print("\n--- Condition 10: Thresholds Analysis (5m) ---")
+        thresholds_5m_result = analyze_thresholds_5m(candle_map.get('5m', []))
+        if 'error' not in thresholds_5m_result:
+            conditions_status["thresholds_5m"] = thresholds_5m_result['condition_met']
+            print(f"Timeframe: {thresholds_5m_result['timeframe']}")
+            print(f"Current Price: {thresholds_5m_result['current_price']:.2f}")
+            print(f"Min Value: {thresholds_5m_result['min_value']:.2f} at index {thresholds_5m_result['min_idx']}")
+            print(f"Max Value: {thresholds_5m_result['max_value']:.2f} at index {thresholds_5m_result['max_idx']}")
+            print(f"HiLo Range: {thresholds_5m_result['hilo_range']:.2f}")
+            print(f"Distance to Min: {thresholds_5m_result['dist_to_min']:.2f}")
+            print(f"Distance to Max: {thresholds_5m_result['dist_to_max']:.2f}")
+            print(f"Percent to Min: {thresholds_5m_result['percent_to_min']:.2f}%")
+            print(f"Percent to Max: {thresholds_5m_result['percent_to_max']:.2f}%")
+            print(f"Description: {thresholds_5m_result['description']}")
+            print(f"Condition Met: {conditions_status['thresholds_5m']}")
+        else:
+            print(f"Error analyzing thresholds (5m): {thresholds_5m_result['error']}")
+            print(f"Condition Met: {conditions_status['thresholds_5m']}")
 
-        # Condition 9: SMA Cascade Condition
-        print("\n--- Condition 9: SMA Cascade Condition ---")
+        # Condition 11: SMA Cascade Condition
+        print("\n--- Condition 11: SMA Cascade Condition ---")
         sma_cascade_result = analyze_sma_cascade(candles_1m)
         if 'error' not in sma_cascade_result:
             conditions_status["sma_cascade_condition"] = sma_cascade_result['condition_met']
@@ -1951,6 +1932,15 @@ try:
         
         all_conditions_met = all(conditions_status.values())
         print(f"\nAll Conditions Met for Entry: {'Yes' if all_conditions_met else 'No'}")
+
+        # Save signal to file if all conditions are met
+        if all_conditions_met:
+            signal_data = {
+                "current_price": float(current_price),
+                "signal": "BUY",
+                "conditions_met": f"{true_conditions_count}/{len(conditions_status)}"
+            }
+            save_signal_to_file(signal_data)
 
         if position_open:
             print()
@@ -2039,9 +2029,6 @@ try:
 
             # Check if all conditions are met for entry
             if all_conditions_met:
-                # Log signal data before executing trade - only timestamp and price
-                log_signal_data(current_local_time, current_price)
-                
                 usdc_balance = get_balance('USDC')
                 if usdc_balance > Decimal('0'):
                     print(f"\n!!! ALL {CONFIG['min_conditions_met']} CONDITIONS MET - EXECUTING TRADE !!!")
