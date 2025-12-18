@@ -43,28 +43,23 @@ CONFIG = {
     "conditions": {
         "momentum_positive_1m": True,
         "momentum_positive_15sec": True,
-        "thresholds_15s": True,  # Replaced double_bottom_pattern_15s
+        "thresholds_15s": True,
         "linear_regression_channel_break": True,
         "fft_prediction_1m": True,
-        "fft_aroon_ml_reversal": True,
+        "aroon_only_signal": True,  # Updated to use the new Aroon-only function
         "volume_bias_condition": True,
-        "thresholds_1m": True,  # Replaced double_bottom_pattern_1m
-        "thresholds_3m": True,  # New condition for 3m timeframe
-        "thresholds_5m": True,  # New condition for 5m timeframe
+        "thresholds_1m": True,
+        "thresholds_3m": True,
+        "thresholds_5m": True,
         "sma_cascade_condition": True,
     },
-    "min_conditions_met": 11  # Updated to 11 conditions
+    "min_conditions_met": 11  # Total number of conditions to check
 }
 
 # Global variables for market state tracking
 last_reversal_type = None
 last_reversal_time = None
 current_major_trend = "UNKNOWN"
-last_major_high = None
-last_major_low = None
-resistance_level = None
-support_level = None
-market_cycle_position = 0
 
 # Variables for extrema tracking across timeframes
 timeframe_extrema = {
@@ -276,7 +271,6 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
         return False
     current_value = asset_balance * current_price
     
-    # Calculate the target value accounting for fees
     # To achieve 0.75% net profit after 0.22% fees, we need 0.75% + 0.22% = 0.97% gross profit
     target_value = initial_investment * Decimal('1.0097')  # 0.97% gross profit for 0.75% net profit
     target_price = target_value / asset_balance
@@ -285,26 +279,17 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
     return current_price >= target_price
 
 def save_signal_to_file(signal_data):
-    """
-    Save signal data to a file when all conditions are met.
-    
-    Args:
-        signal_data: Dictionary containing signal information
-    """
     try:
-        # Create the file if it doesn't exist
         if not os.path.exists("signals.txt"):
             with open("signals.txt", "w") as f:
                 f.write("TIMESTAMP,SYMBOL,PRICE,SIGNAL,CONDITIONS_MET\n")
         
-        # Format the data for CSV
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         symbol = TRADE_SYMBOL
         price = signal_data.get("current_price", "N/A")
         signal = signal_data.get("signal", "N/A")
         conditions_met = signal_data.get("conditions_met", "N/A")
         
-        # Write to file
         with open("signals.txt", "a") as f:
             f.write(f"{timestamp},{symbol},{price},{signal},{conditions_met}\n")
         
@@ -317,29 +302,17 @@ def save_signal_to_file(signal_data):
 # =========================================================
 
 def analyze_volume_bias(candles):
-    """
-    Analyze volume bias (bullish vs bearish) from candle data.
-    
-    Args:
-        candles: List of candle data
-        
-    Returns:
-        Dictionary with volume analysis results
-    """
     try:
         if not candles or len(candles) < 20:
             return {"error": "Insufficient data for volume analysis", "condition_met": False}
         
-        # Calculate bullish and bearish volume
         bullish_volume = 0
         bearish_volume = 0
         
         for candle in candles:
             if candle["close"] > candle["open"]:
-                # Green candle - bullish
                 bullish_volume += candle["volume"]
             else:
-                # Red candle - bearish
                 bearish_volume += candle["volume"]
         
         total_volume = bullish_volume + bearish_volume
@@ -367,75 +340,49 @@ def analyze_volume_bias(candles):
         return {"error": str(e), "condition_met": False}
 
 # =========================================================
-# SMA CASCADE ANALYSIS FUNCTION
+# UPDATED SMA CASCADE ANALYSIS FUNCTION
 # =========================================================
 
-def analyze_sma_cascade(candles):
-    """
-    Analyze SMA cascade condition: close < SMA7 < SMA9 < SMA12 < SMA17 < SMA21 < SMA27 < SMA200
-    
-    Args:
-        candles: List of candle data
-        
-    Returns:
-        Dictionary with SMA analysis results
-    """
+def analyze_sma_cascade_updated(candles):
     try:
-        if not candles or len(candles) < 200:
+        if not candles or len(candles) < 12:
             return {"error": "Insufficient data for SMA analysis", "condition_met": False}
         
-        # Extract close prices
         close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
         
-        # Calculate SMAs
+        sma5 = talib.SMA(close_prices, timeperiod=5)
         sma7 = talib.SMA(close_prices, timeperiod=7)
         sma9 = talib.SMA(close_prices, timeperiod=9)
         sma12 = talib.SMA(close_prices, timeperiod=12)
-        sma17 = talib.SMA(close_prices, timeperiod=17)
-        sma21 = talib.SMA(close_prices, timeperiod=21)
-        sma27 = talib.SMA(close_prices, timeperiod=27)
-        sma200 = talib.SMA(close_prices, timeperiod=200)
         
-        # Get current values
         current_close = close_prices[-1]
+        current_sma5 = sma5[-1] if not np.isnan(sma5[-1]) else None
         current_sma7 = sma7[-1] if not np.isnan(sma7[-1]) else None
         current_sma9 = sma9[-1] if not np.isnan(sma9[-1]) else None
         current_sma12 = sma12[-1] if not np.isnan(sma12[-1]) else None
-        current_sma17 = sma17[-1] if not np.isnan(sma17[-1]) else None
-        current_sma21 = sma21[-1] if not np.isnan(sma21[-1]) else None
-        current_sma27 = sma27[-1] if not np.isnan(sma27[-1]) else None
-        current_sma200 = sma200[-1] if not np.isnan(sma200[-1]) else None
         
-        # Check if all SMAs are valid
-        if None in [current_sma7, current_sma9, current_sma12, current_sma17, current_sma21, current_sma27, current_sma200]:
+        if None in [current_sma5, current_sma7, current_sma9, current_sma12]:
             return {"error": "Insufficient data for SMA calculation", "condition_met": False}
         
-        # Check cascade condition
         condition_met = (
-            current_close < current_sma7 and
+            current_close < current_sma5 and
+            current_sma5 < current_sma7 and
             current_sma7 < current_sma9 and
-            current_sma9 < current_sma12 and
-            current_sma12 < current_sma17 and
-            current_sma17 < current_sma21 and
-            current_sma21 < current_sma27 and
-            current_sma27 < current_sma200
+            current_sma9 < current_sma12
         )
         
         return {
             "condition_met": condition_met,
             "current_close": current_close,
+            "sma5": current_sma5,
             "sma7": current_sma7,
             "sma9": current_sma9,
             "sma12": current_sma12,
-            "sma17": current_sma17,
-            "sma21": current_sma21,
-            "sma27": current_sma27,
-            "sma200": current_sma200,
-            "cascade_description": "close < SMA7 < SMA9 < SMA12 < SMA17 < SMA21 < SMA27 < SMA200"
+            "cascade_description": "close < SMA5 < SMA7 < SMA9 < SMA12"
         }
         
     except Exception as e:
-        print(f"Error in analyze_sma_cascade: {e}")
+        print(f"Error in analyze_sma_cascade_updated: {e}")
         return {"error": str(e), "condition_met": False}
 
 # =========================================================
@@ -443,57 +390,37 @@ def analyze_sma_cascade(candles):
 # =========================================================
 
 def analyze_thresholds_by_timeframe(candles, timeframe):
-    """
-    Analyze price position relative to calculated thresholds for a specific timeframe.
-    
-    Args:
-        candles: List of candle data
-        timeframe: String identifier for the timeframe
-        
-    Returns:
-        Dictionary with analysis results for the specified timeframe
-    """
     try:
         if not candles:
             return {"error": f"No {timeframe} data provided", "condition_met": False}
         
-        # Extract close prices
         close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
         
         if len(close_prices) < 14:
             return {"error": f"Insufficient data for {timeframe} analysis", "condition_met": False}
         
-        # Find argmin and argmax in the last 1200 values (or all if less)
         lookback = min(1200, len(close_prices))
         recent_closes = close_prices[-lookback:]
         
-        # Find indices of min and max in the recent window
         min_idx = np.argmin(recent_closes)
         max_idx = np.argmax(recent_closes)
         
-        # Calculate actual indices in the full array
         actual_min_idx = len(close_prices) - lookback + min_idx
         actual_max_idx = len(close_prices) - lookback + max_idx
         
-        # Get values
         min_value = recent_closes[min_idx]
         max_value = recent_closes[max_idx]
         
-        # Get current price
         current_price = close_prices[-1]
         
-        # Calculate the hilo range between argmin and argmax
         hilo_range = max_value - min_value
         
-        # Calculate distance from current price to min and max
         dist_to_min = current_price - min_value
         dist_to_max = max_value - current_price
         
-        # Calculate percentage distances
         percent_to_min = (dist_to_min / hilo_range) * 100 if hilo_range > 0 else 0
         percent_to_max = (dist_to_max / hilo_range) * 100 if hilo_range > 0 else 0
         
-        # Condition is met if dist_to_min < dist_to_max
         condition_met = dist_to_min < dist_to_max
         
         return {
@@ -519,15 +446,6 @@ def analyze_thresholds_by_timeframe(candles, timeframe):
         return {"error": str(e), "condition_met": False}
 
 def analyze_thresholds_15s(candles_1m):
-    """
-    Analyze price position relative to calculated thresholds in 15-second timeframe.
-    
-    Args:
-        candles_1m: List of 1-minute candle data
-        
-    Returns:
-        Dictionary with analysis results for 15s timeframe
-    """
     try:
         if not candles_1m:
             return {"error": "No 1m data provided", "condition_met": False}
@@ -551,7 +469,6 @@ def analyze_thresholds_15s(candles_1m):
                 "timeframe": "15s"
             })
         
-        # Call the threshold analysis function for 15s timeframe
         return analyze_thresholds_by_timeframe(candles_15s, "15s")
         
     except Exception as e:
@@ -561,42 +478,12 @@ def analyze_thresholds_15s(candles_1m):
         return {"error": str(e), "condition_met": False}
 
 def analyze_thresholds_1m(candles_1m):
-    """
-    Analyze price position relative to calculated thresholds in 1-minute timeframe.
-    
-    Args:
-        candles_1m: List of 1-minute candle data
-        
-    Returns:
-        Dictionary with analysis results for 1m timeframe
-    """
-    # Call the threshold analysis function for 1m timeframe
     return analyze_thresholds_by_timeframe(candles_1m, "1m")
 
 def analyze_thresholds_3m(candles_3m):
-    """
-    Analyze price position relative to calculated thresholds in 3-minute timeframe.
-    
-    Args:
-        candles_3m: List of 3-minute candle data
-        
-    Returns:
-        Dictionary with analysis results for 3m timeframe
-    """
-    # Call the threshold analysis function for 3m timeframe
     return analyze_thresholds_by_timeframe(candles_3m, "3m")
 
 def analyze_thresholds_5m(candles_5m):
-    """
-    Analyze price position relative to calculated thresholds in 5-minute timeframe.
-    
-    Args:
-        candles_5m: List of 5-minute candle data
-        
-    Returns:
-        Dictionary with analysis results for 5m timeframe
-    """
-    # Call the threshold analysis function for 5m timeframe
     return analyze_thresholds_by_timeframe(candles_5m, "5m")
 
 # =========================================================
@@ -604,94 +491,36 @@ def analyze_thresholds_5m(candles_5m):
 # =========================================================
 
 def calculate_extrema_with_indices(prices, period=14):
-    """
-    Calculate recent highs and lows with their indices using argmax/argmin.
-    """
     if len(prices) < period:
         return None, None, None, None, None, None
     
-    # Get recent window
     recent_prices = prices[-period:]
     
-    # Find indices within the recent window
     recent_high_idx = np.argmax(recent_prices)
     recent_low_idx = np.argmin(recent_prices)
     
-    # Calculate actual indices in the full array
     actual_high_idx = len(prices) - period + recent_high_idx
     actual_low_idx = len(prices) - period + recent_low_idx
     
-    # Get values
     recent_high = prices[actual_high_idx]
     recent_low = prices[actual_low_idx]
     
-    # Calculate periods since high/low
     current_idx = len(prices) - 1
     periods_since_high = current_idx - actual_high_idx
     periods_since_low = current_idx - actual_low_idx
     
     return recent_high, recent_low, periods_since_high, periods_since_low, actual_high_idx, actual_low_idx
 
-def calculate_thresholds_with_extrema(close_prices, period=14):
-    """
-    Calculate thresholds using recent extrema with indices.
-    """
-    try:
-        if len(close_prices) < period:
-            return None, None, None, None, None, None, None
-        
-        # Calculate recent extrema with indices
-        recent_high, recent_low, periods_since_high, periods_since_low, high_idx, low_idx = calculate_extrema_with_indices(close_prices, period)
-        
-        if recent_high is None or recent_low is None:
-            return None, None, None, None, None, None, None
-        
-        # Calculate thresholds based on recent extrema
-        min_threshold = recent_low
-        max_threshold = recent_high
-        
-        # Middle threshold (average of recent high and low)
-        middle_threshold = (recent_high + recent_low) / 2
-        
-        return (
-            min_threshold, 
-            max_threshold, 
-            middle_threshold,
-            periods_since_high,
-            periods_since_low,
-            high_idx,
-            low_idx
-        )
-        
-    except Exception as e:
-        print(f"Error in calculate_thresholds_with_extrema: {e}")
-        return None, None, None, None, None, None, None
-
 def enhanced_aroon(high, low, close, period=14):
-    """
-    Enhanced Aroon calculation using recent extrema indices.
-    """
     try:
         if len(high) < period or len(low) < period:
             return None, None, None, None, None, None
         
-        # Calculate thresholds to get recent indices
-        thresholds = calculate_thresholds_with_extrema(close, period)
+        recent_high, recent_low, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = calculate_extrema_with_indices(close, period)
         
-        # Check if thresholds calculation was successful and has enough elements
-        if thresholds and len(thresholds) >= 7 and thresholds[5] is not None and thresholds[6] is not None:
-            # Use indices from threshold calculation
-            periods_since_high = thresholds[3]
-            periods_since_low = thresholds[4]
-            recent_high_idx = thresholds[5]
-            recent_low_idx = thresholds[6]
-        else:
-            # Fallback to standard calculation
-            _, _, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = calculate_extrema_with_indices(close, period)
+        if recent_high is None or recent_low is None:
+            return None, None, None, None, None, None
         
-        # Calculate Aroon values using the proper formula
-        # Aroon Up = ((period - periods_since_high) / period) * 100
-        # Aroon Down = ((period - periods_since_low) / period) * 100
         aroon_up = ((period - periods_since_high) / period) * 100
         aroon_down = ((period - periods_since_low) / period) * 100
         
@@ -704,13 +533,9 @@ def enhanced_aroon(high, low, close, period=14):
         return None, None, None, None, None, None
 
 def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=None):
-    """
-    Analyze extrema across multiple timeframes.
-    """
     global timeframe_extrema
     
     try:
-        # Analyze 1m timeframe
         close_1m = [c["close"] for c in candles_1m]
         high_1m = [c["high"] for c in candles_1m]
         low_1m = [c["low"] for c in candles_1m]
@@ -718,7 +543,6 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
         aroon_1m = enhanced_aroon(high_1m, low_1m, close_1m, period=14)
         
         if aroon_1m[0] is not None:
-            # Get recent high and low values directly from the high/low arrays with bounds checking
             recent_high = high_1m[aroon_1m[4]] if aroon_1m[4] is not None and 0 <= aroon_1m[4] < len(high_1m) else None
             recent_low = low_1m[aroon_1m[5]] if aroon_1m[5] is not None and 0 <= aroon_1m[5] < len(low_1m) else None
             
@@ -731,7 +555,6 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
                 'aroon_down': aroon_1m[1]
             }
         
-        # Analyze 3m timeframe if available
         if candles_3m and len(candles_3m) >= 14:
             close_3m = [c["close"] for c in candles_3m]
             high_3m = [c["high"] for c in candles_3m]
@@ -740,7 +563,6 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
             aroon_3m = enhanced_aroon(high_3m, low_3m, close_3m, period=14)
             
             if aroon_3m[0] is not None:
-                # Get recent high and low values directly from the high/low arrays with bounds checking
                 recent_high = high_3m[aroon_3m[4]] if aroon_3m[4] is not None and 0 <= aroon_3m[4] < len(high_3m) else None
                 recent_low = low_3m[aroon_3m[5]] if aroon_3m[5] is not None and 0 <= aroon_3m[5] < len(low_3m) else None
                 
@@ -753,7 +575,6 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
                     'aroon_down': aroon_3m[1]
                 }
         
-        # Analyze 5m timeframe if available
         if candles_5m and len(candles_5m) >= 14:
             close_5m = [c["close"] for c in candles_5m]
             high_5m = [c["high"] for c in candles_5m]
@@ -762,7 +583,6 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
             aroon_5m = enhanced_aroon(high_5m, low_5m, close_5m, period=14)
             
             if aroon_5m[0] is not None:
-                # Get recent high and low values directly from the high/low arrays with bounds checking
                 recent_high = high_5m[aroon_5m[4]] if aroon_5m[4] is not None and 0 <= aroon_5m[4] < len(high_5m) else None
                 recent_low = low_5m[aroon_5m[5]] if aroon_5m[5] is not None and 0 <= aroon_5m[5] < len(low_5m) else None
                 
@@ -926,7 +746,6 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
         above_upper = current_price > current_upper
         below_lower = current_price < current_lower
         
-        # Track all instances where price is below lower channel or above upper channel
         below_lower_indices = []
         above_upper_indices = []
         
@@ -936,13 +755,11 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
             if close_prices[i] > upper_channel[i]:
                 above_upper_indices.append(i)
         
-        # Find the most recent instances
         most_recent_below_lower = len(below_lower_indices) > 0
         most_recent_above_upper = len(above_upper_indices) > 0
         most_recent_below_lower_index = max(below_lower_indices) if below_lower_indices else None
         most_recent_above_upper_index = max(above_upper_indices) if above_upper_indices else None
         
-        # Determine if we're in an up cycle (most recent was below lower channel)
         up_cycle = False
         if most_recent_below_lower and most_recent_above_upper:
             up_cycle = most_recent_below_lower_index > most_recent_above_upper_index
@@ -967,8 +784,8 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
             "std_dev": std_dev,
             "period": period,
             "dev_multiplier": dev_multiplier,
-            "below_lower_indices": below_lower_indices[-10:] if len(below_lower_indices) > 0 else [],  # Last 10 instances
-            "above_upper_indices": above_upper_indices[-10:] if len(above_upper_indices) > 0 else []   # Last 10 instances
+            "below_lower_indices": below_lower_indices[-10:] if len(below_lower_indices) > 0 else [],
+            "above_upper_indices": above_upper_indices[-10:] if len(above_upper_indices) > 0 else []
         }
         
     except Exception as e:
@@ -985,39 +802,32 @@ def analyze_linear_regression_channel_break(candles_1m):
         if "error" in lrc_result:
             return lrc_result
         
-        # Get all instances of channel breaks
         below_lower_indices = lrc_result["below_lower_indices"]
         above_upper_indices = lrc_result["above_upper_indices"]
         
-        # Find the most recent occurrences (the one with the highest index)
         most_recent_below_lower_index = max(below_lower_indices) if below_lower_indices else None
         most_recent_above_upper_index = max(above_upper_indices) if above_upper_indices else None
         
-        # Determine which event was more recent to decide the cycle direction
         condition_met = False
         description = "No channel breaks detected in the analysis window."
         
-        # Determine which event was most recent
         is_most_recent_below_lower = False
         is_most_recent_above_upper = False
         
         if most_recent_below_lower_index is not None and most_recent_above_upper_index is not None:
-            # Both types of breaks occurred, compare which was more recent
             if most_recent_below_lower_index > most_recent_above_upper_index:
-                condition_met = True  # Most recent was below lower channel
+                condition_met = True
                 description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
                 is_most_recent_below_lower = True
             else:
-                condition_met = False  # Most recent was above upper channel
+                condition_met = False
                 description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
                 is_most_recent_above_upper = True
         elif most_recent_below_lower_index is not None:
-            # Only below lower channel breaks occurred
             condition_met = True
             description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
             is_most_recent_below_lower = True
         elif most_recent_above_upper_index is not None:
-            # Only above upper channel breaks occurred
             condition_met = False
             description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
             is_most_recent_above_upper = True
@@ -1029,11 +839,11 @@ def analyze_linear_regression_channel_break(candles_1m):
             "lower_channel": lrc_result["current_lower"],
             "above_upper": lrc_result["above_upper"],
             "below_lower": lrc_result["below_lower"],
-            "most_recent_below_lower": is_most_recent_below_lower,  # Fixed: Only true if this was the most recent event
-            "most_recent_above_upper": is_most_recent_above_upper,  # Fixed: Only true if this was the most recent event
+            "most_recent_below_lower": is_most_recent_below_lower,
+            "most_recent_above_upper": is_most_recent_above_upper,
             "most_recent_below_lower_index": most_recent_below_lower_index,
             "most_recent_above_upper_index": most_recent_above_upper_index,
-            "up_cycle": condition_met,  # True if condition is met
+            "up_cycle": condition_met,
             "description": description,
             "below_lower_indices": below_lower_indices[-10:] if len(below_lower_indices) > 0 else [],
             "above_upper_indices": above_upper_indices[-10:] if len(above_upper_indices) > 0 else []
@@ -1139,482 +949,58 @@ def analyze_fft_prediction_1m(candles_1m):
         print(f"Error analyzing FFT prediction: {e}")
         return {"error": str(e)}
 
-def fft_cycle_phase(close, keep_ratio=0.10):
-    close = np.asarray(close, dtype=np.float64)
-    n = len(close)
-
-    if n < 16:
-        return 0.0, 0.0
-
-    detrended = close - np.mean(close)
-    fft_vals = np.fft.fft(detrended)
-    magnitudes = np.abs(fft_vals)
-
-    threshold = np.quantile(magnitudes, 1 - keep_ratio)
-    fft_vals[magnitudes < threshold] = 0
-
-    cycle = np.real(np.fft.ifft(fft_vals))
-
-    cycle_value = cycle[-1]
-    cycle_slope = cycle[-1] - cycle[-2]
-
-    return cycle_value, cycle_slope
-
-def ml_reversal_probability(features):
-    # Adjusted weights to prevent extreme probabilities
-    weights = np.array([0.8, 0.6, 0.5, 0.4])  # Reduced weights
-    bias = 0.1  # Adjusted bias to center the probability
-
-    z = np.dot(weights, features) + bias
-    
-    # Apply a scaling factor to prevent extreme values
-    z = np.clip(z, -3, 3)  # Clip the value to prevent saturation
-    
-    probability = 1.0 / (1.0 + math.exp(-z))
-    
-    # Ensure probability is in a reasonable range
-    probability = np.clip(probability, 0.05, 0.95)  # Prevent extreme probabilities
-    
-    return probability
-
 # =========================================================
-# FIXED FFT + AROON + ML REVERSAL ANALYSIS
+# AROON-ONLY SIGNAL ANALYSIS FUNCTION
 # =========================================================
-
-def analyze_fft_aroon_ml_reversal(candles, aroon_period=14):
-    global timeframe_extrema, current_major_trend, last_major_high, last_major_low
-    
+def analyze_aroon_only_signal(candles, aroon_period=14):
+    """
+    Generates a definitive "UP" or "DOWN" signal based solely on the Aroon indicator.
+    - If Aroon Up > Aroon Down, signal is "UP" and condition_met is True.
+    - If Aroon Down > Aroon Up, signal is "DOWN" and condition_met is False.
+    """
     try:
-        if len(candles) < 50:
-            return {"error": "Not enough candles", "condition_met": False}
+        if not candles or len(candles) < aroon_period + 1:
+            return {"error": "Insufficient data for Aroon analysis", "condition_met": False, "signal": "DOWN"}
 
         close = [c["close"] for c in candles]
         high = [c["high"] for c in candles]
         low = [c["low"] for c in candles]
+        current_price = close[-1]
         
-        current_time = datetime.datetime.now()
-        current_price = close[-1] if len(close) > 0 else 0
+        aroon_result = enhanced_aroon(high, low, close, aroon_period)
         
-        # =====================================================
-        # CALCULATE REAL MIN/MAX THRESHOLDS FROM 1200 CANDLES
-        # =====================================================
-        # Use the last 1200 candles (or all available if less)
-        lookback_candles = min(1200, len(candles))
-        recent_candles = candles[-lookback_candles:]
+        if aroon_result[0] is None:
+            return {"error": "Failed to calculate Aroon values", "condition_met": False, "signal": "DOWN"}
         
-        # Initialize thresholds with safe defaults
-        min_threshold = current_price * 0.99
-        max_threshold = current_price * 1.01
-        middle_threshold = current_price
+        aroon_up, aroon_down, _, _, recent_high_idx, recent_low_idx = aroon_result
         
-        if len(recent_candles) > 0:
-            try:
-                # Extract close prices for threshold calculation
-                recent_closes = [c["close"] for c in recent_candles]
-                
-                if len(recent_closes) > 0:
-                    # Find argmin and argmax for min/max thresholds
-                    min_idx = np.argmin(recent_closes)
-                    max_idx = np.argmax(recent_closes)
-                    
-                    # Get actual min and max values
-                    min_threshold = recent_closes[min_idx]
-                    max_threshold = recent_closes[max_idx]
-                    
-                    # Calculate middle threshold (average of min and max)
-                    middle_threshold = (min_threshold + max_threshold) / 2
-            except Exception as e:
-                print(f"Error calculating thresholds: {e}")
-                # Keep default values
-        
-        # =====================================================
-        # MULTI-TIMEFRAME EXTREMA ANALYSIS
-        # =====================================================
-        extrema_analysis = {}
-        try:
-            extrema_analysis = analyze_multiple_timeframe_extrema(candles)
-        except Exception as e:
-            print(f"Error in multi-timeframe analysis: {e}")
-        
-        # Use 1m timeframe for Aroon and recent highs/lows
-        aroon_up = 50.0  # Default values
-        aroon_down = 50.0
-        recent_high = None
-        recent_low = None
-        
-        if '1m' in extrema_analysis and extrema_analysis['1m'].get('recent_high') is not None:
-            tf_data = extrema_analysis['1m']
-            aroon_up = tf_data.get('aroon_up', 50.0)
-            aroon_down = tf_data.get('aroon_down', 50.0)
-            recent_high = tf_data.get('recent_high')
-            recent_low = tf_data.get('recent_low')
+        # The core logic: determine signal based on Aroon comparison
+        if aroon_up > aroon_down:
+            signal = "UP"
+            condition_met = True
         else:
-            # Fallback to enhanced_aroon if extrema analysis failed
-            try:
-                aroon_result = enhanced_aroon(high, low, close, aroon_period)
-                if aroon_result and aroon_result[0] is not None:
-                    aroon_up, aroon_down, periods_since_high, periods_since_low, recent_high_idx, recent_low_idx = aroon_result
-                    if recent_high_idx is not None and 0 <= recent_high_idx < len(high):
-                        recent_high = high[recent_high_idx]
-                    if recent_low_idx is not None and 0 <= recent_low_idx < len(low):
-                        recent_low = low[recent_low_idx]
-            except Exception as e:
-                print(f"Error in Aroon calculation: {e}")
+            signal = "DOWN"
+            condition_met = False
         
-        # =====================================================
-        # FFT ANALYSIS
-        # =====================================================
-        cycle_value = 0.0
-        cycle_slope = 0.0
-        try:
-            cycle_value, cycle_slope = fft_cycle_phase(close)
-        except Exception as e:
-            print(f"Error in FFT analysis: {e}")
+        recent_high = high[recent_high_idx] if recent_high_idx is not None and 0 <= recent_high_idx < len(high) else None
+        recent_low = low[recent_low_idx] if recent_low_idx is not None and 0 <= recent_low_idx < len(low) else None
         
-        # =====================================================
-        # ML PROBABILITY
-        # =====================================================
-        probability = 0.5  # Default neutral probability
-        try:
-            price_vs_cycle = current_price - cycle_value if cycle_value is not None else 0.0
-            aroon_diff = aroon_up - aroon_down
-            aroon_diff_normalized = aroon_diff / 100.0 if aroon_diff != 0 else 0.0
-            aroon_strength = max(aroon_up, aroon_down)
-            
-            features = np.array([
-                float(cycle_slope),
-                float(price_vs_cycle),
-                float(aroon_diff_normalized),
-                float(aroon_strength / 100.0)
-            ], dtype=np.float64)
-
-            probability = ml_reversal_probability(features)
-        except Exception as e:
-            print(f"Error in ML probability calculation: {e}")
-        
-        # =====================================================
-        # TREND DETECTION - CORRECTED
-        # =====================================================
-        # Determine Aroon trend - only UP or DOWN
-        aroon_trend = "UP" if aroon_up > aroon_down else "DOWN"
-        
-        # Check for strong trends
-        if aroon_up > 70 and aroon_down < 30:
-            aroon_trend_strength = "STRONG_UP"
-        elif aroon_down > 70 and aroon_up < 30:
-            aroon_trend_strength = "STRONG_DOWN"
-        else:
-            aroon_trend_strength = "WEAK"
-        
-        # Current trend based on multiple indicators
-        current_trend = "UP"
-        try:
-            trend_score = 0
-            if aroon_trend == "UP":
-                trend_score += 1
-            if float(cycle_slope) > 0:
-                trend_score += 1
-            if current_price > middle_threshold:
-                trend_score += 1
-            
-            current_trend = "UP" if trend_score >= 2 else "DOWN"
-        except Exception as e:
-            print(f"Error determining current trend: {e}")
-        
-        # Update major trend
-        try:
-            if current_major_trend == "UNKNOWN":
-                current_major_trend = current_trend
-            elif aroon_trend_strength == "STRONG_UP" and float(cycle_slope) > 0.05:
-                current_major_trend = "UP"
-            elif aroon_trend_strength == "STRONG_DOWN" and float(cycle_slope) < -0.05:
-                current_major_trend = "DOWN"
-        except Exception as e:
-            print(f"Error updating major trend: {e}")
-        
-        # =====================================================
-        # MARKET CYCLE POSITION
-        # =====================================================
-        market_cycle_position = 50
-        market_phase = "MIDDLE ZONE"
-        
-        try:
-            threshold_range = max_threshold - min_threshold
-            if threshold_range > 0:
-                market_cycle_position = ((current_price - min_threshold) / threshold_range) * 100
-            else:
-                market_cycle_position = 50
-            
-            market_cycle_position = max(0, min(100, market_cycle_position))
-            
-            # Market phase
-            if market_cycle_position > 70:
-                market_phase = "TOP ZONE"
-            elif market_cycle_position < 30:
-                market_phase = "BOTTOM ZONE"
-            else:
-                market_phase = "MIDDLE ZONE"
-        except Exception as e:
-            print(f"Error calculating market cycle: {e}")
-        
-        # =====================================================
-        # SUPPORT AND RESISTANCE
-        # =====================================================
-        resistance_level = max_threshold
-        support_level = min_threshold
-        
-        # Update major highs/lows
-        try:
-            if recent_high is not None and (last_major_high is None or recent_high > last_major_high):
-                last_major_high = recent_high
-            
-            if recent_low is not None and (last_major_low is None or recent_low < last_major_low):
-                last_major_low = recent_low
-        except Exception as e:
-            print(f"Error updating major highs/lows: {e}")
-        
-        # =====================================================
-        # POSITION DETECTION
-        # =====================================================
-        # Initialize position variables
-        support_distance = 0.0
-        resistance_distance = 0.0
-        support_distance_pct = 0.0
-        resistance_distance_pct = 0.0
-        near_support = False
-        near_resistance = False
-        in_middle_range = False
-        
-        try:
-            # Calculate percentage distance to support and resistance
-            if support_level is not None and support_level > 0:
-                support_distance = current_price - support_level
-                support_distance_pct = (support_distance / support_level) * 100
-                near_support = support_distance_pct >= 0 and support_distance_pct <= 0.5  # Increased range
-            
-            if resistance_level is not None and resistance_level > 0:
-                resistance_distance = resistance_level - current_price
-                resistance_distance_pct = (resistance_distance / resistance_level) * 100
-                near_resistance = resistance_distance_pct >= 0 and resistance_distance_pct <= 0.5  # Increased range
-            
-            # Check if in middle range
-            in_middle_range = not near_support and not near_resistance
-        except Exception as e:
-            print(f"Error in position detection: {e}")
-        
-        # =====================================================
-        # REVERSAL SIGNALS - CORRECTED LOGIC
-        # =====================================================
-        reversal_dip = False
-        reversal_top = False
-        
-        try:
-            # Reversal dip: Price near support, major trend was DOWN, now showing UP signals
-            reversal_dip = (
-                market_phase == "BOTTOM ZONE" and
-                aroon_up > 70 and  # Strong bullish Aroon
-                aroon_down < 30 and  # Weak bearish Aroon
-                cycle_slope > 0.01 and  # Positive cycle (lowered threshold)
-                probability > 0.6  # High reversal probability (lowered threshold)
-            )
-            
-            # Reversal top: Price near resistance, major trend was UP, now showing DOWN signals
-            reversal_top = (
-                market_phase == "TOP ZONE" and
-                aroon_down > 70 and  # Strong bearish Aroon
-                aroon_up < 30 and  # Weak bullish Aroon
-                cycle_slope < -0.01 and  # Negative cycle (lowered threshold)
-                probability > 0.6  # High reversal probability (lowered threshold)
-            )
-        except Exception as e:
-            print(f"Error in reversal detection: {e}")
-        
-        # =====================================================
-        # CONTINUATION SIGNALS
-        # =====================================================
-        up_continuation = False
-        down_continuation = False
-        
-        try:
-            # Up continuation: Price has broken resistance, strong UP signals
-            up_continuation = (
-                current_trend == "UP" and
-                aroon_up > 70 and  # Strong bullish Aroon
-                current_price > resistance_level * 0.98 and  # Near or above resistance
-                cycle_slope > 0  # Positive cycle
-            )
-            
-            # Down continuation: Price has broken support, strong DOWN signals
-            down_continuation = (
-                current_trend == "DOWN" and
-                aroon_down > 70 and  # Strong bearish Aroon
-                current_price < support_level * 1.02 and  # Near or below support
-                cycle_slope < 0  # Negative cycle
-            )
-        except Exception as e:
-            print(f"Error in continuation detection: {e}")
-        
-        # =====================================================
-        # SIGNAL GENERATION - REVISED LOGIC
-        # =====================================================
-        condition_met = False
-        signal = "NO TRADE"
-        signal_reason = ""
-        
-        try:
-            # Priority 1: Major reversals (strongest signals)
-            if reversal_dip:
-                signal = "LONG"
-                signal_reason = "REVERSAL DIP (BOTTOM ZONE WITH STRONG UP SIGNALS)"
-                condition_met = True
-            elif reversal_top:
-                signal = "SHORT"
-                signal_reason = "REVERSAL TOP (TOP ZONE WITH STRONG DOWN SIGNALS)"
-                condition_met = False  # Always false for top reversal
-            
-            # Priority 2: Strong Aroon signals regardless of zone
-            elif aroon_up > 70 and aroon_down < 30:
-                signal = "LONG"
-                signal_reason = "STRONG AROON UP SIGNAL"
-                condition_met = True
-            elif aroon_down > 70 and aroon_up < 30:
-                signal = "SHORT"
-                signal_reason = "STRONG AROON DOWN SIGNAL"
-                condition_met = False  # Always false for down signals
-            
-            # Priority 3: Continuations (momentum signals)
-            elif up_continuation:
-                signal = "LONG"
-                signal_reason = "UP CONTINUATION (BREAKING RESISTANCE)"
-                condition_met = True
-            elif down_continuation:
-                signal = "SHORT"
-                signal_reason = "DOWN CONTINUATION (BREAKING SUPPORT)"
-                condition_met = False  # Always false for down signals
-            
-            # Priority 4: Bottom zone with positive indicators
-            elif market_phase == "BOTTOM ZONE" and (
-                (aroon_up > aroon_down and cycle_slope > 0) or
-                (current_trend == "UP" and probability > 0.6)
-            ):
-                signal = "LONG"
-                signal_reason = "BOTTOM ZONE WITH POSITIVE INDICATORS"
-                condition_met = True
-            
-            # Priority 5: General upward trend
-            elif current_trend == "UP" and aroon_up > 60:
-                signal = "LONG"
-                signal_reason = "GENERAL UPWARD TREND"
-                condition_met = True
-                
-        except Exception as e:
-            print(f"Error in signal generation: {e}")
-        
-        # =====================================================
-        # FORECAST CALCULATION
-        # =====================================================
-        forecast_pct = 0.0
-        forecast_move = 0.0
-        reversal_forecast = current_price
-        
-        try:
-            if signal == "LONG":
-                # Calculate forecast for LONG
-                recent_price_data = close[-10:] if len(close) >= 10 else close
-                if len(recent_price_data) > 1:
-                    recent_volatility = np.std(recent_price_data)
-                else:
-                    recent_volatility = current_price * 0.001
-                
-                base_move = min(recent_volatility, current_price * 0.005)
-                aroon_factor = aroon_up / 100.0 if aroon_up > 0 else 0.5
-                confidence = probability if probability > 0 else 0.5
-                cycle_factor = 1 + (abs(cycle_slope) * 0.001)
-                position_factor = 1.5 if near_support else 1.0
-                
-                forecast_move = base_move * aroon_factor * confidence * cycle_factor * position_factor
-                
-                max_move = current_price * 0.01
-                min_move = current_price * 0.0005
-                forecast_move = max(min(forecast_move, max_move), min_move)
-                
-                reversal_forecast = current_price + forecast_move
-                forecast_pct = (forecast_move / current_price) * 100 if current_price > 0 else 0
-                
-            elif signal == "SHORT":
-                # Similar calculation for SHORT
-                recent_price_data = close[-10:] if len(close) >= 10 else close
-                if len(recent_price_data) > 1:
-                    recent_volatility = np.std(recent_price_data)
-                else:
-                    recent_volatility = current_price * 0.001
-                
-                base_move = min(recent_volatility, current_price * 0.005)
-                aroon_factor = aroon_down / 100.0 if aroon_down > 0 else 0.5
-                confidence = probability if probability > 0 else 0.5
-                cycle_factor = 1 + (abs(cycle_slope) * 0.001)
-                position_factor = 1.5 if near_resistance else 1.0
-                
-                forecast_move = base_move * aroon_factor * confidence * cycle_factor * position_factor
-                
-                max_move = current_price * 0.01
-                min_move = current_price * 0.0005
-                forecast_move = max(min(forecast_move, max_move), min_move)
-                
-                reversal_forecast = current_price - forecast_move
-                forecast_pct = (forecast_move / current_price) * 100 if current_price > 0 else 0
-                
-        except Exception as e:
-            print(f"Error in forecast calculation: {e}")
-        
-        # =====================================================
-        # RETURN RESULTS
-        # =====================================================
         return {
             "signal": signal,
             "condition_met": condition_met,
-            "probability": round(probability, 4),
-            "cycle_slope": round(cycle_slope, 6),
-            "price_vs_cycle": round(price_vs_cycle, 6) if 'price_vs_cycle' in locals() else 0.0,
+            "signal_reason": f"Aroon Up ({aroon_up:.2f}) is {'greater than' if condition_met else 'less than'} Aroon Down ({aroon_down:.2f})",
             "aroon_up": round(aroon_up, 2),
             "aroon_down": round(aroon_down, 2),
-            "aroon_trend": aroon_trend,
-            "aroon_trend_strength": aroon_trend_strength,
-            "current_trend": current_trend,
-            "current_major_trend": current_major_trend,
-            "market_phase": market_phase,
-            "market_cycle_position": round(market_cycle_position, 2),
             "current_price": round(current_price, 2),
-            "support_level": round(support_level, 2) if support_level is not None else None,
-            "resistance_level": round(resistance_level, 2) if resistance_level is not None else None,
-            "middle_threshold": round(middle_threshold, 2) if middle_threshold is not None else None,
-            "min_threshold": round(min_threshold, 2) if min_threshold is not None else None,
-            "max_threshold": round(max_threshold, 2) if max_threshold is not None else None,
-            "support_distance": round(support_distance, 2),
-            "resistance_distance": round(resistance_distance, 2),
-            "support_distance_pct": round(support_distance_pct, 3),
-            "resistance_distance_pct": round(resistance_distance_pct, 3),
-            "near_support": near_support,
-            "near_resistance": near_resistance,
-            "in_middle_range": in_middle_range,
-            "reversal_forecast": round(reversal_forecast, 2),
-            "forecast_percentage": round(forecast_pct, 4),
             "recent_high": round(recent_high, 2) if recent_high is not None else None,
             "recent_low": round(recent_low, 2) if recent_low is not None else None,
-            "last_major_high": round(last_major_high, 2) if last_major_high is not None else None,
-            "last_major_low": round(last_major_low, 2) if last_major_low is not None else None,
-            "reversal_dip": reversal_dip,
-            "reversal_top": reversal_top,
-            "up_continuation": up_continuation,
-            "down_continuation": down_continuation,
-            "multi_timeframe_analysis": extrema_analysis
         }
         
     except Exception as e:
-        print(f"Error in analyze_fft_aroon_ml_reversal: {e}")
+        print(f"Error in analyze_aroon_only_signal: {e}")
         import traceback
         traceback.print_exc()
-        return {"error": str(e), "condition_met": False}
+        return {"error": str(e), "condition_met": False, "signal": "DOWN"}
 
 # =========================================================
 # MAIN TRADING LOOP
@@ -1673,10 +1059,9 @@ try:
 
         # Fetch candles for multiple timeframes
         candle_map = fetch_candles_in_parallel(['1m', '3m', '5m'])
+        candles_1m = candle_map.get('1m', [])
         
-        candles_1m = get_candles(TRADE_SYMBOL, '1m', limit=1200)
-        
-        if not candle_map.get('1m'):
+        if not candles_1m:
             print("Error: '1m' candles not fetched. Check API connectivity or symbol.")
         if current_price == Decimal('0.0'):
             print(f"Warning: Current {TRADE_SYMBOL} price is {current_price:.25f}. API may be failing.")
@@ -1685,14 +1070,14 @@ try:
         conditions_status = {
             "momentum_positive_1m": False,
             "momentum_positive_15sec": False,
-            "thresholds_15s": False,  # Replaced double_bottom_pattern_15s
+            "thresholds_15s": False,
             "linear_regression_channel_break": False,
             "fft_prediction_1m": False,
-            "fft_aroon_ml_reversal": False,
+            "aroon_only_signal": False,
             "volume_bias_condition": False,
-            "thresholds_1m": False,  # Replaced double_bottom_pattern_1m
-            "thresholds_3m": False,  # New condition for 3m timeframe
-            "thresholds_5m": False,  # New condition for 5m timeframe
+            "thresholds_1m": False,
+            "thresholds_3m": False,
+            "thresholds_5m": False,
             "sma_cascade_condition": False,
         }
 
@@ -1703,13 +1088,12 @@ try:
         
         # Condition 1: Momentum Positive (1m)
         print("\n--- Condition 1: Momentum Positive (1m) ---")
-        momentum_1m_positive, momentum_1m_value, momentum_1m_details = calculate_momentum(candle_map['1m'])
+        momentum_1m_positive, momentum_1m_value, momentum_1m_details = calculate_momentum(candles_1m)
         conditions_status["momentum_positive_1m"] = momentum_1m_positive
         print(f"Current Momentum: {momentum_1m_value:.4f}")
         print(f"Momentum Period: {momentum_1m_details.get('period', 10)}")
         print(f"Momentum Direction: {'Positive' if momentum_1m_positive else 'Negative'}")
         print(f"Momentum Strength: {'Strong' if abs(momentum_1m_value) > 100 else 'Moderate' if abs(momentum_1m_value) > 50 else 'Weak'}")
-        print(f"Momentum Positive: {momentum_1m_positive}")
         print(f"Condition Met: {conditions_status['momentum_positive_1m']}")
         
         # Condition 2: Momentum Positive (15s)
@@ -1721,7 +1105,6 @@ try:
             print(f"Momentum Period: {momentum_15s_result['period']}")
             print(f"Momentum Direction: {'Positive' if momentum_15s_result['momentum_positive'] else 'Negative'}")
             print(f"Momentum Strength: {momentum_15s_result['momentum_strength']}")
-            print(f"Momentum Positive: {momentum_15s_result['momentum_positive']}")
             print(f"Condition Met: {conditions_status['momentum_positive_15sec']}")
         else:
             print(f"Error analyzing momentum (15s): {momentum_15s_result['error']}")
@@ -1757,17 +1140,8 @@ try:
             print(f"Lower Channel: {lrc_break_result['lower_channel']:.2f}")
             print(f"Most Recent Below Lower: {lrc_break_result['most_recent_below_lower']}")
             print(f"Most Recent Above Upper: {lrc_break_result['most_recent_above_upper']}")
-            print(f"Most Recent Below Lower Index: {lrc_break_result['most_recent_below_lower_index']}")
-            print(f"Most Recent Above Upper Index: {lrc_break_result['most_recent_above_upper_index']}")
             print(f"Up Cycle: {lrc_break_result['up_cycle']}")
             print(f"Description: {lrc_break_result['description']}")
-    
-            # Print the last few instances of channel breaks for debugging
-            if lrc_break_result['below_lower_indices']:
-                print(f"Recent Below Lower Indices: {lrc_break_result['below_lower_indices']}")
-            if lrc_break_result['above_upper_indices']:
-                print(f"Recent Above Upper Indices: {lrc_break_result['above_upper_indices']}")
-        
             print(f"Condition Met: {conditions_status['linear_regression_channel_break']}")
         else:
             print(f"Error analyzing linear regression channel break: {lrc_break_result['error']}")
@@ -1788,46 +1162,24 @@ try:
             print(f"Error analyzing FFT prediction: {fft_prediction_result['error']}")
             print(f"Condition Met: {conditions_status['fft_prediction_1m']}")
             
-        # Condition 6: FFT + Aroon + ML Reversal (FIXED)
-        print("\n--- Condition 6: FFT + Aroon + ML Reversal (FIXED) ---")
-        fft_aroon_ml_result = analyze_fft_aroon_ml_reversal(candles_1m)
-        if 'error' not in fft_aroon_ml_result:
-            conditions_status["fft_aroon_ml_reversal"] = fft_aroon_ml_result['condition_met']
-            print(f"Signal: {fft_aroon_ml_result['signal']}")
-            print(f"Probability: {fft_aroon_ml_result['probability']}")
-            print(f"Cycle Slope: {fft_aroon_ml_result['cycle_slope']}")
-            print(f"Price vs Cycle: {fft_aroon_ml_result['price_vs_cycle']}")
-            print(f"Aroon Up: {fft_aroon_ml_result['aroon_up']}")
-            print(f"Aroon Down: {fft_aroon_ml_result['aroon_down']}")
-            print(f"Aroon Trend: {fft_aroon_ml_result['aroon_trend']}")
-            print(f"Current Trend: {fft_aroon_ml_result['current_trend']}")
-            print(f"Current Major Trend: {fft_aroon_ml_result['current_major_trend']}")
-            print(f"Market Phase: {fft_aroon_ml_result['market_phase']}")
-            print(f"Market Cycle Position: {fft_aroon_ml_result['market_cycle_position']}%")
-            print(f"Reversal Forecast: {fft_aroon_ml_result['reversal_forecast']}")
-            print(f"Recent High: {fft_aroon_ml_result['recent_high']}")
-            print(f"Recent Low: {fft_aroon_ml_result['recent_low']}")
-            print(f"Min Threshold: {fft_aroon_ml_result['min_threshold']}")
-            print(f"Max Threshold: {fft_aroon_ml_result['max_threshold']}")
-            print(f"Middle Threshold: {fft_aroon_ml_result['middle_threshold']}")
-            print(f"Resistance Level: {fft_aroon_ml_result['resistance_level']}")
-            print(f"Support Level: {fft_aroon_ml_result['support_level']}")
-            print(f"Last Major High: {fft_aroon_ml_result['last_major_high']}")
-            print(f"Last Major Low: {fft_aroon_ml_result['last_major_low']}")
-            print(f"Condition Met: {conditions_status['fft_aroon_ml_reversal']}")
-
-            # Show multi-timeframe analysis
-            if 'multi_timeframe_analysis' in fft_aroon_ml_result:
-                print("\nMulti-Timeframe Analysis:")
-                for tf, data in fft_aroon_ml_result['multi_timeframe_analysis'].items():
-                    if data and data['recent_high'] is not None:
-                        print(f"  {tf}: High={data['recent_high']:.2f}, Low={data['recent_low']:.2f}, "
-                              f"Aroon Up={data['aroon_up']:.2f}, Aroon Down={data['aroon_down']:.2f}")
+        # Condition 6: Aroon-Only Signal
+        print("\n--- Condition 6: Aroon-Only Signal ---")
+        aroon_signal_result = analyze_aroon_only_signal(candles_1m, aroon_period=14)
+        if 'error' not in aroon_signal_result:
+            conditions_status["aroon_only_signal"] = aroon_signal_result['condition_met']
+            print(f"Signal: {aroon_signal_result['signal']}")
+            print(f"Aroon Up: {aroon_signal_result['aroon_up']}")
+            print(f"Aroon Down: {aroon_signal_result['aroon_down']}")
+            print(f"Current Price: {aroon_signal_result['current_price']}")
+            print(f"Recent High: {aroon_signal_result['recent_high']}")
+            print(f"Recent Low: {aroon_signal_result['recent_low']}")
+            print(f"Reason: {aroon_signal_result['signal_reason']}")
+            print(f"Condition Met: {conditions_status['aroon_only_signal']}")
         else:
-            print(f"Error analyzing FFT + Aroon + ML Reversal: {fft_aroon_ml_result['error']}")
-            print(f"Condition Met: {conditions_status['fft_aroon_ml_reversal']}")
+            print(f"Error analyzing Aroon signal: {aroon_signal_result['error']}")
+            print(f"Condition Met: {conditions_status['aroon_only_signal']}")
 
-        # Condition 7: Volume Bias Condition (replaces ema_crossover_orderflow)
+        # Condition 7: Volume Bias Condition
         print("\n--- Condition 7: Volume Bias Condition ---")
         volume_bias_result = analyze_volume_bias(candles_1m)
         if 'error' not in volume_bias_result:
@@ -1901,19 +1253,16 @@ try:
             print(f"Error analyzing thresholds (5m): {thresholds_5m_result['error']}")
             print(f"Condition Met: {conditions_status['thresholds_5m']}")
 
-        # Condition 11: SMA Cascade Condition
-        print("\n--- Condition 11: SMA Cascade Condition ---")
-        sma_cascade_result = analyze_sma_cascade(candles_1m)
+        # Condition 11: SMA Cascade Condition (UPDATED)
+        print("\n--- Condition 11: SMA Cascade Condition (UPDATED) ---")
+        sma_cascade_result = analyze_sma_cascade_updated(candles_1m)
         if 'error' not in sma_cascade_result:
             conditions_status["sma_cascade_condition"] = sma_cascade_result['condition_met']
             print(f"Current Close: {sma_cascade_result['current_close']:.2f}")
+            print(f"SMA5: {sma_cascade_result['sma5']:.2f}")
             print(f"SMA7: {sma_cascade_result['sma7']:.2f}")
             print(f"SMA9: {sma_cascade_result['sma9']:.2f}")
             print(f"SMA12: {sma_cascade_result['sma12']:.2f}")
-            print(f"SMA17: {sma_cascade_result['sma17']:.2f}")
-            print(f"SMA21: {sma_cascade_result['sma21']:.2f}")
-            print(f"SMA27: {sma_cascade_result['sma27']:.2f}")
-            print(f"SMA200: {sma_cascade_result['sma200']:.2f}")
             print(f"Cascade Description: {sma_cascade_result['cascade_description']}")
             print(f"Condition Met: {conditions_status['sma_cascade_condition']}")
         else:
@@ -1958,9 +1307,7 @@ try:
                 current_value_in_usdc = Decimal('0.0')
             print(f"Current BTC Balance Value in USDC: {current_value_in_usdc:.25f}")
 
-            # Calculate the target value accounting for fees
-            # To achieve 0.75% net profit after 0.22% fees, we need 0.75% + 0.22% = 0.97% gross profit
-            target_value = initial_investment * Decimal('1.0097')  # 0.97% gross profit for 0.75% net profit
+            target_value = initial_investment * Decimal('1.0097')
             entry_time_str = entry_datetime.strftime("%H:%M") if entry_datetime else "Unknown"
             time_span = (current_local_time - entry_datetime) if entry_datetime else None
             time_span_str = "Unknown"
@@ -1979,14 +1326,12 @@ try:
             print(f"Initial USDC amount: {initial_investment_display:.25f}, Expected USDC amount after exit: {target_value:.25f}, Entry Price for last BTC purchased: {entry_price:.25f}")
             print(f"Entry Time (HH:MM): {entry_time_str}, Time Span from Entry: {time_span_str}")
 
-            # Value Change Percentage
             if initial_investment_display > Decimal('0'):
                 value_change_percentage = ((current_value_in_usdc - initial_investment) / initial_investment) * Decimal('100')
             else:
                 value_change_percentage = Decimal('0.0')
             print(f"Value Change Percentage from Initial Investment: {value_change_percentage:.25f}%")
 
-            # Price for 0.75% Net Profit Target (after fees)
             if asset_balance > Decimal('0'):
                 target_price = target_value / asset_balance
             else:
@@ -1994,7 +1339,6 @@ try:
                 print("Error: BTC balance is zero or negative. Target price set to 0.")
             print(f"Price for 0.75% Net Profit Target (after fees): {target_price:.25f}")
 
-            # Percentage Price Differences
             if entry_price > Decimal('0') and target_price > entry_price:
                 entry_to_current_pct = ((current_price - entry_price) / entry_price) * Decimal('100')
                 current_to_target_pct = ((target_price - current_price) / current_price) * Decimal('100')
@@ -2034,7 +1378,6 @@ try:
                 print("No USDC balance available.")
             print(f"Current BTC balance: {asset_balance:.25f}")
 
-            # Check if all conditions are met for entry
             if all_conditions_met:
                 usdc_balance = get_balance('USDC')
                 if usdc_balance > Decimal('0'):
