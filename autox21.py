@@ -788,7 +788,7 @@ def analyze_fft_prediction_by_timeframe(candles, timeframe, num_predictions=5, f
         if not candles:
             return {"error": f"No {timeframe} data provided"}
 
-        # Ensure we're using the last 1200 values from this specific timeframe
+        # Ensure we're using last 1200 values from this specific timeframe
         recent_candles = candles[-1200:] if len(candles) > 1200 else candles
         close_prices = np.array([candle["close"] for candle in recent_candles], dtype=np.float64)
         
@@ -801,18 +801,18 @@ def analyze_fft_prediction_by_timeframe(candles, timeframe, num_predictions=5, f
         # Apply FFT to get frequency components
         fft_values = np.fft.fft(close_prices)
         
-        # Get the dominant frequency (excluding the DC component)
+        # Get dominant frequency (excluding DC component)
         fft_abs = np.abs(fft_values[1:len(fft_values)//2])
-        dominant_freq_idx = np.argmax(fft_abs) + 1  # +1 because we skipped the DC component
+        dominant_freq_idx = np.argmax(fft_abs) + 1  # +1 because we skipped DC component
         
-        # Calculate the phase angle of the dominant frequency
+        # Calculate phase angle of the dominant frequency
         phase_angle = np.angle(fft_values[dominant_freq_idx])
         
         # Calculate sine and cosine components
         sine_component = np.sin(phase_angle)
         cosine_component = np.cos(phase_angle)
         
-        # Filter the FFT values to keep only the most significant frequencies
+        # Filter FFT values to keep only the most significant frequencies
         fft_abs = np.abs(fft_values)
         threshold = np.max(fft_abs) * (1 - filter_ratio)
         mask = fft_abs > threshold
@@ -823,25 +823,57 @@ def analyze_fft_prediction_by_timeframe(candles, timeframe, num_predictions=5, f
         extended_fft[:len(filtered_fft)] = filtered_fft
         extended_detrended = np.fft.ifft(extended_fft).real
         
-        # Get the current price and the next prediction
+        # Get the current price and next prediction
         current_price = close_prices[-1]
         next_prediction = extended_detrended[-1]
         
-        # Determine if forecast is above current close
+        # Determine if the forecast is above the current close
         forecast_above_close = next_prediction > current_price
         
-        # Determine cycle direction
+        # Determine the cycle direction
         cycle_direction = "Up" if forecast_above_close else "Down"
         
-        # Calculate percentage change
+        # Calculate the percentage change
         pct_change = ((next_prediction - current_price) / current_price) * 100
         
         # Calculate confidence based on the proportion of frequencies kept
         confidence = np.sum(mask) / len(mask)
         
-        # Determine if the cycle is at a peak or trough
-        is_peak = sine_component > 0.7
-        is_trough = sine_component < -0.7
+        # Determine if the cycle is at a top or dip
+        is_top = sine_component > 0.7
+        is_dip = sine_component < -0.7
+        
+        # Find the most recent reversal pattern
+        # Look for local minima (dips) and maxima (tops) in the recent data
+        window_size = min(50, len(close_prices) // 4)
+        if window_size < 5:
+            window_size = 5
+            
+        # Find local minima and maxima
+        local_minima_indices = signal.argrelextrema(np.array(close_prices), np.less, order=window_size)[0]
+        local_maxima_indices = signal.argrelextrema(np.array(close_prices), np.greater, order=window_size)[0]
+        
+        # Find the most recent reversal
+        most_recent_reversal_type = "None"
+        most_recent_reversal_idx = -1
+        
+        # Check if the most recent pattern was a dip or top
+        if len(local_minima_indices) > 0 and len(local_maxima_indices) > 0:
+            most_recent_min_idx = max(local_minima_indices)
+            most_recent_max_idx = max(local_maxima_indices)
+            
+            if most_recent_min_idx > most_recent_max_idx:
+                most_recent_reversal_type = "Reversal Dip"
+                most_recent_reversal_idx = most_recent_min_idx
+            else:
+                most_recent_reversal_type = "Reversal Top"
+                most_recent_reversal_idx = most_recent_max_idx
+        elif len(local_minima_indices) > 0:
+            most_recent_reversal_type = "Reversal Dip"
+            most_recent_reversal_idx = max(local_minima_indices)
+        elif len(local_maxima_indices) > 0:
+            most_recent_reversal_type = "Reversal Top"
+            most_recent_reversal_idx = max(local_maxima_indices)
         
         return {
             "condition_met": forecast_above_close,
@@ -854,14 +886,16 @@ def analyze_fft_prediction_by_timeframe(candles, timeframe, num_predictions=5, f
             "confidence": confidence,
             "sine_component": sine_component,
             "cosine_component": cosine_component,
-            "is_peak": is_peak,
-            "is_trough": is_trough,
+            "is_top": is_top,
+            "is_dip": is_dip,
+            "most_recent_reversal_type": most_recent_reversal_type,
+            "most_recent_reversal_idx": most_recent_reversal_idx,
             "phase_angle": phase_angle,
             "min_value": min_value,
             "max_value": max_value,
             "min_idx": min_idx,
             "max_idx": max_idx,
-            "description": f"FFT forecast for {timeframe}: {'Up' if forecast_above_close else 'Down'} cycle, next prediction: {next_prediction:.2f}"
+            "description": f"FFT forecast for {timeframe}: {'Up' if forecast_above_close else 'Down'} cycle, next prediction: {next_prediction:.2f}, Most recent: {most_recent_reversal_type}"
         }
         
     except Exception as e:
@@ -1162,8 +1196,9 @@ try:
             print(f"Confidence: {fft_forecast_1m_result['confidence']:.4f}")
             print(f"Sine Component: {fft_forecast_1m_result['sine_component']:.4f}")
             print(f"Cosine Component: {fft_forecast_1m_result['cosine_component']:.4f}")
-            print(f"Is Peak: {fft_forecast_1m_result['is_peak']}")
-            print(f"Is Trough: {fft_forecast_1m_result['is_trough']}")
+            print(f"Is Top: {fft_forecast_1m_result['is_top']}")
+            print(f"Is Dip: {fft_forecast_1m_result['is_dip']}")
+            print(f"Most Recent Reversal: {fft_forecast_1m_result['most_recent_reversal_type']}")
             print(f"Min Value: {fft_forecast_1m_result['min_value']:.2f}")
             print(f"Max Value: {fft_forecast_1m_result['max_value']:.2f}")
             print(f"Description: {fft_forecast_1m_result['description']}")
@@ -1186,8 +1221,9 @@ try:
             print(f"Confidence: {fft_forecast_3m_result['confidence']:.4f}")
             print(f"Sine Component: {fft_forecast_3m_result['sine_component']:.4f}")
             print(f"Cosine Component: {fft_forecast_3m_result['cosine_component']:.4f}")
-            print(f"Is Peak: {fft_forecast_3m_result['is_peak']}")
-            print(f"Is Trough: {fft_forecast_3m_result['is_trough']}")
+            print(f"Is Top: {fft_forecast_3m_result['is_top']}")
+            print(f"Is Dip: {fft_forecast_3m_result['is_dip']}")
+            print(f"Most Recent Reversal: {fft_forecast_3m_result['most_recent_reversal_type']}")
             print(f"Min Value: {fft_forecast_3m_result['min_value']:.2f}")
             print(f"Max Value: {fft_forecast_3m_result['max_value']:.2f}")
             print(f"Description: {fft_forecast_3m_result['description']}")
@@ -1210,8 +1246,9 @@ try:
             print(f"Confidence: {fft_forecast_5m_result['confidence']:.4f}")
             print(f"Sine Component: {fft_forecast_5m_result['sine_component']:.4f}")
             print(f"Cosine Component: {fft_forecast_5m_result['cosine_component']:.4f}")
-            print(f"Is Peak: {fft_forecast_5m_result['is_peak']}")
-            print(f"Is Trough: {fft_forecast_5m_result['is_trough']}")
+            print(f"Is Top: {fft_forecast_5m_result['is_top']}")
+            print(f"Is Dip: {fft_forecast_5m_result['is_dip']}")
+            print(f"Most Recent Reversal: {fft_forecast_5m_result['most_recent_reversal_type']}")
             print(f"Min Value: {fft_forecast_5m_result['min_value']:.2f}")
             print(f"Max Value: {fft_forecast_5m_result['max_value']:.2f}")
             print(f"Description: {fft_forecast_5m_result['description']}")
