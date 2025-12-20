@@ -11,7 +11,6 @@ from decimal import Decimal, getcontext
 import pandas as pd
 import warnings
 import os
-from scipy import signal
 
 # Set Decimal precision to 25
 getcontext().prec = 25
@@ -39,7 +38,9 @@ PROFIT_TARGET_PERCENT = 1.00  # 1.00% net profit target
 TOTAL_FEE_PERCENT = 0.22  # Total fee percentage
 MIN_TRADE_AMOUNT = 10
 
-# Updated CONFIG with FFT conditions
+# CHANGE 1: Completely removed two conditions from CONFIG and updated min_conditions_met.
+# CHANGE 5: Added 3 new conditions for recent extrema analysis and updated min_conditions_met.
+# CHANGE 6: Removed analysis-only conditions and updated min_conditions_met.
 CONFIG = {
     "conditions": {
         "momentum_positive_1m": True,
@@ -50,11 +51,11 @@ CONFIG = {
         "thresholds_1m": True,
         "thresholds_3m": True,
         "thresholds_5m": True,
-        "fft_forecast_1m": True,
-        "fft_forecast_3m": True,
-        "fft_forecast_5m": True,
+        "recent_extrema_1m": True,      # NEW
+        "recent_extrema_3m": True,      # NEW
+        "recent_extrema_5m": True,      # NEW
     },
-    "min_conditions_met": 11  # Updated to 11 active conditions
+    "min_conditions_met": 9  # Corrected to 9 active conditions (11 - 2 removed)
 }
 
 # Global variables for market state tracking
@@ -341,7 +342,14 @@ def analyze_volume_bias(candles):
         return {"error": str(e), "condition_met": False}
 
 # =========================================================
-# THRESHOLDS ANALYSIS FUNCTION
+# UPDATED SMA CASCADE ANALYSIS FUNCTION (REMOVED)
+# =========================================================
+# def analyze_sma_cascade_updated(candles):
+#     # This function is no longer used as the condition was removed.
+#     pass
+
+# =========================================================
+# NEW THRESHOLDS ANALYSIS FUNCTION
 # =========================================================
 
 def analyze_thresholds_by_timeframe(candles, timeframe):
@@ -777,141 +785,15 @@ def analyze_linear_regression_channel_break(candles_1m):
         return {"error": str(e)}
 
 # =========================================================
-# FFT FORECASTING FUNCTIONS FOR MULTIPLE TIMEFRAMES
+# FFT PREDICTION FUNCTION (REMOVED)
 # =========================================================
+# def predict_prices_with_fft(candles, num_predictions=5, filter_ratio=0.8):
+#     # This function is no longer used as the condition was removed.
+#     pass
 
-def analyze_fft_prediction_by_timeframe(candles, timeframe, num_predictions=5, filter_ratio=0.8):
-    """
-    Analyzes FFT prediction for a specific timeframe.
-    """
-    try:
-        if not candles:
-            return {"error": f"No {timeframe} data provided"}
-
-        # Ensure we're using last 1200 values from this specific timeframe
-        recent_candles = candles[-1200:] if len(candles) > 1200 else candles
-        close_prices = np.array([candle["close"] for candle in recent_candles], dtype=np.float64)
-        
-        # Calculate min and max values for this specific timeframe
-        min_value = np.min(close_prices)
-        max_value = np.max(close_prices)
-        min_idx = np.argmin(close_prices)
-        max_idx = np.argmax(close_prices)
-        
-        # Apply FFT to get frequency components
-        fft_values = np.fft.fft(close_prices)
-        
-        # Get dominant frequency (excluding DC component)
-        fft_abs = np.abs(fft_values[1:len(fft_values)//2])
-        dominant_freq_idx = np.argmax(fft_abs) + 1  # +1 because we skipped DC component
-        
-        # Calculate phase angle of the dominant frequency
-        phase_angle = np.angle(fft_values[dominant_freq_idx])
-        
-        # Calculate sine and cosine components
-        sine_component = np.sin(phase_angle)
-        cosine_component = np.cos(phase_angle)
-        
-        # Filter FFT values to keep only the most significant frequencies
-        fft_abs = np.abs(fft_values)
-        threshold = np.max(fft_abs) * (1 - filter_ratio)
-        mask = fft_abs > threshold
-        filtered_fft = fft_values * mask
-        
-        # Extend the filtered FFT to predict the next value
-        extended_fft = np.zeros(len(filtered_fft) + 1, dtype=complex)
-        extended_fft[:len(filtered_fft)] = filtered_fft
-        extended_detrended = np.fft.ifft(extended_fft).real
-        
-        # Get the current price and next prediction
-        current_price = close_prices[-1]
-        next_prediction = extended_detrended[-1]
-        
-        # Determine if the forecast is above the current close
-        forecast_above_close = next_prediction > current_price
-        
-        # Determine the cycle direction
-        cycle_direction = "Up" if forecast_above_close else "Down"
-        
-        # Calculate the percentage change
-        pct_change = ((next_prediction - current_price) / current_price) * 100
-        
-        # Calculate confidence based on the proportion of frequencies kept
-        confidence = np.sum(mask) / len(mask)
-        
-        # Determine if the cycle is at a top or dip
-        is_top = sine_component > 0.7
-        is_dip = sine_component < -0.7
-        
-        # Find the most recent reversal pattern
-        # Look for local minima (dips) and maxima (tops) in the recent data
-        window_size = min(50, len(close_prices) // 4)
-        if window_size < 5:
-            window_size = 5
-            
-        # Find local minima and maxima
-        local_minima_indices = signal.argrelextrema(np.array(close_prices), np.less, order=window_size)[0]
-        local_maxima_indices = signal.argrelextrema(np.array(close_prices), np.greater, order=window_size)[0]
-        
-        # Find the most recent reversal
-        most_recent_reversal_type = "None"
-        most_recent_reversal_idx = -1
-        
-        # Check if the most recent pattern was a dip or top
-        if len(local_minima_indices) > 0 and len(local_maxima_indices) > 0:
-            most_recent_min_idx = max(local_minima_indices)
-            most_recent_max_idx = max(local_maxima_indices)
-            
-            if most_recent_min_idx > most_recent_max_idx:
-                most_recent_reversal_type = "Reversal Dip"
-                most_recent_reversal_idx = most_recent_min_idx
-            else:
-                most_recent_reversal_type = "Reversal Top"
-                most_recent_reversal_idx = most_recent_max_idx
-        elif len(local_minima_indices) > 0:
-            most_recent_reversal_type = "Reversal Dip"
-            most_recent_reversal_idx = max(local_minima_indices)
-        elif len(local_maxima_indices) > 0:
-            most_recent_reversal_type = "Reversal Top"
-            most_recent_reversal_idx = max(local_maxima_indices)
-        
-        return {
-            "condition_met": forecast_above_close,
-            "timeframe": timeframe,
-            "current_price": current_price,
-            "next_prediction": next_prediction,
-            "forecast_above_close": forecast_above_close,
-            "cycle_direction": cycle_direction,
-            "pct_change": pct_change,
-            "confidence": confidence,
-            "sine_component": sine_component,
-            "cosine_component": cosine_component,
-            "is_top": is_top,
-            "is_dip": is_dip,
-            "most_recent_reversal_type": most_recent_reversal_type,
-            "most_recent_reversal_idx": most_recent_reversal_idx,
-            "phase_angle": phase_angle,
-            "min_value": min_value,
-            "max_value": max_value,
-            "min_idx": min_idx,
-            "max_idx": max_idx,
-            "description": f"FFT forecast for {timeframe}: {'Up' if forecast_above_close else 'Down'} cycle, next prediction: {next_prediction:.2f}, Most recent: {most_recent_reversal_type}"
-        }
-        
-    except Exception as e:
-        print(f"Error analyzing FFT prediction ({timeframe}): {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e)}
-
-def analyze_fft_forecast_1m(candles_1m):
-    return analyze_fft_prediction_by_timeframe(candles_1m, "1m")
-
-def analyze_fft_forecast_3m(candles_3m):
-    return analyze_fft_prediction_by_timeframe(candles_3m, "3m")
-
-def analyze_fft_forecast_5m(candles_5m):
-    return analyze_fft_prediction_by_timeframe(candles_5m, "5m")
+# def analyze_fft_prediction_15sec(candles_1m):
+#     # This function is no longer used as the condition was removed.
+#     pass
 
 # =========================================================
 # AROON-ONLY SIGNAL ANALYSIS FUNCTION
@@ -965,6 +847,99 @@ def analyze_aroon_only_signal(candles, aroon_period=14):
         import traceback
         traceback.print_exc()
         return {"error": str(e), "condition_met": False, "signal": "DOWN"}
+
+# =========================================================
+# NEW RECENT EXTREMA ANALYSIS FUNCTIONS
+# =========================================================
+
+def analyze_recent_extrema_1m(timeframe_extrema_data):
+    """
+    Analyzes if the most recent extremum in the 1m timeframe was a low.
+    Condition is met if the most recent low occurred after the most recent high.
+    """
+    try:
+        if '1m' not in timeframe_extrema_data:
+            return {"error": "1m data not available in timeframe_extrema", "condition_met": False}
+
+        data = timeframe_extrema_data['1m']
+        recent_high_idx = data.get('recent_high_idx')
+        recent_low_idx = data.get('recent_low_idx')
+
+        if recent_high_idx is None or recent_low_idx is None:
+            return {"error": "Extrema indices not calculated for 1m", "condition_met": False}
+
+        # If the index of the low is greater, it is more recent
+        condition_met = recent_low_idx > recent_high_idx
+        
+        return {
+            "condition_met": condition_met,
+            "timeframe": "1m",
+            "recent_high_idx": recent_high_idx,
+            "recent_low_idx": recent_low_idx,
+            "description": f"Most recent extremum was a {'LOW' if condition_met else 'HIGH'} (Low idx: {recent_low_idx}, High idx: {recent_high_idx})"
+        }
+    except Exception as e:
+        print(f"Error in analyze_recent_extrema_1m: {e}")
+        return {"error": str(e), "condition_met": False}
+
+def analyze_recent_extrema_3m(timeframe_extrema_data):
+    """
+    Analyzes if the most recent extremum in the 3m timeframe was a low.
+    Condition is met if the most recent low occurred after the most recent high.
+    """
+    try:
+        if '3m' not in timeframe_extrema_data:
+            return {"error": "3m data not available in timeframe_extrema", "condition_met": False}
+
+        data = timeframe_extrema_data['3m']
+        recent_high_idx = data.get('recent_high_idx')
+        recent_low_idx = data.get('recent_low_idx')
+
+        if recent_high_idx is None or recent_low_idx is None:
+            return {"error": "Extrema indices not calculated for 3m", "condition_met": False}
+
+        condition_met = recent_low_idx > recent_high_idx
+
+        return {
+            "condition_met": condition_met,
+            "timeframe": "3m",
+            "recent_high_idx": recent_high_idx,
+            "recent_low_idx": recent_low_idx,
+            "description": f"Most recent extremum was a {'LOW' if condition_met else 'HIGH'} (Low idx: {recent_low_idx}, High idx: {recent_high_idx})"
+        }
+    except Exception as e:
+        print(f"Error in analyze_recent_extrema_3m: {e}")
+        return {"error": str(e), "condition_met": False}
+
+def analyze_recent_extrema_5m(timeframe_extrema_data):
+    """
+    Analyzes if the most recent extremum in the 5m timeframe was a low.
+    Condition is met if the most recent low occurred after the most recent high.
+    """
+    try:
+        if '5m' not in timeframe_extrema_data:
+            return {"error": "5m data not available in timeframe_extrema", "condition_met": False}
+
+        data = timeframe_extrema_data['5m']
+        recent_high_idx = data.get('recent_high_idx')
+        recent_low_idx = data.get('recent_low_idx')
+
+        if recent_high_idx is None or recent_low_idx is None:
+            return {"error": "Extrema indices not calculated for 5m", "condition_met": False}
+
+        condition_met = recent_low_idx > recent_high_idx
+
+        return {
+            "condition_met": condition_met,
+            "timeframe": "5m",
+            "recent_high_idx": recent_high_idx,
+            "recent_low_idx": recent_low_idx,
+            "description": f"Most recent extremum was a {'LOW' if condition_met else 'HIGH'} (Low idx: {recent_low_idx}, High idx: {recent_high_idx})"
+        }
+    except Exception as e:
+        print(f"Error in analyze_recent_extrema_5m: {e}")
+        return {"error": str(e), "condition_met": False}
+
 
 # =========================================================
 # MAIN TRADING LOOP
@@ -1024,7 +999,12 @@ try:
         # Fetch candles for multiple timeframes
         candle_map = fetch_candles_in_parallel(['1m', '3m', '5m'])
         candles_1m = candle_map.get('1m', [])
+        candles_3m = candle_map.get('3m', [])
+        candles_5m = candle_map.get('5m', [])
         
+        # NEW: Populate the global timeframe_extrema dictionary
+        analyze_multiple_timeframe_extrema(candles_1m, candles_3m, candles_5m)
+
         if not candles_1m:
             print("Error: '1m' candles not fetched. Check API connectivity or symbol.")
         if current_price == Decimal('0.0'):
@@ -1040,9 +1020,9 @@ try:
             "thresholds_1m": False,
             "thresholds_3m": False,
             "thresholds_5m": False,
-            "fft_forecast_1m": False,
-            "fft_forecast_3m": False,
-            "fft_forecast_5m": False,
+            "recent_extrema_1m": False,    # NEW
+            "recent_extrema_3m": False,    # NEW
+            "recent_extrema_5m": False,    # NEW
         }
 
         # Print conditions in order
@@ -1144,7 +1124,7 @@ try:
             
         # Condition 7: Thresholds Analysis (3m)
         print("\n--- Condition 7: Thresholds Analysis (3m) ---")
-        thresholds_3m_result = analyze_thresholds_3m(candle_map.get('3m', []))
+        thresholds_3m_result = analyze_thresholds_3m(candles_3m)
         if 'error' not in thresholds_3m_result:
             conditions_status["thresholds_3m"] = thresholds_3m_result['condition_met']
             print(f"Timeframe: {thresholds_3m_result['timeframe']}")
@@ -1164,7 +1144,7 @@ try:
             
         # Condition 8: Thresholds Analysis (5m)
         print("\n--- Condition 8: Thresholds Analysis (5m) ---")
-        thresholds_5m_result = analyze_thresholds_5m(candle_map.get('5m', []))
+        thresholds_5m_result = analyze_thresholds_5m(candles_5m)
         if 'error' not in thresholds_5m_result:
             conditions_status["thresholds_5m"] = thresholds_5m_result['condition_met']
             print(f"Timeframe: {thresholds_5m_result['timeframe']}")
@@ -1182,87 +1162,55 @@ try:
             print(f"Error analyzing thresholds (5m): {thresholds_5m_result['error']}")
             print(f"Condition Met: {conditions_status['thresholds_5m']}")
 
-        # Condition 9: FFT Forecast (1m)
-        print("\n--- Condition 9: FFT Forecast (1m) ---")
-        fft_forecast_1m_result = analyze_fft_forecast_1m(candles_1m)
-        if 'error' not in fft_forecast_1m_result:
-            conditions_status["fft_forecast_1m"] = fft_forecast_1m_result['condition_met']
-            print(f"Timeframe: {fft_forecast_1m_result['timeframe']}")
-            print(f"Current Price: {fft_forecast_1m_result['current_price']:.2f}")
-            print(f"Next Prediction: {fft_forecast_1m_result['next_prediction']:.2f}")
-            print(f"Forecast Above Close: {fft_forecast_1m_result['forecast_above_close']}")
-            print(f"Cycle Direction: {fft_forecast_1m_result['cycle_direction']}")
-            print(f"Percentage Change: {fft_forecast_1m_result['pct_change']:.4f}%")
-            print(f"Confidence: {fft_forecast_1m_result['confidence']:.4f}")
-            print(f"Sine Component: {fft_forecast_1m_result['sine_component']:.4f}")
-            print(f"Cosine Component: {fft_forecast_1m_result['cosine_component']:.4f}")
-            print(f"Is Top: {fft_forecast_1m_result['is_top']}")
-            print(f"Is Dip: {fft_forecast_1m_result['is_dip']}")
-            print(f"Most Recent Reversal: {fft_forecast_1m_result['most_recent_reversal_type']}")
-            print(f"Min Value: {fft_forecast_1m_result['min_value']:.2f}")
-            print(f"Max Value: {fft_forecast_1m_result['max_value']:.2f}")
-            print(f"Description: {fft_forecast_1m_result['description']}")
-            print(f"Condition Met: {conditions_status['fft_forecast_1m']}")
+        # Condition 9: Recent Extrema Analysis (1m) - NEW
+        print("\n--- Condition 9: Recent Extrema Analysis (1m) ---")
+        extrema_1m_result = analyze_recent_extrema_1m(timeframe_extrema)
+        if 'error' not in extrema_1m_result:
+            conditions_status["recent_extrema_1m"] = extrema_1m_result['condition_met']
+            print(f"Timeframe: {extrema_1m_result['timeframe']}")
+            print(f"Recent High Index: {extrema_1m_result['recent_high_idx']}")
+            print(f"Recent Low Index: {extrema_1m_result['recent_low_idx']}")
+            print(f"Description: {extrema_1m_result['description']}")
+            print(f"Condition Met: {conditions_status['recent_extrema_1m']}")
         else:
-            print(f"Error analyzing FFT forecast (1m): {fft_forecast_1m_result['error']}")
-            print(f"Condition Met: {conditions_status['fft_forecast_1m']}")
+            print(f"Error analyzing recent extrema (1m): {extrema_1m_result['error']}")
+            print(f"Condition Met: {conditions_status['recent_extrema_1m']}")
 
-        # Condition 10: FFT Forecast (3m)
-        print("\n--- Condition 10: FFT Forecast (3m) ---")
-        fft_forecast_3m_result = analyze_fft_forecast_3m(candle_map.get('3m', []))
-        if 'error' not in fft_forecast_3m_result:
-            conditions_status["fft_forecast_3m"] = fft_forecast_3m_result['condition_met']
-            print(f"Timeframe: {fft_forecast_3m_result['timeframe']}")
-            print(f"Current Price: {fft_forecast_3m_result['current_price']:.2f}")
-            print(f"Next Prediction: {fft_forecast_3m_result['next_prediction']:.2f}")
-            print(f"Forecast Above Close: {fft_forecast_3m_result['forecast_above_close']}")
-            print(f"Cycle Direction: {fft_forecast_3m_result['cycle_direction']}")
-            print(f"Percentage Change: {fft_forecast_3m_result['pct_change']:.4f}%")
-            print(f"Confidence: {fft_forecast_3m_result['confidence']:.4f}")
-            print(f"Sine Component: {fft_forecast_3m_result['sine_component']:.4f}")
-            print(f"Cosine Component: {fft_forecast_3m_result['cosine_component']:.4f}")
-            print(f"Is Top: {fft_forecast_3m_result['is_top']}")
-            print(f"Is Dip: {fft_forecast_3m_result['is_dip']}")
-            print(f"Most Recent Reversal: {fft_forecast_3m_result['most_recent_reversal_type']}")
-            print(f"Min Value: {fft_forecast_3m_result['min_value']:.2f}")
-            print(f"Max Value: {fft_forecast_3m_result['max_value']:.2f}")
-            print(f"Description: {fft_forecast_3m_result['description']}")
-            print(f"Condition Met: {conditions_status['fft_forecast_3m']}")
+        # Condition 10: Recent Extrema Analysis (3m) - NEW
+        print("\n--- Condition 10: Recent Extrema Analysis (3m) ---")
+        extrema_3m_result = analyze_recent_extrema_3m(timeframe_extrema)
+        if 'error' not in extrema_3m_result:
+            conditions_status["recent_extrema_3m"] = extrema_3m_result['condition_met']
+            print(f"Timeframe: {extrema_3m_result['timeframe']}")
+            print(f"Recent High Index: {extrema_3m_result['recent_high_idx']}")
+            print(f"Recent Low Index: {extrema_3m_result['recent_low_idx']}")
+            print(f"Description: {extrema_3m_result['description']}")
+            print(f"Condition Met: {conditions_status['recent_extrema_3m']}")
         else:
-            print(f"Error analyzing FFT forecast (3m): {fft_forecast_3m_result['error']}")
-            print(f"Condition Met: {conditions_status['fft_forecast_3m']}")
+            print(f"Error analyzing recent extrema (3m): {extrema_3m_result['error']}")
+            print(f"Condition Met: {conditions_status['recent_extrema_3m']}")
 
-        # Condition 11: FFT Forecast (5m)
-        print("\n--- Condition 11: FFT Forecast (5m) ---")
-        fft_forecast_5m_result = analyze_fft_forecast_5m(candle_map.get('5m', []))
-        if 'error' not in fft_forecast_5m_result:
-            conditions_status["fft_forecast_5m"] = fft_forecast_5m_result['condition_met']
-            print(f"Timeframe: {fft_forecast_5m_result['timeframe']}")
-            print(f"Current Price: {fft_forecast_5m_result['current_price']:.2f}")
-            print(f"Next Prediction: {fft_forecast_5m_result['next_prediction']:.2f}")
-            print(f"Forecast Above Close: {fft_forecast_5m_result['forecast_above_close']}")
-            print(f"Cycle Direction: {fft_forecast_5m_result['cycle_direction']}")
-            print(f"Percentage Change: {fft_forecast_5m_result['pct_change']:.4f}%")
-            print(f"Confidence: {fft_forecast_5m_result['confidence']:.4f}")
-            print(f"Sine Component: {fft_forecast_5m_result['sine_component']:.4f}")
-            print(f"Cosine Component: {fft_forecast_5m_result['cosine_component']:.4f}")
-            print(f"Is Top: {fft_forecast_5m_result['is_top']}")
-            print(f"Is Dip: {fft_forecast_5m_result['is_dip']}")
-            print(f"Most Recent Reversal: {fft_forecast_5m_result['most_recent_reversal_type']}")
-            print(f"Min Value: {fft_forecast_5m_result['min_value']:.2f}")
-            print(f"Max Value: {fft_forecast_5m_result['max_value']:.2f}")
-            print(f"Description: {fft_forecast_5m_result['description']}")
-            print(f"Condition Met: {conditions_status['fft_forecast_5m']}")
+        # Condition 11: Recent Extrema Analysis (5m) - NEW
+        print("\n--- Condition 11: Recent Extrema Analysis (5m) ---")
+        extrema_5m_result = analyze_recent_extrema_5m(timeframe_extrema)
+        if 'error' not in extrema_5m_result:
+            conditions_status["recent_extrema_5m"] = extrema_5m_result['condition_met']
+            print(f"Timeframe: {extrema_5m_result['timeframe']}")
+            print(f"Recent High Index: {extrema_5m_result['recent_high_idx']}")
+            print(f"Recent Low Index: {extrema_5m_result['recent_low_idx']}")
+            print(f"Description: {extrema_5m_result['description']}")
+            print(f"Condition Met: {conditions_status['recent_extrema_5m']}")
         else:
-            print(f"Error analyzing FFT forecast (5m): {fft_forecast_5m_result['error']}")
-            print(f"Condition Met: {conditions_status['fft_forecast_5m']}")
+            print(f"Error analyzing recent extrema (5m): {extrema_5m_result['error']}")
+            print(f"Condition Met: {conditions_status['recent_extrema_5m']}")
+
 
         # Print all conditions with true/false values
         print("\n" + "="*80)
         print("TRADING CONDITIONS STATUS")
         print("="*80)
         
-        # Get results only for active conditions and require ALL to be true.
+        # CHANGE 2 & 3: Get results only for active conditions and require ALL to be true.
         active_conditions_results = [
             conditions_status[condition_name]
             for condition_name in CONFIG['conditions']
@@ -1404,7 +1352,7 @@ try:
 
         del candle_map
         gc.collect()
-        # Strict sleep time of 5 seconds.
+        # CHANGE 4: Strict sleep time of 5 seconds.
         time.sleep(5)
 
 except KeyboardInterrupt:
