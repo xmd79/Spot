@@ -11,6 +11,8 @@ from decimal import Decimal, getcontext
 import pandas as pd
 import warnings
 import os
+from scipy.fft import fft, fftfreq
+from scipy.signal import hilbert
 
 # Set Decimal precision to 25
 getcontext().prec = 25
@@ -46,11 +48,12 @@ CONFIG = {
         "linear_regression_channel_break": True,
         "aroon_only_signal": True,
         "volume_bias_condition": True,
-        "dip_analysis_1m": True,
-        "dip_analysis_3m": True,
-        "dip_analysis_5m": True,
+        "thresholds_1m": True,
+        "thresholds_3m": True,
+        "thresholds_5m": True,
+        "octave_cycle_analysis": True,  # New condition for octave cycle analysis
     },
-    "min_conditions_met": 8  # Corrected to 8 active conditions
+    "min_conditions_met": 9  # Updated to 9 active conditions (including the new one)
 }
 
 # Global variables for market state tracking
@@ -337,280 +340,371 @@ def analyze_volume_bias(candles):
         return {"error": str(e), "condition_met": False}
 
 # =========================================================
-# NEW DIP ANALYSIS FUNCTIONS
+# NEW THRESHOLDS ANALYSIS FUNCTION
 # =========================================================
 
-def calculate_compounded_sinusoidal_oscillator(price_data, volume_data, period=14):
-    """
-    Create a single compounded sinusoidal oscillator combining price and volume.
-    This oscillator represents the combined wave pattern of price and volume.
-    """
+def analyze_thresholds_by_timeframe(candles, timeframe):
     try:
-        if len(price_data) < period * 2 or len(volume_data) < period * 2:
-            return None, None
+        if not candles:
+            return {"error": f"No {timeframe} data provided", "condition_met": False}
         
-        # Normalize both price and volume to 0-1 range
-        price_min, price_max = np.min(price_data), np.max(price_data)
-        volume_min, volume_max = np.min(volume_data), np.max(volume_data)
-        
-        if price_max == price_min or volume_max == volume_min:
-            return None, None
-        
-        normalized_price = (price_data - price_min) / (price_max - price_min)
-        normalized_volume = (volume_data - volume_min) / (volume_max - volume_min)
-        
-        # Create compounded oscillator using weighted combination
-        # Price gets 60% weight, volume gets 40% weight (adjustable)
-        price_weight = 0.6
-        volume_weight = 0.4
-        
-        compounded_oscillator = np.zeros_like(normalized_price)
-        
-        for i in range(period, len(normalized_price)):
-            # Calculate phase shift for this point
-            phase = 2 * np.pi * i / period
-            
-            # Create compounded wave: price and volume interact to create a single wave
-            # When price is decreasing and volume is increasing, we get a specific pattern
-            price_component = normalized_price[i] * np.sin(phase)
-            volume_component = normalized_volume[i] * np.cos(phase)
-            
-            # Combine with weights
-            compounded_oscillator[i] = (price_weight * price_component) + (volume_weight * volume_component)
-        
-        # Calculate the derivative to find turning points
-        oscillator_derivative = np.gradient(compounded_oscillator)
-        
-        return compounded_oscillator, oscillator_derivative
-        
-    except Exception as e:
-        print(f"Error in calculate_compounded_sinusoidal_oscillator: {e}")
-        return None, None
-
-def predict_prices_with_fft(candles, num_predictions=5, filter_ratio=0.8, timeframe="1m"):
-    """
-    Predict prices using FFT with timeframe-specific parameters.
-    """
-    try:
-        if not candles or len(candles) < 10:
-            return {"error": "Insufficient data for FFT prediction"}
-        
-        # Adjust parameters based on timeframe
-        if timeframe == "1m":
-            lookback = min(15, len(candles))
-            max_change_pct = 0.001  # 0.1% max change
-            filter_ratio = 0.7
-        elif timeframe == "3m":
-            lookback = min(20, len(candles))
-            max_change_pct = 0.002  # 0.2% max change
-            filter_ratio = 0.75
-        elif timeframe == "5m":
-            lookback = min(25, len(candles))
-            max_change_pct = 0.003  # 0.3% max change
-            filter_ratio = 0.8
-        else:
-            lookback = min(15, len(candles))
-            max_change_pct = 0.001
-            filter_ratio = 0.7
-        
-        recent_candles = candles[-lookback:] if len(candles) > lookback else candles
-        close_prices = np.array([candle["close"] for candle in recent_candles], dtype=np.float64)
-        
-        window_size = min(3, len(close_prices) // 3)
-        if window_size < 3:
-            window_size = 3
-        
-        weights = np.ones(window_size) / window_size
-        moving_avg = np.convolve(close_prices, weights, mode='valid')
-        padding = np.zeros(len(close_prices) - len(moving_avg))
-        moving_avg = np.concatenate([padding, moving_avg])
-        
-        detrended = close_prices - moving_avg
-        fft_values = np.fft.fft(detrended)
-        
-        fft_abs = np.abs(fft_values)
-        threshold = np.max(fft_abs) * (1 - filter_ratio)
-        mask = fft_abs > threshold
-        filtered_fft = fft_values * mask
-        
-        extended_fft = np.zeros(len(filtered_fft) + 1, dtype=complex)
-        extended_fft[:len(filtered_fft)] = filtered_fft
-        extended_detrended = np.fft.ifft(extended_fft).real
-        
-        last_ma_value = moving_avg[-1]
-        next_pred_detrended = extended_detrended[-1]
-        next_prediction = next_pred_detrended + last_ma_value
-        
-        current_price = close_prices[-1]
-        change_pct = (next_prediction - current_price) / current_price
-        
-        if abs(change_pct) > max_change_pct:
-            constrained_prediction = current_price * (1 + max_change_pct if change_pct > 0 else 1 - max_change_pct)
-        else:
-            constrained_prediction = next_prediction
-        
-        predictions = []
-        for i in range(num_predictions):
-            # Adjust variation based on timeframe
-            variation_factor = 0.02 if timeframe == "1m" else 0.03 if timeframe == "3m" else 0.04
-            variation = (1 - (i * variation_factor)) if change_pct > 0 else (1 + (i * variation_factor))
-            predictions.append(constrained_prediction * variation)
-        
-        confidence = np.sum(mask) / len(mask)
-        prediction_direction = "Up" if predictions[0] > current_price else "Down"
-        pct_change = ((predictions[0] - current_price) / current_price) * 100
-        
-        return {
-            "current_price": current_price,
-            "predictions": predictions,
-            "num_predictions": num_predictions,
-            "confidence": confidence,
-            "prediction_direction": prediction_direction,
-            "pct_change": pct_change,
-            "filter_ratio": filter_ratio,
-            "window_size": window_size,
-            "data_points": len(close_prices),
-            "max_change_pct": max_change_pct * 100,
-            "timeframe": timeframe
-        }
-        
-    except Exception as e:
-        print(f"Error in FFT prediction: {e}")
-        return {"error": str(e)}
-
-def identify_local_dips_with_compounded_oscillator(candles, timeframe):
-    """
-    Identify local dips using a compounded sinusoidal oscillator that combines price and volume.
-    This creates a single wave pattern representing the interaction between price and volume.
-    """
-    try:
-        if not candles or len(candles) < 50:
-            return {"error": f"Insufficient data for {timeframe} dip analysis", "condition_met": False}
-        
-        # Extract price and volume data
         close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
-        volumes = np.array([candle["volume"] for candle in candles], dtype=np.float64)
         
-        # Calculate compounded sinusoidal oscillator
-        compounded_oscillator, oscillator_derivative = calculate_compounded_sinusoidal_oscillator(close_prices, volumes, period=14)
+        if len(close_prices) < 14:
+            return {"error": f"Insufficient data for {timeframe} analysis", "condition_met": False}
         
-        if compounded_oscillator is None or oscillator_derivative is None:
-            return {"error": f"Failed to calculate compounded oscillator for {timeframe}", "condition_met": False}
+        lookback = min(1200, len(close_prices))
+        recent_closes = close_prices[-lookback:]
         
-        # Find recent local minimum in price
-        lookback = min(100, len(close_prices) // 4)
-        recent_prices = close_prices[-lookback:]
-        recent_volumes = volumes[-lookback:]
-        recent_oscillator = compounded_oscillator[-lookback:]
-        recent_derivative = oscillator_derivative[-lookback:]
+        min_idx = np.argmin(recent_closes)
+        max_idx = np.argmax(recent_closes)
         
-        # Find local minimum in price
-        min_idx = np.argmin(recent_prices)
-        local_dip_price = recent_prices[min_idx]
-        local_dip_idx = len(close_prices) - lookback + min_idx
+        actual_min_idx = len(close_prices) - lookback + min_idx
+        actual_max_idx = len(close_prices) - lookback + max_idx
         
-        # Current price
+        min_value = recent_closes[min_idx]
+        max_value = recent_closes[max_idx]
+        
         current_price = close_prices[-1]
         
-        # Calculate price range for zone classification
-        price_range = np.max(recent_prices) - np.min(recent_prices)
+        hilo_range = max_value - min_value
         
-        # Classify zone
-        zone_position = (current_price - np.min(recent_prices)) / price_range if price_range > 0 else 0.5
+        dist_to_min = current_price - min_value
+        dist_to_max = max_value - current_price
         
-        if zone_position < 0.33:
-            zone = "DIP ZONE"
-        elif zone_position < 0.67:
-            zone = "MIDDLE ZONE"
-        else:
-            zone = "TOP ZONE"
+        percent_to_min = (dist_to_min / hilo_range) * 100 if hilo_range > 0 else 0
+        percent_to_max = (dist_to_max / hilo_range) * 100 if hilo_range > 0 else 0
         
-        # Check for volume confirmation at the dip
-        dip_volume = recent_volumes[min_idx]
-        avg_volume = np.mean(recent_volumes)
-        volume_confirmation = dip_volume > avg_volume * 1.2  # 20% above average volume
-        
-        # Analyze the compounded oscillator at the dip point
-        dip_oscillator_value = recent_oscillator[min_idx]
-        dip_derivative_value = recent_derivative[min_idx]
-        
-        # Key conditions for dip formation:
-        # 1. Oscillator should be at or near a local minimum (negative value)
-        # 2. Derivative should be changing from negative to positive (bottoming out)
-        # 3. Volume should be elevated at the dip
-        
-        oscillator_at_minimum = dip_oscillator_value < -0.1  # Oscillator in negative territory
-        derivative_bottoming = dip_derivative_value > -0.05  # Derivative indicating bottom
-        
-        # Combined confirmation using the compounded oscillator
-        dip_confirmed = (
-            oscillator_at_minimum and 
-            derivative_bottoming and 
-            volume_confirmation
-        )
-        
-        # Calculate oscillator strength
-        oscillator_strength = abs(dip_oscillator_value)
-        oscillator_phase = "BOTTOMING" if derivative_bottoming else "DECLINING"
-        
-        # FFT prediction for potential reversal with timeframe-specific parameters
-        fft_result = predict_prices_with_fft(candles, num_predictions=5, filter_ratio=0.8, timeframe=timeframe)
-        
-        if "error" in fft_result:
-            return {"error": f"FFT prediction failed for {timeframe}: {fft_result['error']}", "condition_met": False}
-        
-        forecast_price = fft_result["predictions"][0]
-        forecast_direction = fft_result["prediction_direction"]
-        
-        # Calculate percentage differences
-        current_to_dip_pct = ((current_price - local_dip_price) / current_price) * 100 if current_price > 0 else 0
-        current_to_forecast_pct = ((forecast_price - current_price) / current_price) * 100 if current_price > 0 else 0
-        
-        # Condition for valid dip with upward potential
-        condition_met = (
-            dip_confirmed and 
-            (forecast_direction == "Up" or current_to_forecast_pct > -0.05) and  # Allow small negative forecast
-            current_to_dip_pct > 0.05 and  # At least 0.05% above the dip
-            oscillator_strength > 0.1  # Sufficient oscillator strength
-        )
+        condition_met = dist_to_min < dist_to_max
         
         return {
             "timeframe": timeframe,
             "condition_met": condition_met,
             "current_price": current_price,
-            "local_dip_price": local_dip_price,
-            "local_dip_idx": local_dip_idx,
-            "zone": zone,
-            "zone_position": zone_position,
-            "volume_confirmation": volume_confirmation,
-            "dip_oscillator_value": dip_oscillator_value,
-            "dip_derivative_value": dip_derivative_value,
-            "oscillator_strength": oscillator_strength,
-            "oscillator_phase": oscillator_phase,
-            "dip_confirmed": dip_confirmed,
-            "forecast_price": forecast_price,
-            "forecast_direction": forecast_direction,
-            "current_to_dip_pct": current_to_dip_pct,
-            "current_to_forecast_pct": current_to_forecast_pct,
-            "description": f"Local dip at {local_dip_price:.2f} in {zone}, oscillator phase: {oscillator_phase}, forecast: {forecast_price:.2f} ({forecast_direction})",
-            "fft_timeframe": fft_result["timeframe"],
-            "max_change_pct": fft_result["max_change_pct"]
+            "min_value": min_value,
+            "max_value": max_value,
+            "min_idx": actual_min_idx,
+            "max_idx": actual_max_idx,
+            "hilo_range": hilo_range,
+            "dist_to_min": dist_to_min,
+            "dist_to_max": dist_to_max,
+            "percent_to_min": percent_to_min,
+            "percent_to_max": percent_to_max,
+            "description": f"Distance to min ({dist_to_min:.2f}) is {'less than' if condition_met else 'greater than'} distance to max ({dist_to_max:.2f})"
         }
         
     except Exception as e:
-        print(f"Error analyzing dips ({timeframe}): {e}")
+        print(f"Error analyzing thresholds ({timeframe}): {e}")
         import traceback
         traceback.print_exc()
         return {"error": str(e), "condition_met": False}
 
-def analyze_dip_1m(candles_1m):
-    return identify_local_dips_with_compounded_oscillator(candles_1m, "1m")
+def analyze_thresholds_1m(candles_1m):
+    return analyze_thresholds_by_timeframe(candles_1m, "1m")
 
-def analyze_dip_3m(candles_3m):
-    return identify_local_dips_with_compounded_oscillator(candles_3m, "3m")
+def analyze_thresholds_3m(candles_3m):
+    return analyze_thresholds_by_timeframe(candles_3m, "3m")
 
-def analyze_dip_5m(candles_5m):
-    return identify_local_dips_with_compounded_oscillator(candles_5m, "5m")
+def analyze_thresholds_5m(candles_5m):
+    return analyze_thresholds_by_timeframe(candles_5m, "5m")
+
+# =========================================================
+# NEW OCTAVE CYCLE ANALYSIS FUNCTION
+# =========================================================
+
+def phase_shear(signal):
+    """Calculate phase shear in signal"""
+    try:
+        analytic = hilbert(signal)
+        phase = np.unwrap(np.angle(analytic))
+        dphi = np.diff(phase)
+        return np.std(dphi)  # high = MI→FA shock
+    except Exception as e:
+        print(f"Error in phase_shear: {e}")
+        return 0
+
+def detuned_energy(signal, fs):
+    """Calculate detuned energy around a frequency relative to the sampling rate"""
+    try:
+        fft = np.fft.rfft(signal)
+        freqs = np.fft.rfftfreq(len(signal), 1/fs)
+        
+        # Instead of using a fixed 77.3 Hz, we'll use a relative frequency
+        # based on the sampling rate of our data
+        # For 1-minute data (fs=1/60), we'll look at a relative frequency
+        # that represents a similar position in the spectrum
+        
+        # Calculate a relative target frequency based on the sampling rate
+        # This represents a frequency that's in a similar relative position
+        # as 77.3 Hz would be in a higher frequency signal
+        target = fs * 0.4  # 40% of the Nyquist frequency
+        bandwidth = fs * 0.1  # 10% bandwidth
+        
+        band = (freqs > target - bandwidth) & (freqs < target + bandwidth)
+        
+        if np.any(band):
+            phase_var = np.var(np.angle(fft[band]))
+            return phase_var
+        else:
+            return 0
+    except Exception as e:
+        print(f"Error in detuned_energy: {e}")
+        return 0
+
+def calculate_octave_thresholds(close_prices, period=14):
+    """
+    Calculate thresholds based on min and max values using argmin/argmax and their hilo range.
+    """
+    try:
+        # Convert close_prices to numpy array
+        close_prices = np.array(close_prices)
+        
+        # Find the actual min and max values and their indices using argmin and argmax
+        min_value = np.nanmin(close_prices)
+        max_value = np.nanmax(close_prices)
+        min_idx = np.nanargmin(close_prices)
+        max_idx = np.nanargmax(close_prices)
+        
+        # Calculate the hilo range between min and max
+        hilo_range = max_value - min_value
+        
+        # Calculate middle threshold (midpoint of hilo range)
+        middle_threshold = (min_value + max_value) / 2
+        
+        # Calculate momentum
+        momentum = talib.MOM(close_prices, timeperiod=period)
+        
+        # Get min/max momentum    
+        min_momentum = np.nanmin(momentum)   
+        max_momentum = np.nanmax(momentum)
+        
+        # Get current momentum       
+        current_momentum = momentum[-1]
+
+        # Calculate % to min/max momentum    
+        with np.errstate(invalid='ignore', divide='ignore'):
+            percent_to_min_momentum = ((max_momentum - current_momentum) /   
+                                       (max_momentum - min_momentum)) * 100 if max_momentum - min_momentum != 0 else np.nan               
+
+            percent_to_max_momentum = ((current_momentum - min_momentum) / 
+                                       (max_momentum - min_momentum)) * 100 if max_momentum - min_momentum != 0 else np.nan
+     
+        # Calculate combined percentages              
+        percent_to_min_combined = percent_to_min_momentum / 2         
+        percent_to_max_combined = percent_to_max_momentum / 2
+          
+        # Combined momentum signal     
+        momentum_signal = percent_to_max_combined - percent_to_min_combined
+        
+        # Determine current cycle phase based on the Law of Octaves
+        current_cycle_phase = "UNKNOWN"
+        cycle_strength = 0
+        
+        # Calculate phase shear and detuned energy
+        phase_shear_value = phase_shear(close_prices)
+        
+        # Calculate sampling frequency (1 point per minute = 1/60 Hz)
+        fs = 1/60  # Hz
+        detuned_energy_value = detuned_energy(close_prices, fs)
+        
+        # Determine if we're in an MI→FA transition (phase shear)
+        if phase_shear_value > 0.5:  # Threshold for significant phase shear
+            current_cycle_phase = "MI_FA_TRANSITION"
+            cycle_strength = min(phase_shear_value * 10, 100)  # Scale to 0-100
+        # Determine if we're in a stable octave step
+        elif momentum_signal > 0:
+            current_cycle_phase = "UPWARD_OCTAVE"
+            cycle_strength = min(momentum_signal, 100)
+        elif momentum_signal < 0:
+            current_cycle_phase = "DOWNWARD_OCTAVE"
+            cycle_strength = min(abs(momentum_signal), 100)
+        else:
+            current_cycle_phase = "STABLE"
+            cycle_strength = 0
+        
+        # Forecast next price based on current cycle phase
+        current_price = close_prices[-1]
+        forecast_price = current_price  # Default to current price
+        
+        if current_cycle_phase == "MI_FA_TRANSITION":
+            # In transition, forecast could be in either direction
+            # Use the middle threshold as a pivot point
+            if current_price > middle_threshold:
+                # Above middle, forecast slight upward movement
+                forecast_price = current_price + (max_value - current_price) * 0.1
+            else:
+                # Below middle, forecast slight downward movement
+                forecast_price = current_price - (current_price - min_value) * 0.1
+        elif current_cycle_phase == "UPWARD_OCTAVE":
+            # Upward trend, forecast toward max value
+            # The closer we are to max, the smaller the forecast increase
+            if current_price > middle_threshold:
+                # Already in upper half, forecast modest increase
+                forecast_price = current_price + (max_value - current_price) * (cycle_strength / 200)
+            else:
+                # In lower half, forecast stronger increase
+                forecast_price = current_price + (max_value - current_price) * (cycle_strength / 100)
+        elif current_cycle_phase == "DOWNWARD_OCTAVE":
+            # Downward trend, forecast toward min value
+            # The closer we are to min, the smaller the forecast decrease
+            if current_price < middle_threshold:
+                # Already in lower half, forecast modest decrease
+                forecast_price = current_price - (current_price - min_value) * (cycle_strength / 200)
+            else:
+                # In upper half, forecast stronger decrease
+                forecast_price = current_price - (current_price - min_value) * (cycle_strength / 100)
+        else:
+            # Stable, forecast stays near current price
+            forecast_price = current_price
+        
+        # Calculate average of all prices
+        avg_mtf = np.nanmean(close_prices)
+
+        return {
+            "min_value": min_value,
+            "max_value": max_value,
+            "middle_threshold": middle_threshold,
+            "min_idx": min_idx,
+            "max_idx": max_idx,
+            "hilo_range": hilo_range,
+            "avg_mtf": avg_mtf,
+            "momentum_signal": momentum_signal,
+            "current_cycle_phase": current_cycle_phase,
+            "cycle_strength": cycle_strength,
+            "forecast_price": forecast_price,
+            "phase_shear": phase_shear_value,
+            "detuned_energy": detuned_energy_value
+        }
+    except Exception as e:
+        print(f"Error in calculate_octave_thresholds: {e}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "min_value": 0,
+            "max_value": 0,
+            "middle_threshold": 0,
+            "min_idx": 0,
+            "max_idx": 0,
+            "hilo_range": 0,
+            "avg_mtf": 0,
+            "momentum_signal": 0,
+            "current_cycle_phase": "ERROR",
+            "cycle_strength": 0,
+            "forecast_price": 0,
+            "phase_shear": 0,
+            "detuned_energy": 0
+        }
+
+def analyze_octave_cycle(candles):
+    """
+    Analyze the current market cycle using the Law of Octaves.
+    """
+    try:
+        if not candles or len(candles) < 100:
+            return {"error": "Insufficient data for octave cycle analysis", "condition_met": False}
+        
+        close_prices = np.array([candle["close"] for candle in candles], dtype=np.float64)
+        
+        # Calculate octave thresholds with only period parameter
+        octave_data = calculate_octave_thresholds(
+            close_prices, 
+            period=14
+        )
+        
+        # Get current price and forecast price
+        current_price = close_prices[-1]
+        forecast_price = octave_data["forecast_price"]
+        
+        # More reasonable condition evaluation:
+        # 1. If we're in an UPWARD_OCTAVE phase and forecast is above current price, condition is met
+        # 2. If we're in an MI_FA_TRANSITION phase and forecast is above current price, condition is met
+        # 3. If we're in a DOWNWARD_OCTAVE phase, condition is not met
+        # 4. If we're in STABLE phase, condition is not met
+        
+        condition_met = False
+        
+        if octave_data["current_cycle_phase"] == "UPWARD_OCTAVE" and forecast_price > current_price:
+            condition_met = True
+        elif octave_data["current_cycle_phase"] == "MI_FA_TRANSITION" and forecast_price > current_price:
+            condition_met = True
+        elif octave_data["current_cycle_phase"] == "DOWNWARD_OCTAVE":
+            condition_met = False
+        elif octave_data["current_cycle_phase"] == "STABLE":
+            condition_met = False
+        
+        # Add additional context for decision making
+        min_value = octave_data["min_value"]
+        max_value = octave_data["max_value"]
+        middle_threshold = octave_data["middle_threshold"]
+        min_idx = octave_data["min_idx"]
+        max_idx = octave_data["max_idx"]
+        hilo_range = octave_data["hilo_range"]
+        
+        # Determine which threshold is closest to the current close
+        closest_threshold = "middle"
+        min_dist = abs(current_price - min_value)
+        max_dist = abs(current_price - max_value)
+        middle_dist = abs(current_price - middle_threshold)
+        
+        if min_dist < middle_dist and min_dist < max_dist:
+            closest_threshold = "min"
+        elif max_dist < middle_dist and max_dist < min_dist:
+            closest_threshold = "max"
+        
+        # Calculate time since min/max occurred
+        total_periods = len(close_prices)
+        periods_since_min = total_periods - min_idx - 1
+        periods_since_max = total_periods - max_idx - 1
+        
+        # Find most recent extrema
+        most_recent_extrema = "min" if min_idx > max_idx else "max"
+        most_recent_extrema_idx = max_idx if max_idx > min_idx else min_idx
+        most_recent_extrema_value = max_value if max_idx > min_idx else min_value
+        periods_since_most_recent = total_periods - most_recent_extrema_idx - 1
+        
+        # Create description of current state
+        description = f"Current cycle phase: {octave_data['current_cycle_phase']} with strength {octave_data['cycle_strength']:.2f}. "
+        description += f"Price is closest to {closest_threshold} threshold. "
+        description += f"Forecast price: {forecast_price:.2f}. "
+        description += f"Min value {min_value:.2f} occurred {periods_since_min} periods ago. "
+        description += f"Max value {max_value:.2f} occurred {periods_since_max} periods ago. "
+        description += f"Most recent extrema: {most_recent_extrema} value {most_recent_extrema_value:.2f} occurred {periods_since_most_recent} periods ago. "
+        
+        if condition_met:
+            description += "Condition met for upward movement."
+        else:
+            description += "Condition not met for upward movement."
+        
+        return {
+            "condition_met": condition_met,
+            "current_price": current_price,
+            "min_value": min_value,
+            "max_value": max_value,
+            "middle_threshold": middle_threshold,
+            "min_idx": min_idx,
+            "max_idx": max_idx,
+            "hilo_range": hilo_range,
+            "periods_since_min": periods_since_min,
+            "periods_since_max": periods_since_max,
+            "forecast_price": forecast_price,
+            "closest_threshold": closest_threshold,
+            "current_cycle_phase": octave_data["current_cycle_phase"],
+            "cycle_strength": octave_data["cycle_strength"],
+            "momentum_signal": octave_data["momentum_signal"],
+            "phase_shear": octave_data["phase_shear"],
+            "detuned_energy": octave_data["detuned_energy"],
+            "most_recent_extrema": most_recent_extrema,
+            "most_recent_extrema_idx": most_recent_extrema_idx,
+            "most_recent_extrema_value": most_recent_extrema_value,
+            "periods_since_most_recent": periods_since_most_recent,
+            "description": description
+        }
+        
+    except Exception as e:
+        print(f"Error in analyze_octave_cycle: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "condition_met": False}
 
 # =========================================================
 # ENHANCED TECHNICAL ANALYSIS FUNCTIONS
@@ -1103,9 +1197,10 @@ try:
             "linear_regression_channel_break": False,
             "aroon_only_signal": False,
             "volume_bias_condition": False,
-            "dip_analysis_1m": False,
-            "dip_analysis_3m": False,
-            "dip_analysis_5m": False,
+            "thresholds_1m": False,
+            "thresholds_3m": False,
+            "thresholds_5m": False,
+            "octave_cycle_analysis": False,  # New condition for octave cycle analysis
         }
 
         # Print conditions in order
@@ -1185,93 +1280,96 @@ try:
             print(f"Error analyzing volume bias: {volume_bias_result['error']}")
             print(f"Condition Met: {conditions_status['volume_bias_condition']}")
 
-        # Condition 6: Dip Analysis (1m)
-        print("\n--- Condition 6: Dip Analysis (1m) ---")
-        dip_1m_result = analyze_dip_1m(candles_1m)
-        if 'error' not in dip_1m_result:
-            conditions_status["dip_analysis_1m"] = dip_1m_result['condition_met']
-            print(f"Timeframe: {dip_1m_result['timeframe']}")
-            print(f"Current Price: {dip_1m_result['current_price']:.2f}")
-            print(f"Local Dip Price: {dip_1m_result['local_dip_price']:.2f} at index {dip_1m_result['local_dip_idx']}")
-            print(f"Zone: {dip_1m_result['zone']}")
-            print(f"Zone Position: {dip_1m_result['zone_position']:.2f}")
-            print(f"Volume Confirmation: {dip_1m_result['volume_confirmation']}")
-            print(f"Oscillator Value: {dip_1m_result['dip_oscillator_value']:.4f}")
-            print(f"Oscillator Strength: {dip_1m_result['oscillator_strength']:.4f}")
-            print(f"Oscillator Phase: {dip_1m_result['oscillator_phase']}")
-            print(f"Dip Confirmed: {dip_1m_result['dip_confirmed']}")
-            print(f"Forecast Price: {dip_1m_result['forecast_price']:.2f}")
-            print(f"Forecast Direction: {dip_1m_result['forecast_direction']}")
-            print(f"Current to Dip: {dip_1m_result['current_to_dip_pct']:.2f}%")
-            print(f"Current to Forecast: {dip_1m_result['current_to_forecast_pct']:.2f}%")
-            print(f"FFT Timeframe: {dip_1m_result.get('fft_timeframe', 'N/A')}")
-            print(f"Max Change %: {dip_1m_result.get('max_change_pct', 'N/A'):.3f}%")
-            print(f"Description: {dip_1m_result['description']}")
-            print(f"Condition Met: {conditions_status['dip_analysis_1m']}")
+        # Condition 6: Thresholds Analysis (1m)
+        print("\n--- Condition 6: Thresholds Analysis (1m) ---")
+        thresholds_1m_result = analyze_thresholds_1m(candles_1m)
+        if 'error' not in thresholds_1m_result:
+            conditions_status["thresholds_1m"] = thresholds_1m_result['condition_met']
+            print(f"Timeframe: {thresholds_1m_result['timeframe']}")
+            print(f"Current Price: {thresholds_1m_result['current_price']:.2f}")
+            print(f"Min Value: {thresholds_1m_result['min_value']:.2f} at index {thresholds_1m_result['min_idx']}")
+            print(f"Max Value: {thresholds_1m_result['max_value']:.2f} at index {thresholds_1m_result['max_idx']}")
+            print(f"HiLo Range: {thresholds_1m_result['hilo_range']:.2f}")
+            print(f"Distance to Min: {thresholds_1m_result['dist_to_min']:.2f}")
+            print(f"Distance to Max: {thresholds_1m_result['dist_to_max']:.2f}")
+            print(f"Percent to Min: {thresholds_1m_result['percent_to_min']:.2f}%")
+            print(f"Percent to Max: {thresholds_1m_result['percent_to_max']:.2f}%")
+            print(f"Description: {thresholds_1m_result['description']}")
+            print(f"Condition Met: {conditions_status['thresholds_1m']}")
         else:
-            print(f"Error analyzing dip (1m): {dip_1m_result['error']}")
-            print(f"Condition Met: {conditions_status['dip_analysis_1m']}")
+            print(f"Error analyzing thresholds (1m): {thresholds_1m_result['error']}")
+            print(f"Condition Met: {conditions_status['thresholds_1m']}")
             
-        # Condition 7: Dip Analysis (3m)
-        print("\n--- Condition 7: Dip Analysis (3m) ---")
-        dip_3m_result = analyze_dip_3m(candle_map.get('3m', []))
-        if 'error' not in dip_3m_result:
-            conditions_status["dip_analysis_3m"] = dip_3m_result['condition_met']
-            print(f"Timeframe: {dip_3m_result['timeframe']}")
-            print(f"Current Price: {dip_3m_result['current_price']:.2f}")
-            print(f"Local Dip Price: {dip_3m_result['local_dip_price']:.2f} at index {dip_3m_result['local_dip_idx']}")
-            print(f"Zone: {dip_3m_result['zone']}")
-            print(f"Zone Position: {dip_3m_result['zone_position']:.2f}")
-            print(f"Volume Confirmation: {dip_3m_result['volume_confirmation']}")
-            print(f"Oscillator Value: {dip_3m_result['dip_oscillator_value']:.4f}")
-            print(f"Oscillator Strength: {dip_3m_result['oscillator_strength']:.4f}")
-            print(f"Oscillator Phase: {dip_3m_result['oscillator_phase']}")
-            print(f"Dip Confirmed: {dip_3m_result['dip_confirmed']}")
-            print(f"Forecast Price: {dip_3m_result['forecast_price']:.2f}")
-            print(f"Forecast Direction: {dip_3m_result['forecast_direction']}")
-            print(f"Current to Dip: {dip_3m_result['current_to_dip_pct']:.2f}%")
-            print(f"Current to Forecast: {dip_3m_result['current_to_forecast_pct']:.2f}%")
-            print(f"FFT Timeframe: {dip_3m_result.get('fft_timeframe', 'N/A')}")
-            print(f"Max Change %: {dip_3m_result.get('max_change_pct', 'N/A'):.3f}%")
-            print(f"Description: {dip_3m_result['description']}")
-            print(f"Condition Met: {conditions_status['dip_analysis_3m']}")
+        # Condition 7: Thresholds Analysis (3m)
+        print("\n--- Condition 7: Thresholds Analysis (3m) ---")
+        thresholds_3m_result = analyze_thresholds_3m(candle_map.get('3m', []))
+        if 'error' not in thresholds_3m_result:
+            conditions_status["thresholds_3m"] = thresholds_3m_result['condition_met']
+            print(f"Timeframe: {thresholds_3m_result['timeframe']}")
+            print(f"Current Price: {thresholds_3m_result['current_price']:.2f}")
+            print(f"Min Value: {thresholds_3m_result['min_value']:.2f} at index {thresholds_3m_result['min_idx']}")
+            print(f"Max Value: {thresholds_3m_result['max_value']:.2f} at index {thresholds_3m_result['max_idx']}")
+            print(f"HiLo Range: {thresholds_3m_result['hilo_range']:.2f}")
+            print(f"Distance to Min: {thresholds_3m_result['dist_to_min']:.2f}")
+            print(f"Distance to Max: {thresholds_3m_result['dist_to_max']:.2f}")
+            print(f"Percent to Min: {thresholds_3m_result['percent_to_min']:.2f}%")
+            print(f"Percent to Max: {thresholds_3m_result['percent_to_max']:.2f}%")
+            print(f"Description: {thresholds_3m_result['description']}")
+            print(f"Condition Met: {conditions_status['thresholds_3m']}")
         else:
-            print(f"Error analyzing dip (3m): {dip_3m_result['error']}")
-            print(f"Condition Met: {conditions_status['dip_analysis_3m']}")
+            print(f"Error analyzing thresholds (3m): {thresholds_3m_result['error']}")
+            print(f"Condition Met: {conditions_status['thresholds_3m']}")
             
-        # Condition 8: Dip Analysis (5m)
-        print("\n--- Condition 8: Dip Analysis (5m) ---")
-        dip_5m_result = analyze_dip_5m(candle_map.get('5m', []))
-        if 'error' not in dip_5m_result:
-            conditions_status["dip_analysis_5m"] = dip_5m_result['condition_met']
-            print(f"Timeframe: {dip_5m_result['timeframe']}")
-            print(f"Current Price: {dip_5m_result['current_price']:.2f}")
-            print(f"Local Dip Price: {dip_5m_result['local_dip_price']:.2f} at index {dip_5m_result['local_dip_idx']}")
-            print(f"Zone: {dip_5m_result['zone']}")
-            print(f"Zone Position: {dip_5m_result['zone_position']:.2f}")
-            print(f"Volume Confirmation: {dip_5m_result['volume_confirmation']}")
-            print(f"Oscillator Value: {dip_5m_result['dip_oscillator_value']:.4f}")
-            print(f"Oscillator Strength: {dip_5m_result['oscillator_strength']:.4f}")
-            print(f"Oscillator Phase: {dip_5m_result['oscillator_phase']}")
-            print(f"Dip Confirmed: {dip_5m_result['dip_confirmed']}")
-            print(f"Forecast Price: {dip_5m_result['forecast_price']:.2f}")
-            print(f"Forecast Direction: {dip_5m_result['forecast_direction']}")
-            print(f"Current to Dip: {dip_5m_result['current_to_dip_pct']:.2f}%")
-            print(f"Current to Forecast: {dip_5m_result['current_to_forecast_pct']:.2f}%")
-            print(f"FFT Timeframe: {dip_5m_result.get('fft_timeframe', 'N/A')}")
-            print(f"Max Change %: {dip_5m_result.get('max_change_pct', 'N/A'):.3f}%")
-            print(f"Description: {dip_5m_result['description']}")
-            print(f"Condition Met: {conditions_status['dip_analysis_5m']}")
+        # Condition 8: Thresholds Analysis (5m)
+        print("\n--- Condition 8: Thresholds Analysis (5m) ---")
+        thresholds_5m_result = analyze_thresholds_5m(candle_map.get('5m', []))
+        if 'error' not in thresholds_5m_result:
+            conditions_status["thresholds_5m"] = thresholds_5m_result['condition_met']
+            print(f"Timeframe: {thresholds_5m_result['timeframe']}")
+            print(f"Current Price: {thresholds_5m_result['current_price']:.2f}")
+            print(f"Min Value: {thresholds_5m_result['min_value']:.2f} at index {thresholds_5m_result['min_idx']}")
+            print(f"Max Value: {thresholds_5m_result['max_value']:.2f} at index {thresholds_5m_result['max_idx']}")
+            print(f"HiLo Range: {thresholds_5m_result['hilo_range']:.2f}")
+            print(f"Distance to Min: {thresholds_5m_result['dist_to_min']:.2f}")
+            print(f"Distance to Max: {thresholds_5m_result['dist_to_max']:.2f}")
+            print(f"Percent to Min: {thresholds_5m_result['percent_to_min']:.2f}%")
+            print(f"Percent to Max: {thresholds_5m_result['percent_to_max']:.2f}%")
+            print(f"Description: {thresholds_5m_result['description']}")
+            print(f"Condition Met: {conditions_status['thresholds_5m']}")
         else:
-            print(f"Error analyzing dip (5m): {dip_5m_result['error']}")
-            print(f"Condition Met: {conditions_status['dip_analysis_5m']}")
+            print(f"Error analyzing thresholds (5m): {thresholds_5m_result['error']}")
+            print(f"Condition Met: {conditions_status['thresholds_5m']}")
+            
+        # Condition 9: Octave Cycle Analysis (NEW)
+        print("\n--- Condition 9: Octave Cycle Analysis ---")
+        octave_cycle_result = analyze_octave_cycle(candles_1m)
+        if 'error' not in octave_cycle_result:
+            conditions_status["octave_cycle_analysis"] = octave_cycle_result['condition_met']
+            print(f"Current Price: {octave_cycle_result['current_price']:.2f}")
+            print(f"Min Value: {octave_cycle_result['min_value']:.2f} at index {octave_cycle_result['min_idx']} ({octave_cycle_result['periods_since_min']} periods ago)")
+            print(f"Max Value: {octave_cycle_result['max_value']:.2f} at index {octave_cycle_result['max_idx']} ({octave_cycle_result['periods_since_max']} periods ago)")
+            print(f"Most Recent Extrema: {octave_cycle_result['most_recent_extrema']} value {octave_cycle_result['most_recent_extrema_value']:.2f} at index {octave_cycle_result['most_recent_extrema_idx']} ({octave_cycle_result['periods_since_most_recent']} periods ago)")
+            print(f"Middle Threshold: {octave_cycle_result['middle_threshold']:.2f}")
+            print(f"HiLo Range: {octave_cycle_result['hilo_range']:.2f}")
+            print(f"Forecast Price: {octave_cycle_result['forecast_price']:.2f}")
+            print(f"Closest Threshold: {octave_cycle_result['closest_threshold']}")
+            print(f"Current Cycle Phase: {octave_cycle_result['current_cycle_phase']}")
+            print(f"Cycle Strength: {octave_cycle_result['cycle_strength']:.2f}")
+            print(f"Momentum Signal: {octave_cycle_result['momentum_signal']:.2f}")
+            print(f"Phase Shear: {octave_cycle_result['phase_shear']:.4f}")
+            print(f"Detuned Energy: {octave_cycle_result['detuned_energy']:.4f}")
+            print(f"Description: {octave_cycle_result['description']}")
+            print(f"Condition Met: {conditions_status['octave_cycle_analysis']}")
+        else:
+            print(f"Error analyzing octave cycle: {octave_cycle_result['error']}")
+            print(f"Condition Met: {conditions_status['octave_cycle_analysis']}")
 
         # Print all conditions with true/false values
         print("\n" + "="*80)
         print("TRADING CONDITIONS STATUS")
         print("="*80)
         
-        # CHANGE 2 & 3: Get results only for active conditions and require ALL to be true.
+        # Get results only for active conditions and require ALL to be true.
         active_conditions_results = [
             conditions_status[condition_name]
             for condition_name in CONFIG['conditions']
@@ -1413,7 +1511,7 @@ try:
 
         del candle_map
         gc.collect()
-        # CHANGE 4: Strict sleep time of 5 seconds.
+        # Strict sleep time of 5 seconds.
         time.sleep(5)
 
 except KeyboardInterrupt:
