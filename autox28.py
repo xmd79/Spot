@@ -12,6 +12,7 @@ import pandas as pd
 import warnings
 import os
 from scipy import signal
+from scipy.fft import fft, ifft, fftfreq
 
 # Set Decimal precision to 25
 getcontext().prec = 25
@@ -85,14 +86,25 @@ def get_symbol_lot_size_info(symbol):
         print(f"Error fetching symbol info for {symbol}: {e.message}")
         return {'minQty': Decimal('0.00001'), 'stepSize': Decimal('0.00001')}
 
-def get_candles(symbol, timeframe, limit=1200, retries=5, delay=5):
+def get_candles(symbol, timeframe, limit=1200, retries=5, delay=5, endTime=None):
     for attempt in range(retries):
         try:
             # Binance has a limit of 1000 candles for most timeframes
             # Let's try to get the maximum possible and see what we get
             actual_limit = min(limit, 1000)
             
-            klines = client.get_klines(symbol=symbol, interval=timeframe, limit=actual_limit)
+            # Prepare parameters for the API call
+            params = {
+                'symbol': symbol,
+                'interval': timeframe,
+                'limit': actual_limit
+            }
+            
+            # Add endTime if provided
+            if endTime is not None:
+                params['endTime'] = endTime
+            
+            klines = client.get_klines(**params)
             candles = []
             for k in klines:
                 candle = {
@@ -302,35 +314,107 @@ def save_signal_to_file(signal_data):
         print(f"Error saving signal to file: {e}")
 
 # =========================================================
-# NEW SINE WAVE OSCILLATOR FUNCTION
+# THRESHOLDS CALCULATION FUNCTION
 # =========================================================
 
-def analyze_sine_wave_oscillator_5m(candles_5m):
+def calculate_thresholds(close_prices, period=14, minimum_percentage=3, maximum_percentage=3, range_distance=0.05):
     """
-    Analyzes price data using a sine wave oscillator to identify cycles.
-    Uses last available values to determine the current cycle direction.
+    Calculate thresholds and averages based on min and max percentages. 
+    """
+    # Get min/max close    
+    min_close = np.nanmin(close_prices)
+    max_close = np.nanmax(close_prices)
+    
+    # Convert close_prices to numpy array
+    close_prices = np.array(close_prices)
+    
+    # Calculate momentum
+    momentum = talib.MOM(close_prices, timeperiod=period)
+    
+    # Get min/max momentum    
+    min_momentum = np.nanmin(momentum)   
+    max_momentum = np.nanmax(momentum)
+    
+    # Calculate custom percentages 
+    min_percentage_custom = minimum_percentage / 100  
+    max_percentage_custom = maximum_percentage / 100
+
+    # Calculate thresholds       
+    min_threshold = np.minimum(min_close - (max_close - min_close) * min_percentage_custom, close_prices[-1])
+    max_threshold = np.maximum(max_close + (max_close - min_close) * max_percentage_custom, close_prices[-1])
+
+    # Calculate range of prices within a certain distance from the current close price
+    range_price = np.linspace(close_prices[-1] * (1 - range_distance), close_prices[-1] * (1 + range_distance), num=50)
+
+    # Filter close prices
+    with np.errstate(invalid='ignore'):
+        filtered_close = np.where(close_prices < min_threshold, min_threshold, close_prices)      
+        filtered_close = np.where(filtered_close > max_threshold, max_threshold, filtered_close)
+        
+    # Calculate avg    
+    avg_mtf = np.nanmean(filtered_close)
+
+    # Get current momentum       
+    current_momentum = momentum[-1]
+
+    # Calculate % to min/max momentum    
+    with np.errstate(invalid='ignore', divide='ignore'):
+        percent_to_min_momentum = ((max_momentum - current_momentum) /   
+                                   (max_momentum - min_momentum)) * 100 if max_momentum - min_momentum != 0 else np.nan               
+
+        percent_to_max_momentum = ((current_momentum - min_momentum) / 
+                                   (max_momentum - min_momentum)) * 100 if max_momentum - min_momentum != 0 else np.nan
+ 
+    # Calculate combined percentages              
+    percent_to_min_combined = (minimum_percentage + percent_to_min_momentum) / 2         
+    percent_to_max_combined = (maximum_percentage + percent_to_max_momentum) / 2
+      
+    # Combined momentum signal     
+    momentum_signal = percent_to_max_combined - percent_to_min_combined
+
+    return min_threshold, max_threshold, avg_mtf, momentum_signal, range_price
+
+# =========================================================
+# ENHANCED SINE WAVE OSCILLATOR FUNCTION WITH FFT
+# =========================================================
+
+def analyze_sine_wave_oscillator_5m(candles_5m=None):
+    """
+    Analyzes price data using FFT-based sine wave oscillator to identify cycles.
+    Uses Fibonacci scaling and threshold analysis for more accurate predictions.
     - If in an up cycle (approaching a new argmax), condition_met is True
     - If in a down cycle (approaching a new argmin), condition_met is False
-    - Uses Fibonacci scaling to model the wave pattern
-    - Strictly uses the last 1200 5-minute candles for analysis
+    - Uses FFT to identify dominant cycles in price data
+    - Uses thresholds to validate cycle direction
+    - Works with available candles (minimum 500, preferably 1000-1200)
     """
     try:
-        if not candles_5m:
-            return {"error": "No 5m candle data available", "condition_met": False}
+        # Fetch fresh data directly from API to ensure we have the latest candles
+        fresh_candles = get_candles(TRADE_SYMBOL, "5m", limit=1000)
         
-        # Strictly use the last 1200 candles from the 5-minute timeframe
-        if len(candles_5m) >= 1200:
-            candles_to_use = candles_5m[-1200:]
-            print(f"Using last 1200 5-minute candles for analysis (total available: {len(candles_5m)})")
-        else:
-            candles_to_use = candles_5m
-            print(f"Using all available {len(candles_to_use)} 5-minute candles (less than 1200 available)")
+        if not fresh_candles:
+            return {"error": "Failed to fetch fresh 5m candle data", "condition_met": False}
         
-        close_prices = np.array([candle["close"] for candle in candles_to_use], dtype=np.float64)
+        print(f"Fetched {len(fresh_candles)} fresh 5-minute candles from API")
         
-        # Find local minima and maxima
-        minima_indices = signal.argrelextrema(close_prices, np.less, order=10)[0]
-        maxima_indices = signal.argrelextrema(close_prices, np.greater, order=10)[0]
+        # Verify we have sufficient data (minimum 500 candles)
+        if len(fresh_candles) < 500:
+            return {"error": f"Insufficient fresh data: only {len(fresh_candles)} candles, need at least 500", "condition_met": False}
+        
+        # Use the fresh candles for analysis
+        close_prices = np.array([candle["close"] for candle in fresh_candles], dtype=np.float64)
+        
+        # Print timestamp of the first and last candle to verify freshness
+        first_candle_time = datetime.datetime.fromtimestamp(fresh_candles[0]["time"])
+        last_candle_time = datetime.datetime.fromtimestamp(fresh_candles[-1]["time"])
+        print(f"Analyzing data from {first_candle_time} to {last_candle_time}")
+        
+        # Find local minima and maxima with higher order to filter noise
+        # Using order=30 to filter out noise and only detect significant turning points
+        minima_indices = signal.argrelextrema(close_prices, np.less, order=30)[0]
+        maxima_indices = signal.argrelextrema(close_prices, np.greater, order=30)[0]
+        
+        print(f"Found {len(minima_indices)} minima and {len(maxima_indices)} significant extrema")
         
         if len(minima_indices) < 2 or len(maxima_indices) < 2:
             return {"error": "Not enough extrema for cycle analysis", "condition_met": False}
@@ -353,13 +437,61 @@ def analyze_sine_wave_oscillator_5m(candles_5m):
         else:
             print(f"Most recent extremum: ARGMAX (maximum) at index {last_max_idx}")
         
+        # Apply FFT to identify dominant cycles
+        # First, detrend the data to remove linear trend
+        x = np.arange(len(close_prices))
+        coeffs = np.polyfit(x, close_prices, 1)
+        detrended = close_prices - (coeffs[0] * x + coeffs[1])
+        
+        # Apply FFT to detrended data
+        fft_values = fft(detrended)
+        fft_freq = fftfreq(len(detrended))
+        
+        # Find dominant frequencies (excluding the DC component)
+        # We're interested in cycles with periods between 20 and 200 candles
+        valid_indices = np.where((np.abs(fft_freq) > 1/200) & (np.abs(fft_freq) < 1/20))
+        valid_freq = fft_freq[valid_indices]
+        valid_fft = np.abs(fft_values[valid_indices])
+        
+        if len(valid_fft) == 0:
+            return {"error": "No valid frequency components found", "condition_met": False}
+        
+        # Find the dominant frequency
+        dominant_freq_idx = np.argmax(valid_fft)
+        dominant_freq = valid_freq[dominant_freq_idx]
+        dominant_period = 1 / np.abs(dominant_freq)
+        
+        print(f"Dominant cycle period: {dominant_period:.2f} candles")
+        
+        # Calculate thresholds using the provided function
+        min_threshold, max_threshold, avg_mtf, momentum_signal, range_price = calculate_thresholds(
+            close_prices, period=14, minimum_percentage=2, maximum_percentage=2, range_distance=0.05
+        )
+        
+        print(f"Minimum threshold: {min_threshold:.2f}")
+        print(f"Maximum threshold: {max_threshold:.2f}")
+        print(f"Momentum signal: {momentum_signal:.2f}")
+        
+        # Determine which threshold is closest to the current close
+        closest_threshold = min(min_threshold, max_threshold, key=lambda x: abs(x - current_price))
+        
+        if closest_threshold == min_threshold:
+            print("The last minimum value is closest to the current close.")
+            threshold_signal = "UP"
+        elif closest_threshold == max_threshold:
+            print("The last maximum value is closest to the current close.")
+            threshold_signal = "DOWN"
+        else:
+            print("No threshold value found.")
+            threshold_signal = "UNKNOWN"
+        
         # Fibonacci ratios for wave modeling
         fib_ratios = [0.236, 0.382, 0.5, 0.618, 0.786]
         
         # Determine cycle direction based on which extremum is more recent
+        # But also validate with FFT and threshold analysis
         if last_min_idx > last_max_idx:
             # Last extremum was a minimum, so we're in an up cycle
-            condition_met = True  # Up cycle
             cycle_type = "UP"
             next_extremum_type = "MAXIMUM"
             
@@ -389,9 +521,49 @@ def analyze_sine_wave_oscillator_5m(candles_5m):
             # Calculate the time to the next maximum
             time_to_next_max = wave_period - (current_idx - last_min_idx)
             
+            # Primary validation: forecast price should be above current price for UP cycle
+            primary_validation = forecast_price > current_price
+            
+            # FFT validation using actual hilo range between argmin and argmax
+            # Calculate the average period between the most recent argmin and argmax
+            # Find all periods between minima and maxima
+            periods_between_extrema = []
+            
+            # Get all pairs of consecutive minima and maxima
+            all_extrema = sorted(np.concatenate([minima_indices, maxima_indices]))
+            
+            for i in range(1, len(all_extrema)):
+                # Skip if both are minima or both are maxima
+                if (all_extrema[i] in minima_indices and all_extrema[i-1] in minima_indices) or \
+                   (all_extrema[i] in maxima_indices and all_extrema[i-1] in maxima_indices):
+                    continue
+                
+                periods_between_extrema.append(abs(all_extrema[i] - all_extrema[i-1]))
+            
+            # Calculate the average period between extrema
+            if periods_between_extrema:
+                avg_period_between_extrema = np.mean(periods_between_extrema)
+                print(f"Average period between extrema: {avg_period_between_extrema:.2f} candles")
+                
+                # Validate that our wave_period is consistent with historical data
+                # Allow some tolerance (25%) to account for natural variation
+                fft_validation = (avg_period_between_extrema * 0.75 <= wave_period <= avg_period_between_extrema * 1.25)
+            else:
+                print("Not enough extrema pairs to calculate average period")
+                fft_validation = False
+            
+            # Tertiary validation with threshold
+            threshold_validation = (threshold_signal == "UP")
+            
+            # Primary condition is most important
+            condition_met = primary_validation
+            
+            print(f"Primary validation (forecast > current): {primary_validation}")
+            print(f"FFT validation: {fft_validation} (wave_period: {wave_period}, avg_period_between_extrema: {avg_period_between_extrema:.2f})")
+            print(f"Threshold validation: {threshold_validation}")
+            
         else:
             # Last extremum was a maximum, so we're in a down cycle
-            condition_met = False  # Down cycle
             cycle_type = "DOWN"
             next_extremum_type = "MINIMUM"
             
@@ -420,9 +592,50 @@ def analyze_sine_wave_oscillator_5m(candles_5m):
             
             # Calculate the time to the next minimum
             time_to_next_min = wave_period - (current_idx - last_max_idx)
+            
+            # Primary validation: forecast price should be below current price for DOWN cycle
+            primary_validation = forecast_price < current_price
+            
+            # FFT validation using actual hilo range between argmin and argmax
+            # Calculate the average period between the most recent argmin and argmax
+            # Find all periods between minima and maxima
+            periods_between_extrema = []
+            
+            # Get all pairs of consecutive minima and maxima
+            all_extrema = sorted(np.concatenate([minima_indices, maxima_indices]))
+            
+            for i in range(1, len(all_extrema)):
+                # Skip if both are minima or both are maxima
+                if (all_extrema[i] in minima_indices and all_extrema[i-1] in minima_indices) or \
+                   (all_extrema[i] in maxima_indices and all_extrema[i-1] in maxima_indices):
+                    continue
+                
+                periods_between_extrema.append(abs(all_extrema[i] - all_extrema[i-1]))
+            
+            # Calculate the average period between extrema
+            if periods_between_extrema:
+                avg_period_between_extrema = np.mean(periods_between_extrema)
+                print(f"Average period between extrema: {avg_period_between_extrema:.2f} candles")
+                
+                # Validate that our wave_period is consistent with historical data
+                # Allow some tolerance (25%) to account for natural variation
+                fft_validation = (avg_period_between_extrema * 0.75 <= wave_period <= avg_period_between_extrema * 1.25)
+            else:
+                print("Not enough extrema pairs to calculate average period")
+                fft_validation = False
+            
+            # Tertiary validation with threshold
+            threshold_validation = (threshold_signal == "DOWN")
+            
+            # Primary condition is most important
+            condition_met = primary_validation
+            
+            print(f"Primary validation (forecast < current): {primary_validation}")
+            print(f"FFT validation: {fft_validation} (wave_period: {wave_period}, avg_period_between_extrema: {avg_period_between_extrema:.2f})")
+            print(f"Threshold validation: {threshold_validation}")
         
         # Calculate the position in the current cycle (0 to 1)
-        if condition_met:  # Up cycle
+        if cycle_type == "UP":  # Up cycle
             cycle_position = (current_idx - last_min_idx) / wave_period if wave_period > 0 else 0
         else:  # Down cycle
             cycle_position = (current_idx - last_max_idx) / wave_period if wave_period > 0 else 0
@@ -440,7 +653,13 @@ def analyze_sine_wave_oscillator_5m(candles_5m):
             "cycle_position": cycle_position,
             "wave_period": wave_period,
             "fib_amplitude": fib_amplitude,
-            "description": f"Current cycle is {cycle_type}, expecting a new {next_extremum_type} at price {forecast_price:.2f} in {time_to_next_max if condition_met else time_to_next_min} periods"
+            "dominant_period": dominant_period,
+            "min_threshold": min_threshold,
+            "max_threshold": max_threshold,
+            "momentum_signal": momentum_signal,
+            "threshold_signal": threshold_signal,
+            "avg_period_between_extrema": avg_period_between_extrema if 'avg_period_between_extrema' in locals() else None,
+            "description": f"Current cycle is {cycle_type}, expecting a new {next_extremum_type} at price {forecast_price:.2f} in {time_to_next_max if cycle_type == 'UP' else time_to_next_min} periods"
         }
         
     except Exception as e:
@@ -1158,6 +1377,11 @@ try:
             print(f"Cycle Position: {sine_wave_result['cycle_position']:.2f}")
             print(f"Wave Period: {sine_wave_result['wave_period']}")
             print(f"Fib Amplitude: {sine_wave_result['fib_amplitude']:.2f}")
+            print(f"Dominant Period (FFT): {sine_wave_result.get('dominant_period', 'N/A'):.2f}")
+            print(f"Min Threshold: {sine_wave_result.get('min_threshold', 'N/A'):.2f}")
+            print(f"Max Threshold: {sine_wave_result.get('max_threshold', 'N/A'):.2f}")
+            print(f"Momentum Signal: {sine_wave_result.get('momentum_signal', 'N/A'):.2f}")
+            print(f"Threshold Signal: {sine_wave_result.get('threshold_signal', 'N/A')}")
             print(f"Description: {sine_wave_result['description']}")
             print(f"Condition Met: {conditions_status['sine_wave_oscillator_5m']}")
         else:
