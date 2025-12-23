@@ -385,8 +385,17 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
     - If in an up cycle (approaching a new argmax), condition_met is True
     - If in a down cycle (approaching a new argmin), condition_met is False
     - Uses FFT to identify dominant cycles in price data
-    - Uses thresholds to validate cycle direction
+    - Uses enhanced threshold analysis to determine cycle position and stage
     - Works with available candles (minimum 500, preferably 1000-1200)
+    
+    Enhanced Threshold Signal:
+    For up cycles:
+    - Stage 1: When in dip area to middle area
+    - Stage 2: When in middle area to top area
+    
+    For down cycles:
+    - Stage 1: When in top area to middle area
+    - Stage 2: When in middle area to dip area
     """
     try:
         # Fetch fresh data directly from API to ensure we have the latest candles
@@ -472,28 +481,27 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
         print(f"Maximum threshold: {max_threshold:.2f}")
         print(f"Momentum signal: {momentum_signal:.2f}")
         
+        # Calculate the midpoint between min and max thresholds
+        midpoint_threshold = (min_threshold + max_threshold) / 2
+        
         # Determine which threshold is closest to the current close
         closest_threshold = min(min_threshold, max_threshold, key=lambda x: abs(x - current_price))
         
-        if closest_threshold == min_threshold:
-            print("The last minimum value is closest to the current close.")
-            threshold_signal = "UP"
-        elif closest_threshold == max_threshold:
-            print("The last maximum value is closest to the current close.")
-            threshold_signal = "DOWN"
-        else:
-            print("No threshold value found.")
-            threshold_signal = "UNKNOWN"
-        
-        # Fibonacci ratios for wave modeling
-        fib_ratios = [0.236, 0.382, 0.5, 0.618, 0.786]
-        
-        # Determine cycle direction based on which extremum is more recent
-        # But also validate with FFT and threshold analysis
+        # Enhanced threshold signal logic
         if last_min_idx > last_max_idx:
             # Last extremum was a minimum, so we're in an up cycle
             cycle_type = "UP"
             next_extremum_type = "MAXIMUM"
+            
+            # Determine the stage in the up cycle
+            if current_price < midpoint_threshold:
+                # Closer to min_threshold than midpoint
+                threshold_signal = "UP_STAGE_1"  # Dip area to middle area
+                stage_description = "In dip area, moving toward middle area"
+            else:
+                # Closer to max_threshold than midpoint
+                threshold_signal = "UP_STAGE_2"  # Middle area to top area
+                stage_description = "In middle area, moving toward top area"
             
             # Calculate the amplitude and period of the current wave
             # Find the previous maximum before the last minimum
@@ -509,6 +517,7 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
             amplitude = prev_max_value - last_min_value
             
             # Apply Fibonacci scaling to the amplitude
+            fib_ratios = [0.236, 0.382, 0.5, 0.618, 0.786]
             fib_amplitude = amplitude * fib_ratios[3]  # Using 0.618 (golden ratio)
             
             # Calculate the forecast price for the next maximum (should be above current price)
@@ -552,20 +561,27 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
                 print("Not enough extrema pairs to calculate average period")
                 fft_validation = False
             
-            # Tertiary validation with threshold
-            threshold_validation = (threshold_signal == "UP")
-            
             # For UP cycles, condition_met should be True
             condition_met = True
             
             print(f"Primary validation (forecast > current): {primary_validation}")
             print(f"FFT validation: {fft_validation} (wave_period: {wave_period}, avg_period_between_extrema: {avg_period_between_extrema:.2f})")
-            print(f"Threshold validation: {threshold_validation}")
+            print(f"Enhanced threshold signal: {threshold_signal} - {stage_description}")
             
         else:
             # Last extremum was a maximum, so we're in a down cycle
             cycle_type = "DOWN"
             next_extremum_type = "MINIMUM"
+            
+            # Determine the stage in the down cycle
+            if current_price > midpoint_threshold:
+                # Closer to max_threshold than midpoint
+                threshold_signal = "DOWN_STAGE_1"  # Top area to middle area
+                stage_description = "In top area, moving toward middle area"
+            else:
+                # Closer to min_threshold than midpoint
+                threshold_signal = "DOWN_STAGE_2"  # Middle area to dip area
+                stage_description = "In middle area, moving toward dip area"
             
             # Calculate the amplitude and period of the current wave
             # Find the previous minimum before the last maximum
@@ -581,6 +597,7 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
             amplitude = last_max_value - prev_min_value
             
             # Apply Fibonacci scaling to the amplitude
+            fib_ratios = [0.236, 0.382, 0.5, 0.618, 0.786]
             fib_amplitude = amplitude * fib_ratios[3]  # Using 0.618 (golden ratio)
             
             # Calculate the forecast price for the next minimum (should be below current price)
@@ -624,15 +641,12 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
                 print("Not enough extrema pairs to calculate average period")
                 fft_validation = False
             
-            # Tertiary validation with threshold
-            threshold_validation = (threshold_signal == "DOWN")
-            
             # For DOWN cycles, condition_met should be False
             condition_met = False
             
             print(f"Primary validation (forecast < current): {primary_validation}")
             print(f"FFT validation: {fft_validation} (wave_period: {wave_period}, avg_period_between_extrema: {avg_period_between_extrema:.2f})")
-            print(f"Threshold validation: {threshold_validation}")
+            print(f"Enhanced threshold signal: {threshold_signal} - {stage_description}")
         
         # Calculate the position in the current cycle (0 to 1)
         if cycle_type == "UP":  # Up cycle
@@ -656,10 +670,12 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
             "dominant_period": dominant_period,
             "min_threshold": min_threshold,
             "max_threshold": max_threshold,
+            "midpoint_threshold": midpoint_threshold,
             "momentum_signal": momentum_signal,
             "threshold_signal": threshold_signal,
+            "stage_description": stage_description,
             "avg_period_between_extrema": avg_period_between_extrema if 'avg_period_between_extrema' in locals() else None,
-            "description": f"Current cycle is {cycle_type}, expecting a new {next_extremum_type} at price {forecast_price:.2f} in {time_to_next_max if cycle_type == 'UP' else time_to_next_min} periods"
+            "description": f"Current cycle is {cycle_type}, expecting a new {next_extremum_type} at price {forecast_price:.2f} in {time_to_next_max if cycle_type == 'UP' else time_to_next_min} periods. {stage_description}"
         }
         
     except Exception as e:
