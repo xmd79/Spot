@@ -555,8 +555,8 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
             # Tertiary validation with threshold
             threshold_validation = (threshold_signal == "UP")
             
-            # Primary condition is most important
-            condition_met = primary_validation
+            # For UP cycles, condition_met should be True
+            condition_met = True
             
             print(f"Primary validation (forecast > current): {primary_validation}")
             print(f"FFT validation: {fft_validation} (wave_period: {wave_period}, avg_period_between_extrema: {avg_period_between_extrema:.2f})")
@@ -627,8 +627,8 @@ def analyze_sine_wave_oscillator_5m(candles_5m=None):
             # Tertiary validation with threshold
             threshold_validation = (threshold_signal == "DOWN")
             
-            # Primary condition is most important
-            condition_met = primary_validation
+            # For DOWN cycles, condition_met should be False
+            condition_met = False
             
             print(f"Primary validation (forecast < current): {primary_validation}")
             print(f"FFT validation: {fft_validation} (wave_period: {wave_period}, avg_period_between_extrema: {avg_period_between_extrema:.2f})")
