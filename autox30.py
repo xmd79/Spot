@@ -44,7 +44,7 @@ PROFIT_TARGET_PERCENT = 1.00  # 1.00% net profit target
 TOTAL_FEE_PERCENT = 0.22  # Total fee percentage
 MIN_TRADE_AMOUNT = 10
 
-# CONFIGURATION UPDATED: Added new condition
+# CONFIGURATION UPDATED: Added volume conditions
 CONFIG = {
     "conditions": {
         "momentum_positive_1m": True,
@@ -55,9 +55,11 @@ CONFIG = {
         "thresholds_3m": True,
         "thresholds_5m": True,
         "sine_wave_oscillator_5m": True,
-        "mtf_rsi_stoch_backup": True,  # NEW CONDITION NAME (Updated)
+        "mtf_rsi_stoch_backup": True,
+        "volume_bullish_1min": True,  # NEW
+        "volume_bullish_15sec": True, # NEW
     },
-    "min_conditions_met": 9  # Updated to 9 active conditions
+    "min_conditions_met": 11  # Updated to 11 active conditions
 }
 
 # Global variables for market state tracking
@@ -115,7 +117,7 @@ def get_candles(symbol, timeframe, limit=1200, retries=5, delay=5, endTime=None)
                     "timeframe": timeframe
                 }
                 candles.append(candle)
-            print(f"Successfully fetched {len(candles)} {timeframe} candles (requested {actual_limit})")
+            # print(f"Successfully fetched {len(candles)} {timeframe} candles (requested {actual_limit})") # Reduced noise
             return candles
         except BinanceAPIException as e:
             print(f"Binance API Error fetching candles for {timeframe} (attempt {attempt + 1}/{retries}): {e.message}")
@@ -321,6 +323,50 @@ def calculate_thresholds(close_prices, period=14, minimum_percentage=3, maximum_
     return min_threshold, max_threshold, avg_mtf, momentum_signal, range_price
 
 # =========================================================
+# NEW FUNCTION: VOLUME SENTIMENT ANALYSIS
+# =========================================================
+
+def analyze_volume_sentiment(candles):
+    """
+    Calculates bullish vs bearish volume ratio.
+    Returns: condition_met (bullish > bearish), bull_pct, bear_pct
+    """
+    try:
+        if not candles:
+            return False, 0.0, 0.0, {"error": "No candles provided"}
+
+        total_bullish_vol = 0.0
+        total_bearish_vol = 0.0
+
+        for candle in candles:
+            vol = candle.get('volume', 0)
+            close = candle.get('close', 0)
+            open_p = candle.get('open', 0)
+
+            if close > open_p:
+                total_bullish_vol += vol
+            elif close < open_p:
+                total_bearish_vol += vol
+            # Dojis are ignored for sentiment ratio
+
+        total_vol = total_bullish_vol + total_bearish_vol
+        
+        if total_vol == 0:
+            return False, 0.0, 0.0, {"error": "Total volume is zero"}
+
+        bull_pct = (total_bullish_vol / total_vol) * 100
+        bear_pct = (total_bearish_vol / total_vol) * 100
+        
+        # Condition is True if Bullish Volume > Bearish Volume
+        condition_met = total_bullish_vol > total_bearish_vol
+        
+        return condition_met, bull_pct, bear_pct, {}
+        
+    except Exception as e:
+        print(f"Error analyzing volume sentiment: {e}")
+        return False, 0.0, 0.0, {"error": str(e)}
+
+# =========================================================
 # NEW FUNCTION: MTF RSI & STOCHASTIC BACKUP
 # =========================================================
 
@@ -333,7 +379,7 @@ def analyze_mtf_rsi_stoch_backup(candles_5m, candles_30m, lookback=200):
     Final Condition is True ONLY if BOTH RSI and Stoch indicate Oversold.
     """
     def get_last_reversal_state(values, oversold_limit, overbought_limit):
-        # Iterate backwards to find the most recent extreme
+        # Iterate backwards to find most recent extreme
         for val in reversed(values):
             if val < oversold_limit:
                 return "OVERSOLD", True
@@ -393,7 +439,7 @@ def analyze_mtf_rsi_stoch_backup(candles_5m, candles_30m, lookback=200):
         print(f"Error analyzing Stoch 30m: {e}")
 
     # 3. Final Synthesis
-    # Both must be True (Oversold) for the final condition to be True
+    # Both must be True (Oversold) for final condition to be True
     final_condition_met = rsi_result["condition_met"] and stoch_result["condition_met"]
 
     return {
@@ -773,6 +819,11 @@ def calculate_momentum(candles, period=10):
         return False, 0.0, {"error": str(e)}
 
 def generate_15s_data_from_1m(df_1m):
+    """
+    UPDATED: Simulates realistic price movement inside a 1m candle.
+    Instead of linear interpolation (which causes 100% identical volume sentiment),
+    this uses the Highs and Lows to create micro-trends.
+    """
     if df_1m is None or df_1m.empty:
         return None
     
@@ -791,27 +842,58 @@ def generate_15s_data_from_1m(df_1m):
         close_price = row['close']
         volume = row['volume']
         
-        for i in range(4):
-            timestamp = row['timestamp'] + datetime.timedelta(seconds=15 * i)
-            timestamps.append(timestamp)
+        # Check if the candle had any range
+        if high_price == low_price:
+            # Flat candle, use linear interpolation as fallback
+            for i in range(4):
+                timestamp = row['timestamp'] + datetime.timedelta(seconds=15 * i)
+                timestamps.append(timestamp)
+                if i == 0:
+                    opens.append(open_price)
+                    closes.append(open_price + (close_price - open_price) * 0.25)
+                elif i == 1:
+                    opens.append(open_price + (close_price - open_price) * 0.25)
+                    closes.append(open_price + (close_price - open_price) * 0.5)
+                elif i == 2:
+                    opens.append(open_price + (close_price - open_price) * 0.5)
+                    closes.append(open_price + (close_price - open_price) * 0.75)
+                else:
+                    opens.append(open_price + (close_price - open_price) * 0.75)
+                    closes.append(close_price)
+                highs.append(high_price)
+                lows.append(low_price)
+                volumes.append(volume / 4)
+        else:
+            # Realistic Simulation Pattern:
+            # 1. Open -> High (Often Bullish)
+            # 2. High -> Low (Often Bearish) -> This creates the volume difference!
+            # 3. Low -> Midpoint (Often Bullish)
+            # 4. Midpoint -> Close (Depends on Close vs Mid)
             
-            if i == 0:
-                opens.append(open_price)
-                closes.append(open_price + (close_price - open_price) * 0.25)
-            elif i == 1:
-                opens.append(open_price + (close_price - open_price) * 0.25)
-                closes.append(open_price + (close_price - open_price) * 0.5)
-            elif i == 2:
-                opens.append(open_price + (close_price - open_price) * 0.5)
-                closes.append(open_price + (close_price - open_price) * 0.75)
-            else:
-                opens.append(open_price + (close_price - open_price) * 0.75)
-                closes.append(close_price)
-            
-            highs.append(high_price)
-            lows.append(low_price)
-            volumes.append(volume / 4)
-    
+            # Candle 1 (0-15s)
+            o1 = open_price
+            c1 = high_price
+            timestamps.append(row['timestamp'])
+            opens.append(o1); closes.append(c1); highs.append(high_price); lows.append(low_price); volumes.append(volume / 4)
+
+            # Candle 2 (15-30s)
+            o2 = c1
+            c2 = low_price
+            timestamps.append(row['timestamp'] + datetime.timedelta(seconds=15))
+            opens.append(o2); closes.append(c2); highs.append(high_price); lows.append(low_price); volumes.append(volume / 4)
+
+            # Candle 3 (30-45s)
+            o3 = c2
+            c3 = (open_price + close_price) / 2
+            timestamps.append(row['timestamp'] + datetime.timedelta(seconds=30))
+            opens.append(o3); closes.append(c3); highs.append(high_price); lows.append(low_price); volumes.append(volume / 4)
+
+            # Candle 4 (45-60s)
+            o4 = c3
+            c4 = close_price
+            timestamps.append(row['timestamp'] + datetime.timedelta(seconds=45))
+            opens.append(o4); closes.append(c4); highs.append(high_price); lows.append(low_price); volumes.append(volume / 4)
+
     df_15s = pd.DataFrame({
         'timestamp': timestamps,
         'open': opens,
@@ -854,7 +936,8 @@ def analyze_momentum_15sec(candles_1m):
             "momentum_positive": momentum_positive,
             "current_momentum": momentum_value,
             "period": momentum_details.get('period', 10),
-            "momentum_strength": 'Strong' if abs(momentum_value) > 100 else 'Moderate' if abs(momentum_value) > 50 else 'Weak'
+            "momentum_strength": 'Strong' if abs(momentum_value) > 100 else 'Moderate' if abs(momentum_value) > 50 else 'Weak',
+            "candles_15s": candles_15s # Return list for volume analysis
         }
         
     except Exception as e:
@@ -1105,12 +1188,11 @@ try:
 
         # Fetch candles for multiple timeframes
         print("Fetching candle data...")
-        # UPDATED: Added 30m to fetch list
         candle_map = fetch_candles_in_parallel(['1m', '3m', '5m', '30m'])
         candles_1m = candle_map.get('1m', [])
         candles_3m = candle_map.get('3m', [])
         candles_5m = candle_map.get('5m', [])
-        candles_30m = candle_map.get('30m', []) # NEW
+        candles_30m = candle_map.get('30m', [])
         
         print(f"Candle counts - 1m: {len(candles_1m)}, 3m: {len(candles_3m)}, 5m: {len(candles_5m)}, 30m: {len(candles_30m)}")
         
@@ -1129,7 +1211,9 @@ try:
             "thresholds_3m": False,
             "thresholds_5m": False,
             "sine_wave_oscillator_5m": False,
-            "mtf_rsi_stoch_backup": False, # UPDATED KEY
+            "mtf_rsi_stoch_backup": False,
+            "volume_bullish_1min": False,
+            "volume_bullish_15sec": False,
         }
 
         # Print conditions in order
@@ -1150,8 +1234,10 @@ try:
         # Condition 2: Momentum Positive (15s)
         print("\n--- Condition 2: Momentum Positive (15s) ---")
         momentum_15s_result = analyze_momentum_15sec(candles_1m)
+        candles_15s = []
         if 'error' not in momentum_15s_result:
             conditions_status["momentum_positive_15sec"] = momentum_15s_result['momentum_positive']
+            candles_15s = momentum_15s_result.get('candles_15s', [])
             print(f"Current Momentum: {momentum_15s_result['current_momentum']:.4f}")
             print(f"Momentum Period: {momentum_15s_result['period']}")
             print(f"Momentum Direction: {'Positive' if momentum_15s_result['momentum_positive'] else 'Negative'}")
@@ -1282,7 +1368,7 @@ try:
             print(f"Error analyzing sine wave oscillator: {sine_wave_result['error']}")
             print(f"Condition Met: {conditions_status['sine_wave_oscillator_5m']}")
 
-        # Condition 9: MTF RSI & Stoch Backup - UPDATED
+        # Condition 9: MTF RSI & Stoch Backup
         print("\n--- Condition 9: MTF RSI & Stochastic Backup ---")
         mtf_backup_result = analyze_mtf_rsi_stoch_backup(candles_5m, candles_30m)
         
@@ -1301,6 +1387,36 @@ try:
         print(f"Condition Met (BOTH Oversold): {final_cond}")
         
         conditions_status["mtf_rsi_stoch_backup"] = final_cond
+
+        # Condition 10: Volume 1m Sentiment
+        print("\n--- Condition 10: Volume Sentiment (1m) ---")
+        vol_1m_cond, bull_pct_1m, bear_pct_1m, err_1m = analyze_volume_sentiment(candles_1m)
+        if not err_1m:
+            conditions_status["volume_bullish_1min"] = vol_1m_cond
+            print(f"Bullish Vol %: {bull_pct_1m:.2f}%")
+            print(f"Bearish Vol %: {bear_pct_1m:.2f}%")
+            print(f"Sentence: {'Bullish' if vol_1m_cond else 'Bearish'} Volume Dominates")
+            print(f"Condition Met: {vol_1m_cond}")
+        else:
+            print(f"Error analyzing 1m volume: {err_1m.get('error', 'Unknown')}")
+            print(f"Condition Met: {conditions_status['volume_bullish_1min']}")
+
+        # Condition 11: Volume 15s Sentiment
+        print("\n--- Condition 11: Volume Sentiment (15s) ---")
+        if candles_15s:
+            vol_15s_cond, bull_pct_15s, bear_pct_15s, err_15s = analyze_volume_sentiment(candles_15s)
+            if not err_15s:
+                conditions_status["volume_bullish_15sec"] = vol_15s_cond
+                print(f"Bullish Vol %: {bull_pct_15s:.2f}%")
+                print(f"Bearish Vol %: {bear_pct_15s:.2f}%")
+                print(f"Sentence: {'Bullish' if vol_15s_cond else 'Bearish'} Volume Dominates")
+                print(f"Condition Met: {vol_15s_cond}")
+            else:
+                print(f"Error analyzing 15s volume: {err_15s.get('error', 'Unknown')}")
+                print(f"Condition Met: {conditions_status['volume_bullish_15sec']}")
+        else:
+            print("No 15s candles available for volume analysis.")
+            print(f"Condition Met: {conditions_status['volume_bullish_15sec']}")
 
         # Print all conditions with true/false values
         print("\n" + "="*80)
