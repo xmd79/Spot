@@ -53,14 +53,14 @@ CONFIG = {
         "aroon_only_signal": True,
         "thresholds_15sec": True,
         "volume_bullish_1min": True,
-        "volume_bullish_15sec": True,
         "stoch_rsi_precise_15sec": True,
         "stoch_rsi_precise_1min": True,
         "dip_confirmation_15sec": True,
         "dip_confirmation_1min": True,
-        "stoch_oversold_vs_overbought_15sec": True,  # NEW
+        "stoch_oversold_vs_overbought_1min": True,  # REPLACED 15s WITH 1m
+        "rsi_oversold_vs_overbought_15sec": True,  # NEW
     },
-    "min_conditions_met": 12  # INCREASED TO 12
+    "min_conditions_met": 12  # TOTAL ACTIVE CONDITIONS
 }
 
 # Global variables for market state tracking
@@ -82,69 +82,36 @@ timeframe_extrema = {
 def get_dip_confirmation(closes, lookback=1200):
     """
     Analyzes price structure using GLOBAL Argmin vs Argmax for last 1200 values.
-    
-    Logic (Updated & Robust):
-    1. Look at last 'lookback' candles.
-    2. Find Absolute Maximum Value and Absolute Minimum Value in that window.
-    3. Find ALL INDICES of occurrences.
-    4. Get the INDEX of the LAST (Most Recent) occurrence of these values.
-       (This satisfies "argmin is found most recent").
-    5. Condition Met (True): If Most Recent Min index > Most Recent Max index.
     """
     try:
-        # Convert to numpy array to handle slicing cleanly
         np_closes = np.array(closes, dtype=np.float64)
-        
-        # Slice array to only look at the recent history
         recent_data = np_closes[-lookback:]
         n = len(recent_data)
         
         if n < 5:
-            return False, -1, -1 # Not enough data
+            return False, -1, -1
 
-        # Remove NaNs to prevent errors in calculation
-        # If we keep NaNs, np.min will return NaN, breaking logic.
         clean_data = recent_data[~np.isnan(recent_data)]
         if len(clean_data) == 0:
             return False, -1, -1
 
-        # GLOBAL Min and Max VALUES
         min_val = np.nanmin(clean_data)
         max_val = np.nanmax(clean_data)
 
-        # Find INDICES of ALL occurrences in the cleaned data
-        # We need the indices relative to the clean_data slice
         min_indices_relative = np.where(clean_data == min_val)[0]
         max_indices_relative = np.where(clean_data == max_val)[0]
 
-        # Get the LAST (most recent) index relative to the slice
-        # If indices is empty (shouldn't happen if val exists), fallback to 0
         last_min_idx_relative = min_indices_relative[-1] if len(min_indices_relative) > 0 else 0
         last_max_idx_relative = max_indices_relative[-1] if len(max_indices_relative) > 0 else 0
 
-        # Convert relative indices back to absolute indices
-        # We must account for the removal of NaNs if any, but simpler to just map from clean_data
-        # map relative indices back to the main 'np_closes' array indices
-        # This is complex because NaNs shift indices. 
-        # Simpler: Calculate absolute index based on position from end
-        
-        # Find absolute indices by scanning the original array from the end backwards
         abs_min_idx = -1
         abs_max_idx = -1
         
-        # Scan backwards from the very end of the array
-        # We find the first match for min and max that is valid (not None/Nan if we handled it)
-        # This handles the "Most Recent" requirement and "Most Recent" index logic
-        
-        # Counters for valid data found
         found_min = False
         found_max = False
         
-        # Iterate backwards over the full closes array
         for i in range(len(np_closes) - 1, -1, -1):
             val = np_closes[i]
-            
-            # Skip NaNs
             if np.isnan(val):
                 continue
             
@@ -159,14 +126,10 @@ def get_dip_confirmation(closes, lookback=1200):
             if found_min and found_max:
                 break
 
-        # Fallback if not found (e.g. all NaNs)
         if abs_min_idx == -1 or abs_max_idx == -1:
             return False, -1, -1
 
-        # CORE CONDITION: Is the most recent minimum AFTER the most recent maximum?
-        # If MinIdx > MaxIdx, the absolute lowest price in the window happened after the absolute highest.
         is_dip_confirmed = abs_min_idx > abs_max_idx
-
         return is_dip_confirmed, abs_min_idx, abs_max_idx
 
     except Exception as e:
@@ -176,21 +139,21 @@ def get_dip_confirmation(closes, lookback=1200):
         return False, -1, -1
 
 # =========================================================
-# NEW FUNCTION: OVERSOLD VS OVERBOUGHT CHECK (15SEC)
+# NEW FUNCTION: STOCH OVERSOLD VS OVERBOUGHT (1MIN)
 # =========================================================
 
-def check_stoch_oversold_vs_overbought_15sec(candles_15s):
+def check_stoch_oversold_vs_overbought_1min(candles_1m):
     """
     Checks if Oversold (<20) happened more recently than Overbought (>80)
-    on the Stochastic %K line for the 15s timeframe.
+    on the Stochastic %K line for the 1m timeframe.
     """
     try:
-        if not candles_15s or len(candles_15s) < 15:
+        if not candles_1m or len(candles_1m) < 15:
             return False, "Insufficient data", 0, 0
 
-        closes = np.array([c['close'] for c in candles_15s], dtype=np.float64)
-        highs = np.array([c['high'] for c in candles_15s], dtype=np.float64)
-        lows = np.array([c['low'] for c in candles_15s], dtype=np.float64)
+        closes = np.array([c['close'] for c in candles_1m], dtype=np.float64)
+        highs = np.array([c['high'] for c in candles_1m], dtype=np.float64)
+        lows = np.array([c['low'] for c in candles_1m], dtype=np.float64)
 
         # Stoch: %K 14, Smooth 1, %D 4
         slowk, slowd = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=1, slowd_period=4)
@@ -207,20 +170,15 @@ def check_stoch_oversold_vs_overbought_15sec(candles_15s):
             if np.isnan(val):
                 continue
             
-            # If we haven't found oversold yet and this value is oversold
             if last_oversold_idx == -1 and val <= oversold_limit:
                 last_oversold_idx = i
             
-            # If we haven't found overbought yet and this value is overbought
             if last_overbought_idx == -1 and val >= overbought_limit:
                 last_overbought_idx = i
                 
             if last_oversold_idx != -1 and last_overbought_idx != -1:
                 break
 
-        # Logic: Oversold is true if its index is greater (more recent) than overbought
-        # Note: If only Oversold is found (idx > 0, other is -1), 0 > -1 is True.
-        # If only Overbought is found (idx > 0, other is -1), -1 > 0 is False.
         condition_met = last_oversold_idx > last_overbought_idx
         
         description = ""
@@ -232,7 +190,65 @@ def check_stoch_oversold_vs_overbought_15sec(candles_15s):
         return condition_met, description, last_oversold_idx, last_overbought_idx
 
     except Exception as e:
-        print(f"Error checking Stoch Oversold vs Overbought: {e}")
+        print(f"Error checking Stoch Oversold vs Overbought (1m): {e}")
+        import traceback
+        traceback.print_exc()
+        return False, str(e), -1, -1
+
+
+# =========================================================
+# NEW FUNCTION: RSI OVERSOLD VS OVERBOUGHT (15SEC)
+# =========================================================
+
+def check_rsi_oversold_vs_overbought_15sec(candles_15s):
+    """
+    Checks if Oversold (<30) happened more recently than Overbought (>70)
+    on the RSI line for the 15s timeframe.
+    Uses RSI Length 14.
+    """
+    try:
+        if not candles_15s or len(candles_15s) < 20:
+            return False, "Insufficient data", 0, 0
+
+        closes = np.array([c['close'] for c in candles_15s], dtype=np.float64)
+
+        # RSI Length 14
+        rsi_values = talib.RSI(closes, timeperiod=14)
+        
+        # Standard RSI Oversold/Overbought limits
+        oversold_limit = 30.0
+        overbought_limit = 70.0
+
+        last_oversold_idx = -1
+        last_overbought_idx = -1
+        
+        # Iterate backwards to find most recent occurrences
+        for i in range(len(rsi_values) - 1, -1, -1):
+            val = rsi_values[i]
+            if np.isnan(val):
+                continue
+            
+            if last_oversold_idx == -1 and val <= oversold_limit:
+                last_oversold_idx = i
+            
+            if last_overbought_idx == -1 and val >= overbought_limit:
+                last_overbought_idx = i
+                
+            if last_oversold_idx != -1 and last_overbought_idx != -1:
+                break
+
+        condition_met = last_oversold_idx > last_overbought_idx
+        
+        description = ""
+        if condition_met:
+            description = "Most recent extreme was OVERSOLD (Bullish Potential)"
+        else:
+            description = "Most recent extreme was OVERBOUGHT (Bearish Potential) or None"
+
+        return condition_met, description, last_oversold_idx, last_overbought_idx
+
+    except Exception as e:
+        print(f"Error checking RSI Oversold vs Overbought (15s): {e}")
         import traceback
         traceback.print_exc()
         return False, str(e), -1, -1
@@ -261,7 +277,6 @@ def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
         rsi_values = talib.RSI(closes, timeperiod=3)
         
         # RSI %D: Smoothed RSI (Simple Moving Average of RSI, period 3)
-        # This mimics the %D line concept for RSI
         rsi_d_values = talib.MA(rsi_values, timeperiod=3, matype=0) # 0=SMA
         current_rsi = rsi_values[-1]
         current_rsi_d = rsi_d_values[-1]
@@ -584,8 +599,6 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
     if current_price <= Decimal('0.0'):
         return False
     
-    # Clean calculation: Target = Net Profit + Total Fees
-    # Example: 0.35% Net + 0.22% Fees = 0.57% Gross
     total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
     multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
     
@@ -678,7 +691,6 @@ def analyze_volume_sentiment(candles):
         bull_pct = (total_bullish_vol / total_vol) * 100
         bear_pct = (total_bearish_vol / total_vol) * 100
         
-        # Condition is True if Bullish Volume > Bearish Volume
         condition_met = total_bullish_vol > total_bearish_vol
         
         return condition_met, bull_pct, bear_pct, {}
@@ -701,7 +713,6 @@ def analyze_thresholds_15sec(candles_15s):
         if not candles_15s:
             return {"error": "No 15s data provided", "condition_met": False}
         
-        # Get last 1200 values
         recent_candles = candles_15s[-1200:] if len(candles_15s) >= 1200 else candles_15s
         
         close_prices = np.array([candle["close"] for candle in recent_candles], dtype=np.float64)
@@ -713,7 +724,6 @@ def analyze_thresholds_15sec(candles_15s):
         max_value = np.max(close_prices)
         current_price = close_prices[-1]
         
-        # Calculate midpoint
         midpoint = (min_value + max_value) / 2
         
         condition_met = current_price < midpoint
@@ -745,17 +755,13 @@ def analyze_sine_wave_oscillator_15sec(candles_15s):
         if not candles_15s:
             return {"error": "No 15s data provided", "condition_met": False}
         
-        # Use last 1000 15s candles (approx 4 hours of data)
-        # If fewer exist, use what we have, but need min for analysis
         recent_candles = candles_15s[-1000:] if len(candles_15s) > 1000 else candles_15s
         
-        if len(recent_candles) < 300: # Need at least some data
+        if len(recent_candles) < 300:
             return {"error": f"Insufficient 15s data: only {len(recent_candles)} candles", "condition_met": False}
         
         close_prices = np.array([candle["close"] for candle in recent_candles], dtype=np.float64)
         
-        # Find extrema. 
-        # In 5m we used order=30. 30 * 15s = 7.5 minutes. This is reasonable for high freq.
         minima_indices = signal.argrelextrema(close_prices, np.less, order=30)[0]
         maxima_indices = signal.argrelextrema(close_prices, np.greater, order=30)[0]
         
@@ -767,17 +773,12 @@ def analyze_sine_wave_oscillator_15sec(candles_15s):
         current_idx = len(close_prices) - 1
         current_price = close_prices[-1]
         
-        # FFT Analysis
         x = np.arange(len(close_prices))
         coeffs = np.polyfit(x, close_prices, 1)
         detrended = close_prices - (coeffs[0] * x + coeffs[1])
         fft_values = fft(detrended)
         fft_freq = fftfreq(len(detrended))
         
-        # Filter for frequencies corresponding to reasonable cycle lengths (e.g., 5 min to 2 hours)
-        # 15s interval -> 1/240 Hz (1 hour) to 1/4800 Hz (2 hours)? No.
-        # 1 hour = 240 bars. Freq = 1/240.
-        # 5 min = 20 bars. Freq = 1/20.
         valid_indices = np.where((np.abs(fft_freq) > 1/3000) & (np.abs(fft_freq) < 1/20))
         valid_freq = fft_freq[valid_indices]
         valid_fft = np.abs(fft_values[valid_indices])
@@ -789,7 +790,6 @@ def analyze_sine_wave_oscillator_15sec(candles_15s):
         dominant_freq = valid_freq[dominant_freq_idx]
         dominant_period = 1 / np.abs(dominant_freq)
         
-        # Thresholds Calculation
         min_threshold, max_threshold, avg_mtf, momentum_signal, range_price = calculate_thresholds(
             close_prices, period=14, minimum_percentage=2, maximum_percentage=2, range_distance=0.05
         )
@@ -816,7 +816,7 @@ def analyze_sine_wave_oscillator_15sec(candles_15s):
             forecast_price = last_min_value + fib_amplitude
             
             if forecast_price <= current_price:
-                forecast_price = current_price + (current_price * 0.001) # Smaller increment for 15s
+                forecast_price = current_price + (current_price * 0.001)
             
             time_to_next_max = wave_period - (current_idx - last_min_idx)
             primary_validation = forecast_price > current_price
@@ -1139,9 +1139,7 @@ def generate_15s_data_from_1m(df_1m):
         close_price = row['close']
         volume = row['volume']
         
-        # Check if the candle had any range
         if high_price == low_price:
-            # Flat candle, use linear interpolation as fallback
             for i in range(4):
                 timestamp = row['timestamp'] + datetime.timedelta(seconds=15 * i)
                 timestamps.append(timestamp)
@@ -1161,31 +1159,21 @@ def generate_15s_data_from_1m(df_1m):
                 lows.append(low_price)
                 volumes.append(volume / 4)
         else:
-            # Realistic Simulation Pattern:
-            # 1. Open -> High (Often Bullish)
-            # 2. High -> Low (Often Bearish) -> This creates the volume difference!
-            # 3. Low -> Midpoint (Often Bullish)
-            # 4. Midpoint -> Close (Depends on Close vs Mid)
-            
-            # Candle 1 (0-15s)
             o1 = open_price
             c1 = high_price
             timestamps.append(row['timestamp'])
             opens.append(o1); closes.append(c1); highs.append(high_price); lows.append(low_price); volumes.append(volume / 4)
 
-            # Candle 2 (15-30s)
             o2 = c1
             c2 = low_price
             timestamps.append(row['timestamp'] + datetime.timedelta(seconds=15))
             opens.append(o2); closes.append(c2); highs.append(high_price); lows.append(low_price); volumes.append(volume / 4)
 
-            # Candle 3 (30-45s)
             o3 = c2
             c3 = (open_price + close_price) / 2
             timestamps.append(row['timestamp'] + datetime.timedelta(seconds=30))
             opens.append(o3); closes.append(c3); highs.append(high_price); lows.append(low_price); volumes.append(volume / 4)
 
-            # Candle 4 (45-60s)
             o4 = c3
             c4 = close_price
             timestamps.append(row['timestamp'] + datetime.timedelta(seconds=45))
@@ -1234,7 +1222,7 @@ def analyze_momentum_15sec(candles_1m):
             "current_momentum": momentum_value,
             "period": momentum_details.get('period', 10),
             "momentum_strength": 'Strong' if abs(momentum_value) > 100 else 'Moderate' if abs(momentum_value) > 50 else 'Weak',
-            "candles_15s": candles_15s # Return list for volume analysis
+            "candles_15s": candles_15s 
         }
         
     except Exception as e:
@@ -1384,8 +1372,6 @@ def analyze_linear_regression_channel_break(candles):
 def analyze_aroon_only_signal(candles, aroon_period=14):
     """
     Generates a definitive "UP" or "DOWN" signal based solely on the Aroon indicator.
-    - If Aroon Up > Aroon Down, signal is "UP" and condition_met is True.
-    - If Aroon Down > Aroon Up, signal is "DOWN" and condition_met is False.
     """
     try:
         if not candles or len(candles) < aroon_period + 1:
@@ -1403,7 +1389,6 @@ def analyze_aroon_only_signal(candles, aroon_period=14):
         
         aroon_up, aroon_down, _, _, recent_high_idx, recent_low_idx = aroon_result
         
-        # The core logic: determine signal based on Aroon comparison
         if aroon_up > aroon_down:
             signal = "UP"
             condition_met = True
@@ -1491,7 +1476,6 @@ try:
         candle_map = fetch_candles_in_parallel(['1m', '3m'])
         candles_1m = candle_map.get('1m', [])
         candles_3m = candle_map.get('3m', [])
-        # candles_5m removed
         
         print(f"Candle counts - 1m: {len(candles_1m)}, 3m: {len(candles_3m)}")
         
@@ -1508,12 +1492,13 @@ try:
             "aroon_only_signal": False,
             "thresholds_15sec": False,
             "volume_bullish_1min": False,
-            "volume_bullish_15sec": False,
+            # REMOVED "volume_bullish_15sec"
             "stoch_rsi_precise_15sec": False,
             "stoch_rsi_precise_1min": False,
-            "dip_confirmation_15sec": False, # NEW
-            "dip_confirmation_1min": False,  # NEW
-            "stoch_oversold_vs_overbought_15sec": False, # NEW
+            "dip_confirmation_15sec": False,
+            "dip_confirmation_1min": False,
+            "stoch_oversold_vs_overbought_1min": False, # REPLACED 15s WITH 1m
+            "rsi_oversold_vs_overbought_15sec": False, # NEW
         }
 
         # Generate 15s candles early for other conditions
@@ -1552,7 +1537,7 @@ try:
         
         # Condition 3: Linear Regression Channel Break (UPDATED TO 15s)
         print("\n--- Condition 3: Linear Regression Channel Break (15s) ---")
-        lrc_break_result = analyze_linear_regression_channel_break(candles_15s) # CHANGED: candles_1m -> candles_15s
+        lrc_break_result = analyze_linear_regression_channel_break(candles_15s) 
         if 'error' not in lrc_break_result:
             conditions_status["linear_regression_channel_break"] = lrc_break_result['condition_met']
             print(f"Timeframe: 15s")
@@ -1614,59 +1599,51 @@ try:
             print(f"Error analyzing 1m volume: {err_1m.get('error', 'Unknown')}")
             print(f"Condition Met: {conditions_status['volume_bullish_1min']}")
 
-        # Condition 7: Volume 15s Sentiment
-        print("\n--- Condition 7: Volume Sentiment (15s) ---")
-        if candles_15s:
-            vol_15s_cond, bull_pct_15s, bear_pct_15s, err_15s = analyze_volume_sentiment(candles_15s)
-            if not err_15s:
-                conditions_status["volume_bullish_15sec"] = vol_15s_cond
-                print(f"Bullish Vol %: {bull_pct_15s:.2f}%")
-                print(f"Bearish Vol %: {bear_pct_15s:.2f}%")
-                print(f"Sentence: {'Bullish' if vol_15s_cond else 'Bearish'} Volume Dominates")
-                print(f"Condition Met: {vol_15s_cond}")
-            else:
-                print(f"Error analyzing 15s volume: {err_15s.get('error', 'Unknown')}")
-                print(f"Condition Met: {conditions_status['volume_bullish_15sec']}")
-        else:
-            print("No 15s candles available for volume analysis.")
-            print(f"Condition Met: {conditions_status['volume_bullish_15sec']}")
+        # REMOVED Condition 7: Volume 15s Sentiment
             
-        # Condition 8: Stoch RSI Precise (15sec) - UPDATED
-        print("\n--- Condition 8: Stoch + RSI Precise (15s) ---")
+        # Condition 7: Stoch RSI Precise (15sec) - UPDATED
+        print("\n--- Condition 7: Stoch + RSI Precise (15s) ---")
         precise_15s_result = analyze_stoch_rsi_precise_strategy_15sec(candles_15s)
         if 'error' not in precise_15s_result:
             conditions_status["stoch_rsi_precise_15sec"] = precise_15s_result['condition_met']
-            conditions_status["dip_confirmation_15sec"] = precise_15s_result['dip_confirmed'] # Extract dip condition for global logic
+            conditions_status["dip_confirmation_15sec"] = precise_15s_result['dip_confirmed'] 
         else:
             conditions_status["stoch_rsi_precise_15sec"] = False
             conditions_status["dip_confirmation_15sec"] = False
 
-        # Condition 9: Stoch RSI Precise (1min) - UPDATED
-        print("\n--- Condition 9: Stoch + RSI Precise (1m) ---")
+        # Condition 8: Stoch RSI Precise (1min) - UPDATED
+        print("\n--- Condition 8: Stoch + RSI Precise (1m) ---")
         precise_1m_result = analyze_stoch_rsi_precise_strategy_1min(candles_1m)
         if 'error' not in precise_1m_result:
             conditions_status["stoch_rsi_precise_1min"] = precise_1m_result['condition_met']
-            conditions_status["dip_confirmation_1min"] = precise_1m_result['dip_confirmed'] # Extract dip condition for global logic
+            conditions_status["dip_confirmation_1min"] = precise_1m_result['dip_confirmed'] 
         else:
             conditions_status["stoch_rsi_precise_1min"] = False
             conditions_status["dip_confirmation_1min"] = False
             
-        # Condition 10: Dip Confirmation (15s)
-        print("\n--- Condition 10: Dip Confirmation (15s) ---")
+        # Condition 9: Dip Confirmation (15s)
+        print("\n--- Condition 9: Dip Confirmation (15s) ---")
         print(f"Argmin > Argmax (Last 1200 values): {'YES' if conditions_status['dip_confirmation_15sec'] else 'NO'}")
         print(f"Condition Met: {conditions_status['dip_confirmation_15sec']}")
 
-        # Condition 11: Dip Confirmation (1m)
-        print("\n--- Condition 11: Dip Confirmation (1m) ---")
+        # Condition 10: Dip Confirmation (1m)
+        print("\n--- Condition 10: Dip Confirmation (1m) ---")
         print(f"Argmin > Argmax (Last 1200 values): {'YES' if conditions_status['dip_confirmation_1min'] else 'NO'}")
         print(f"Condition Met: {conditions_status['dip_confirmation_1min']}")
 
-        # Condition 12: Stoch Oversold vs Overbought (15s) - NEW
-        print("\n--- Condition 12: Stoch Oversold vs Overbought (15s) ---")
-        oversold_result = check_stoch_oversold_vs_overbought_15sec(candles_15s)
-        conditions_status["stoch_oversold_vs_overbought_15sec"] = oversold_result[0]
-        print(f"Description: {oversold_result[1]}")
-        print(f"Condition Met: {oversold_result[0]}")
+        # Condition 11: Stoch Oversold vs Overbought (1m) - REPLACED 15s
+        print("\n--- Condition 11: Stoch Oversold vs Overbought (1m) ---")
+        stoch_1m_os_result = check_stoch_oversold_vs_overbought_1min(candles_1m)
+        conditions_status["stoch_oversold_vs_overbought_1min"] = stoch_1m_os_result[0]
+        print(f"Description: {stoch_1m_os_result[1]}")
+        print(f"Condition Met: {stoch_1m_os_result[0]}")
+
+        # Condition 12: RSI Oversold vs Overbought (15s) - NEW
+        print("\n--- Condition 12: RSI Oversold vs Overbought (15s) ---")
+        rsi_15s_os_result = check_rsi_oversold_vs_overbought_15sec(candles_15s)
+        conditions_status["rsi_oversold_vs_overbought_15sec"] = rsi_15s_os_result[0]
+        print(f"Description: {rsi_15s_os_result[1]}")
+        print(f"Condition Met: {rsi_15s_os_result[0]}")
 
         # Print all conditions with true/false values
         print("\n" + "="*80)
@@ -1747,7 +1724,6 @@ try:
                 target_price = Decimal('0.0')
                 print("Error: BTC balance is zero or negative. Target price set to 0.")
             
-            # FIX: Separate fees and profit goal in logs to avoid confusion
             print(f"Net Profit Goal: {PROFIT_TARGET_PERCENT}%")
             print(f"Total Fees: {TOTAL_FEE_PERCENT}%")
             print(f"Price for {PROFIT_TARGET_PERCENT}% Net Profit Target (+ {TOTAL_FEE_PERCENT}% Fees): {target_price:.25f}")
@@ -1760,8 +1736,6 @@ try:
                 print(f"Entry Price: {entry_price:.2f}")
                 print(f"Current Price: {current_price:.2f}")
                 print(f"Target Price: {target_price:.2f}")
-                
-                # Updated logs to clarify 0.57% vs 0.35% distinction
                 print(f"Entry to Current (Gross): {entry_to_current_pct:.2f}%")
                 print(f"Total Required Gross Move (to cover fees + profit): {entry_to_target_pct:.2f}%")
                 print(f"Net Profit at Target (after fees): {PROFIT_TARGET_PERCENT:.2f}%")
@@ -1825,7 +1799,6 @@ try:
 
         del candle_map
         gc.collect()
-        # Strict sleep time of 5 seconds.
         time.sleep(5)
 
 except KeyboardInterrupt:
