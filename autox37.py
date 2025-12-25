@@ -57,10 +57,10 @@ CONFIG = {
         "stoch_rsi_precise_1min": True,
         "dip_confirmation_15sec": True,
         "dip_confirmation_1min": True,
-        "stoch_oversold_vs_overbought_1min": True,  # REPLACED 15s WITH 1m
-        "rsi_oversold_vs_overbought_15sec": True,  # NEW
+        "stoch_oversold_vs_overbought_1min": True,
+        "rsi_oversold_vs_overbought_15sec": True,
     },
-    "min_conditions_met": 12  # TOTAL ACTIVE CONDITIONS
+    "min_conditions_met": 7  # UPDATED: Trigger trade if 7 out of 12 conditions are True
 }
 
 # Global variables for market state tracking
@@ -1650,7 +1650,7 @@ try:
         print("TRADING CONDITIONS STATUS")
         print("="*80)
         
-        # Get results only for active conditions and require ALL to be true.
+        # Get results only for active conditions and require COUNT to be >= min_conditions_met
         active_conditions_results = [
             conditions_status[condition_name]
             for condition_name in CONFIG['conditions']
@@ -1658,8 +1658,11 @@ try:
         true_conditions_count = sum(int(status) for status in active_conditions_results)
         false_conditions_count = len(active_conditions_results) - true_conditions_count
         
+        min_required = CONFIG['min_conditions_met']
+        
         print(f"Overall Conditions Status: {true_conditions_count} True, {false_conditions_count} False")
         print(f"Total Active Conditions: {len(active_conditions_results)}")
+        print(f"Minimum Required to Trigger: {min_required}")
         
         print("\nCondition Summary (Active):")
         print("-" * 65)
@@ -1668,11 +1671,12 @@ try:
             print(f"{condition_name:<50}{status}")
         print("-" * 65)
         
-        all_conditions_met = all(active_conditions_results)
-        print(f"\nAll Active Conditions Met for Entry: {'Yes' if all_conditions_met else 'No'}")
+        # UPDATED LOGIC: Check if count meets minimum threshold instead of requiring all
+        signal_triggered = true_conditions_count >= min_required
+        print(f"\nConditions Met for Entry: {'Yes' if signal_triggered else 'No'} ({true_conditions_count}/{min_required})")
 
-        # Save signal to file if all conditions are met
-        if all_conditions_met:
+        # Save signal to file if signal is triggered
+        if signal_triggered:
             signal_data = {
                 "current_price": float(current_price),
                 "signal": "BUY",
@@ -1770,10 +1774,10 @@ try:
                 print("No USDC balance available.")
             print(f"Current BTC balance: {asset_balance:.25f}")
 
-            if all_conditions_met:
+            if signal_triggered:
                 usdc_balance = get_balance('USDC')
                 if usdc_balance > Decimal('0'):
-                    print(f"\n!!! ALL {len(active_conditions_results)} ACTIVE CONDITIONS MET - EXECUTING TRADE !!!")
+                    print(f"\n!!! SIGNAL TRIGGERED: {true_conditions_count} CONDITIONS MET (>= {min_required}) - EXECUTING TRADE !!!")
                     print(f"Trigger signal detected! Attempting to buy {TRADE_SYMBOL} with entire USDC balance: {usdc_balance:.25f} at price {current_price:.25f}")
                     entry_price, quantity_bought, entry_datetime, cost = buy_asset()
                     if entry_price is not None and quantity_bought is not None and cost is not None:
@@ -1790,7 +1794,7 @@ try:
                     print("No USDC balance to invest in BTC.")
             else:
                 print(f"\n!!! INSUFFICIENT CONDITIONS MET - NO TRADE EXECUTED !!!")
-                print(f"Only {true_conditions_count}/{len(active_conditions_results)} conditions met.")
+                print(f"Only {true_conditions_count}/{min_required} conditions met (Required: {min_required}).")
                 print("Waiting for next iteration...")
 
         print(f"\nCurrent USDC balance: {usdc_balance:.25f}")
