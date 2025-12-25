@@ -45,22 +45,22 @@ TOTAL_FEE_PERCENT = 0.22      # 0.22% total fee percentage
 MIN_TRADE_AMOUNT = 10
 
 # CONFIGURATION UPDATED
-# Added: stoch_rsi_precise_15sec based on user screenshots
 CONFIG = {
     "conditions": {
         "momentum_positive_1m": True,
         "momentum_positive_15sec": True,
-        "linear_regression_channel_break": True, # USING 15s TF
+        "linear_regression_channel_break": True,
         "aroon_only_signal": True,
-        # "sine_wave_oscillator_15sec": True,     # REMOVED
-        # "stoch_15s_oversold": True,            # REMOVED - REPLACED BY PRECISE STRATEGY
-        # "stoch_1m_oversold": True,              # REMOVED
-        "stoch_rsi_precise_15sec": True,         # NEW: Specific settings from screenshots
         "thresholds_15sec": True,
         "volume_bullish_1min": True,
         "volume_bullish_15sec": True,
+        "stoch_rsi_precise_15sec": True,
+        "stoch_rsi_precise_1min": True,
+        "dip_confirmation_15sec": True,
+        "dip_confirmation_1min": True,
+        "stoch_oversold_vs_overbought_15sec": True,  # NEW
     },
-    "min_conditions_met": 8  # Updated to 8 (Added stoch_rsi_precise_15sec)
+    "min_conditions_met": 12  # INCREASED TO 12
 }
 
 # Global variables for market state tracking
@@ -74,6 +74,320 @@ timeframe_extrema = {
     '3m': {'recent_high': None, 'recent_low': None, 'recent_high_idx': None, 'recent_low_idx': None},
     '5m': {'recent_high': None, 'recent_low': None, 'recent_high_idx': None, 'recent_low_idx': None}
 }
+
+# =========================================================
+# UPDATED UTILITY: DIP CONFIRMATION (Argmin vs Argmax - MOST RECENT)
+# =========================================================
+
+def get_dip_confirmation(closes, lookback=1200):
+    """
+    Analyzes price structure using GLOBAL Argmin vs Argmax for last 1200 values.
+    
+    Logic (Updated & Robust):
+    1. Look at last 'lookback' candles.
+    2. Find Absolute Maximum Value and Absolute Minimum Value in that window.
+    3. Find ALL INDICES of occurrences.
+    4. Get the INDEX of the LAST (Most Recent) occurrence of these values.
+       (This satisfies "argmin is found most recent").
+    5. Condition Met (True): If Most Recent Min index > Most Recent Max index.
+    """
+    try:
+        # Convert to numpy array to handle slicing cleanly
+        np_closes = np.array(closes, dtype=np.float64)
+        
+        # Slice array to only look at the recent history
+        recent_data = np_closes[-lookback:]
+        n = len(recent_data)
+        
+        if n < 5:
+            return False, -1, -1 # Not enough data
+
+        # Remove NaNs to prevent errors in calculation
+        # If we keep NaNs, np.min will return NaN, breaking logic.
+        clean_data = recent_data[~np.isnan(recent_data)]
+        if len(clean_data) == 0:
+            return False, -1, -1
+
+        # GLOBAL Min and Max VALUES
+        min_val = np.nanmin(clean_data)
+        max_val = np.nanmax(clean_data)
+
+        # Find INDICES of ALL occurrences in the cleaned data
+        # We need the indices relative to the clean_data slice
+        min_indices_relative = np.where(clean_data == min_val)[0]
+        max_indices_relative = np.where(clean_data == max_val)[0]
+
+        # Get the LAST (most recent) index relative to the slice
+        # If indices is empty (shouldn't happen if val exists), fallback to 0
+        last_min_idx_relative = min_indices_relative[-1] if len(min_indices_relative) > 0 else 0
+        last_max_idx_relative = max_indices_relative[-1] if len(max_indices_relative) > 0 else 0
+
+        # Convert relative indices back to absolute indices
+        # We must account for the removal of NaNs if any, but simpler to just map from clean_data
+        # map relative indices back to the main 'np_closes' array indices
+        # This is complex because NaNs shift indices. 
+        # Simpler: Calculate absolute index based on position from end
+        
+        # Find absolute indices by scanning the original array from the end backwards
+        abs_min_idx = -1
+        abs_max_idx = -1
+        
+        # Scan backwards from the very end of the array
+        # We find the first match for min and max that is valid (not None/Nan if we handled it)
+        # This handles the "Most Recent" requirement and "Most Recent" index logic
+        
+        # Counters for valid data found
+        found_min = False
+        found_max = False
+        
+        # Iterate backwards over the full closes array
+        for i in range(len(np_closes) - 1, -1, -1):
+            val = np_closes[i]
+            
+            # Skip NaNs
+            if np.isnan(val):
+                continue
+            
+            if not found_min and abs(val - min_val) < 1e-8:
+                abs_min_idx = i
+                found_min = True
+            
+            if not found_max and abs(val - max_val) < 1e-8:
+                abs_max_idx = i
+                found_max = True
+                
+            if found_min and found_max:
+                break
+
+        # Fallback if not found (e.g. all NaNs)
+        if abs_min_idx == -1 or abs_max_idx == -1:
+            return False, -1, -1
+
+        # CORE CONDITION: Is the most recent minimum AFTER the most recent maximum?
+        # If MinIdx > MaxIdx, the absolute lowest price in the window happened after the absolute highest.
+        is_dip_confirmed = abs_min_idx > abs_max_idx
+
+        return is_dip_confirmed, abs_min_idx, abs_max_idx
+
+    except Exception as e:
+        print(f"Error in get_dip_confirmation: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, -1, -1
+
+# =========================================================
+# NEW FUNCTION: OVERSOLD VS OVERBOUGHT CHECK (15SEC)
+# =========================================================
+
+def check_stoch_oversold_vs_overbought_15sec(candles_15s):
+    """
+    Checks if Oversold (<20) happened more recently than Overbought (>80)
+    on the Stochastic %K line for the 15s timeframe.
+    """
+    try:
+        if not candles_15s or len(candles_15s) < 15:
+            return False, "Insufficient data", 0, 0
+
+        closes = np.array([c['close'] for c in candles_15s], dtype=np.float64)
+        highs = np.array([c['high'] for c in candles_15s], dtype=np.float64)
+        lows = np.array([c['low'] for c in candles_15s], dtype=np.float64)
+
+        # Stoch: %K 14, Smooth 1, %D 4
+        slowk, slowd = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=1, slowd_period=4)
+        
+        oversold_limit = 20.0
+        overbought_limit = 80.0
+
+        last_oversold_idx = -1
+        last_overbought_idx = -1
+        
+        # Iterate backwards to find most recent occurrences
+        for i in range(len(slowk) - 1, -1, -1):
+            val = slowk[i]
+            if np.isnan(val):
+                continue
+            
+            # If we haven't found oversold yet and this value is oversold
+            if last_oversold_idx == -1 and val <= oversold_limit:
+                last_oversold_idx = i
+            
+            # If we haven't found overbought yet and this value is overbought
+            if last_overbought_idx == -1 and val >= overbought_limit:
+                last_overbought_idx = i
+                
+            if last_oversold_idx != -1 and last_overbought_idx != -1:
+                break
+
+        # Logic: Oversold is true if its index is greater (more recent) than overbought
+        # Note: If only Oversold is found (idx > 0, other is -1), 0 > -1 is True.
+        # If only Overbought is found (idx > 0, other is -1), -1 > 0 is False.
+        condition_met = last_oversold_idx > last_overbought_idx
+        
+        description = ""
+        if condition_met:
+            description = "Most recent extreme was OVERSOLD (Bullish Potential)"
+        else:
+            description = "Most recent extreme was OVERBOUGHT (Bearish Potential) or None"
+
+        return condition_met, description, last_oversold_idx, last_overbought_idx
+
+    except Exception as e:
+        print(f"Error checking Stoch Oversold vs Overbought: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, str(e), -1, -1
+
+
+# =========================================================
+# NEW FUNCTIONS: STOCH + RSI PRECISE STRATEGIES (UPDATED WITH RSI %D)
+# =========================================================
+
+def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
+    """
+    Analyzes 15s timeframe.
+    Trigger: RSI < 61.8 AND Stoch %K < 61.8 AND Dip Confirmation.
+    Added: RSI %D Calculation and Print.
+    """
+    try:
+        if not candles_15s or len(candles_15s) < 20:
+            return {"error": "Insufficient 15s data", "condition_met": False}
+
+        closes = np.array([c['close'] for c in candles_15s], dtype=np.float64)
+        highs = np.array([c['high'] for c in candles_15s], dtype=np.float64)
+        lows = np.array([c['low'] for c in candles_15s], dtype=np.float64)
+
+        # --- 1. CALCULATE INDICATORS ---
+        # RSI Length: 3
+        rsi_values = talib.RSI(closes, timeperiod=3)
+        
+        # RSI %D: Smoothed RSI (Simple Moving Average of RSI, period 3)
+        # This mimics the %D line concept for RSI
+        rsi_d_values = talib.MA(rsi_values, timeperiod=3, matype=0) # 0=SMA
+        current_rsi = rsi_values[-1]
+        current_rsi_d = rsi_d_values[-1]
+        
+        # Stoch: %K 14, Smooth 1, %D 4
+        slowk, slowd = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=1, slowd_period=4)
+        current_stoch_k = slowk[-1]
+        current_stoch_d = slowd[-1]
+
+        # --- 2. DIP CONFIRMATION (Argmin vs Argmax) ---
+        is_dip_15s, idx_min, idx_max = get_dip_confirmation(closes, lookback=1200)
+
+        # --- 3. TRIGGER CONDITIONS ---
+        threshold = 61.8
+        
+        # Condition: RSI < 61.8
+        rsi_condition_met = current_rsi < threshold
+        
+        # Condition: Stoch %K < 61.8
+        stoch_k_condition_met = current_stoch_k < threshold
+        
+        # Combined Logic: RSI, Stoch K, AND Dip Confirmation must all be True
+        condition_met = rsi_condition_met and stoch_k_condition_met and is_dip_15s
+
+        # --- PRINT SPECS ---
+        print(f"====== 15s PRECISE STRATEGY ======")
+        print(f"RSI (Len 3):           {current_rsi:.2f} < {threshold} : {rsi_condition_met}")
+        print(f"RSI %D (MA 3):         {current_rsi_d:.2f}") # NEW PRINT
+        print(f"Stoch %K (14,1,4):     {current_stoch_k:.2f} < {threshold} : {stoch_k_condition_met}")
+        print(f"Stoch %D:              {current_stoch_d:.2f}")
+        print(f"Dip Conf (MinIdx {idx_min} > MaxIdx {idx_max}): {is_dip_15s}")
+        print(f"-----------------------------------")
+        print(f"TOTAL CONDITION MET:   {condition_met}")
+        print(f"===================================")
+
+        return {
+            "timeframe": "15s",
+            "condition_met": condition_met,
+            "current_rsi": current_rsi,
+            "current_rsi_d": current_rsi_d,
+            "current_stoch_k": current_stoch_k,
+            "current_stoch_d": current_stoch_d,
+            "dip_confirmed": is_dip_15s,
+            "rsi_trigger": rsi_condition_met,
+            "stoch_k_trigger": stoch_k_condition_met
+        }
+
+    except Exception as e:
+        print(f"Error in analyze_stoch_rsi_precise_strategy_15sec: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "condition_met": False}
+
+
+def analyze_stoch_rsi_precise_strategy_1min(candles_1m):
+    """
+    Analyzes 1min timeframe.
+    Trigger: RSI < 61.8 AND Stoch %K < 61.8 AND Dip Confirmation.
+    Added: RSI %D Calculation and Print.
+    """
+    try:
+        if not candles_1m or len(candles_1m) < 20:
+            return {"error": "Insufficient 1m data", "condition_met": False}
+
+        closes = np.array([c['close'] for c in candles_1m], dtype=np.float64)
+        highs = np.array([c['high'] for c in candles_1m], dtype=np.float64)
+        lows = np.array([c['low'] for c in candles_1m], dtype=np.float64)
+
+        # --- 1. CALCULATE INDICATORS ---
+        # RSI Length: 3
+        rsi_values = talib.RSI(closes, timeperiod=3)
+        
+        # RSI %D: Smoothed RSI (Simple Moving Average of RSI, period 3)
+        rsi_d_values = talib.MA(rsi_values, timeperiod=3, matype=0) # 0=SMA
+        current_rsi = rsi_values[-1]
+        current_rsi_d = rsi_d_values[-1]
+
+        # Stoch: %K 14, Smooth 1, %D 4
+        slowk, slowd = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=1, slowd_period=4)
+        current_stoch_k = slowk[-1]
+        current_stoch_d = slowd[-1]
+
+        # --- 2. DIP CONFIRMATION (Argmin vs Argmax) ---
+        is_dip_1m, idx_min, idx_max = get_dip_confirmation(closes, lookback=1200)
+
+        # --- 3. TRIGGER CONDITIONS ---
+        threshold = 61.8
+        
+        # Condition: RSI < 61.8
+        rsi_condition_met = current_rsi < threshold
+        
+        # Condition: Stoch %K < 61.8
+        stoch_k_condition_met = current_stoch_k < threshold
+        
+        # Combined Logic: RSI, Stoch K, AND Dip Confirmation must all be True
+        condition_met = rsi_condition_met and stoch_k_condition_met and is_dip_1m
+
+        # --- PRINT SPECS ---
+        print(f"====== 1m PRECISE STRATEGY ======")
+        print(f"RSI (Len 3):           {current_rsi:.2f} < {threshold} : {rsi_condition_met}")
+        print(f"RSI %D (MA 3):         {current_rsi_d:.2f}") # NEW PRINT
+        print(f"Stoch %K (14,1,4):     {current_stoch_k:.2f} < {threshold} : {stoch_k_condition_met}")
+        print(f"Stoch %D:              {current_stoch_d:.2f}")
+        print(f"Dip Conf (MinIdx {idx_min} > MaxIdx {idx_max}): {is_dip_1m}")
+        print(f"-----------------------------------")
+        print(f"TOTAL CONDITION MET:   {condition_met}")
+        print(f"===================================")
+
+        return {
+            "timeframe": "1m",
+            "condition_met": condition_met,
+            "current_rsi": current_rsi,
+            "current_rsi_d": current_rsi_d,
+            "current_stoch_k": current_stoch_k,
+            "current_stoch_d": current_stoch_d,
+            "dip_confirmed": is_dip_1m,
+            "rsi_trigger": rsi_condition_met,
+            "stoch_k_trigger": stoch_k_condition_met
+        }
+
+    except Exception as e:
+        print(f"Error in analyze_stoch_rsi_precise_strategy_1min: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e), "condition_met": False}
+
 
 # =========================================================
 # UTILITY FUNCTIONS
@@ -329,100 +643,6 @@ def calculate_thresholds(close_prices, period=14, minimum_percentage=3, maximum_
     percent_to_max_combined = (maximum_percentage + percent_to_max_momentum) / 2      
     momentum_signal = percent_to_max_combined - percent_to_min_combined
     return min_threshold, max_threshold, avg_mtf, momentum_signal, range_price
-
-# =========================================================
-# NEW FUNCTION: STOCHASTIC + RSI PRECISE STRATEGY (15SEC)
-# =========================================================
-
-def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
-    """
-    Analyzes Stochastic and RSI on 15s timeframe based on user provided screenshots.
-    
-    Settings from Image:
-    - Stoch %K Length: 14
-    - Stoch %K Smoothing: 1
-    - Stoch %D Smoothing: 4
-    - RSI Length: 3
-    
-    Entry Condition:
-    - %D Level for Entry (below this): 61.8
-    
-    Exit Targets (For logging/status):
-    - Target RSI: 92 (Precision 3%)
-    - Target %K: 90 (Precision 4%)
-    - Target %D: 91 (Precision 5%)
-    """
-    try:
-        if not candles_15s or len(candles_15s) < 20:
-            return {"error": "Insufficient 15s data for Precise Strategy", "condition_met": False}
-
-        closes = np.array([c['close'] for c in candles_15s], dtype=np.float64)
-        highs = np.array([c['high'] for c in candles_15s], dtype=np.float64)
-        lows = np.array([c['low'] for c in candles_15s], dtype=np.float64)
-
-        # --- CALCULATE RSI ---
-        # Setting: RSI Length 3
-        rsi_values = talib.RSI(closes, timeperiod=3)
-        current_rsi = rsi_values[-1]
-
-        # --- CALCULATE STOCHASTIC ---
-        # Setting: %K Length 14, %K Smooth 1, %D Smooth 4
-        # Talib STOCH args: fastk_period, slowk_period, slowd_period
-        slowk, slowd = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=1, slowd_period=4)
-        
-        current_stoch_k = slowk[-1]
-        current_stoch_d = slowd[-1]
-
-        # --- ENTRY CONDITION LOGIC ---
-        # From Image 1: "%D Level for Entry (below this) 61.8"
-        # Interpretation: Enter trade when Stochastic %D dips below 61.8 (Mean Reversion / Dip Buy)
-        entry_threshold_d = 61.8
-        condition_met = current_stoch_d < entry_threshold_d
-
-        # --- EXIT TARGET CHECK (For Informational Purposes) ---
-        # From Image 2
-        target_rsi = 92.0
-        rsi_precision = 0.03 # 3%
-        rsi_min = target_rsi * (1 - rsi_precision)
-        rsi_max = target_rsi * (1 + rsi_precision)
-        rsi_target_hit = rsi_min <= current_rsi <= rsi_max
-
-        target_k = 90.0
-        k_precision = 0.04 # 4%
-        k_min = target_k * (1 - k_precision)
-        k_max = target_k * (1 + k_precision)
-        k_target_hit = k_min <= current_stoch_k <= k_max
-
-        target_d = 91.0
-        d_precision = 0.05 # 5%
-        d_min = target_d * (1 - d_precision)
-        d_max = target_d * (1 + d_precision)
-        d_target_hit = d_min <= current_stoch_d <= d_max
-        
-        any_target_hit = rsi_target_hit or k_target_hit or d_target_hit
-
-        return {
-            "condition_met": condition_met,
-            "timeframe": "15s",
-            "current_rsi": current_rsi,
-            "current_stoch_k": current_stoch_k,
-            "current_stoch_d": current_stoch_d,
-            "entry_threshold_d": entry_threshold_d,
-            "entry_reason": f"%D ({current_stoch_d:.2f}) is below {entry_threshold_d}" if condition_met else f"%D ({current_stoch_d:.2f}) is above {entry_threshold_d}",
-            "targets": {
-                "rsi_target_hit": rsi_target_hit,
-                "k_target_hit": k_target_hit,
-                "d_target_hit": d_target_hit,
-                "any_target_hit": any_target_hit,
-                "description": f"RSI {current_rsi:.1f} (Tgt {target_rsi}), %K {current_stoch_k:.1f} (Tgt {target_k}), %D {current_stoch_d:.1f} (Tgt {target_d})"
-            }
-        }
-
-    except Exception as e:
-        print(f"Error in analyze_stoch_rsi_precise_strategy_15sec: {e}")
-        import traceback
-        traceback.print_exc()
-        return {"error": str(e), "condition_met": False}
 
 # =========================================================
 # NEW FUNCTION: VOLUME SENTIMENT ANALYSIS
@@ -1286,13 +1506,14 @@ try:
             "momentum_positive_15sec": False,
             "linear_regression_channel_break": False,
             "aroon_only_signal": False,
-            # "sine_wave_oscillator_15sec": False,  # REMOVED
-            # "stoch_15s_oversold": False,            # REMOVED
-            # "stoch_1m_oversold": False,              # REMOVED
-            "stoch_rsi_precise_15sec": False,         # NEW
             "thresholds_15sec": False,
             "volume_bullish_1min": False,
             "volume_bullish_15sec": False,
+            "stoch_rsi_precise_15sec": False,
+            "stoch_rsi_precise_1min": False,
+            "dip_confirmation_15sec": False, # NEW
+            "dip_confirmation_1min": False,  # NEW
+            "stoch_oversold_vs_overbought_15sec": False, # NEW
         }
 
         # Generate 15s candles early for other conditions
@@ -1331,7 +1552,7 @@ try:
         
         # Condition 3: Linear Regression Channel Break (UPDATED TO 15s)
         print("\n--- Condition 3: Linear Regression Channel Break (15s) ---")
-        lrc_break_result = analyze_linear_regression_channel_break(candles_15s)
+        lrc_break_result = analyze_linear_regression_channel_break(candles_15s) # CHANGED: candles_1m -> candles_15s
         if 'error' not in lrc_break_result:
             conditions_status["linear_regression_channel_break"] = lrc_break_result['condition_met']
             print(f"Timeframe: 15s")
@@ -1364,23 +1585,8 @@ try:
             print(f"Error analyzing Aroon signal: {aroon_signal_result['error']}")
             print(f"Condition Met: {conditions_status['aroon_only_signal']}")
 
-        # Condition 5: Stochastic + RSI Precise Strategy (15s) - NEW
-        print("\n--- Condition 5: Stochastic + RSI Precise Strategy (15s) ---")
-        stoch_rsi_result = analyze_stoch_rsi_precise_strategy_15sec(candles_15s)
-        if 'error' not in stoch_rsi_result:
-            conditions_status["stoch_rsi_precise_15sec"] = stoch_rsi_result['condition_met']
-            print(f"RSI (Len 3): {stoch_rsi_result['current_rsi']:.2f}")
-            print(f"Stoch %K (14,1): {stoch_rsi_result['current_stoch_k']:.2f}")
-            print(f"Stoch %D (4): {stoch_rsi_result['current_stoch_d']:.2f}")
-            print(f"Entry Threshold (%D < 61.8): {stoch_rsi_result['entry_reason']}")
-            print(f"Exit Targets Status: {stoch_rsi_result['targets']['description']}")
-            print(f"Condition Met: {conditions_status['stoch_rsi_precise_15sec']}")
-        else:
-            print(f"Error analyzing Precise Strategy (15s): {stoch_rsi_result['error']}")
-            print(f"Condition Met: {conditions_status['stoch_rsi_precise_15sec']}")
-
-        # Condition 6: Thresholds 15sec
-        print("\n--- Condition 6: Thresholds Analysis (15s) ---")
+        # Condition 5: Thresholds 15sec
+        print("\n--- Condition 5: Thresholds Analysis (15s) ---")
         thresholds_15s_result = analyze_thresholds_15sec(candles_15s)
         if 'error' not in thresholds_15s_result:
             conditions_status["thresholds_15sec"] = thresholds_15s_result['condition_met']
@@ -1395,8 +1601,8 @@ try:
             print(f"Error analyzing thresholds (15s): {thresholds_15s_result['error']}")
             print(f"Condition Met: {conditions_status['thresholds_15sec']}")
 
-        # Condition 7: Volume 1m Sentiment
-        print("\n--- Condition 7: Volume Sentiment (1m) ---")
+        # Condition 6: Volume 1m Sentiment
+        print("\n--- Condition 6: Volume Sentiment (1m) ---")
         vol_1m_cond, bull_pct_1m, bear_pct_1m, err_1m = analyze_volume_sentiment(candles_1m)
         if not err_1m:
             conditions_status["volume_bullish_1min"] = vol_1m_cond
@@ -1408,8 +1614,8 @@ try:
             print(f"Error analyzing 1m volume: {err_1m.get('error', 'Unknown')}")
             print(f"Condition Met: {conditions_status['volume_bullish_1min']}")
 
-        # Condition 8: Volume 15s Sentiment
-        print("\n--- Condition 8: Volume Sentiment (15s) ---")
+        # Condition 7: Volume 15s Sentiment
+        print("\n--- Condition 7: Volume Sentiment (15s) ---")
         if candles_15s:
             vol_15s_cond, bull_pct_15s, bear_pct_15s, err_15s = analyze_volume_sentiment(candles_15s)
             if not err_15s:
@@ -1424,6 +1630,43 @@ try:
         else:
             print("No 15s candles available for volume analysis.")
             print(f"Condition Met: {conditions_status['volume_bullish_15sec']}")
+            
+        # Condition 8: Stoch RSI Precise (15sec) - UPDATED
+        print("\n--- Condition 8: Stoch + RSI Precise (15s) ---")
+        precise_15s_result = analyze_stoch_rsi_precise_strategy_15sec(candles_15s)
+        if 'error' not in precise_15s_result:
+            conditions_status["stoch_rsi_precise_15sec"] = precise_15s_result['condition_met']
+            conditions_status["dip_confirmation_15sec"] = precise_15s_result['dip_confirmed'] # Extract dip condition for global logic
+        else:
+            conditions_status["stoch_rsi_precise_15sec"] = False
+            conditions_status["dip_confirmation_15sec"] = False
+
+        # Condition 9: Stoch RSI Precise (1min) - UPDATED
+        print("\n--- Condition 9: Stoch + RSI Precise (1m) ---")
+        precise_1m_result = analyze_stoch_rsi_precise_strategy_1min(candles_1m)
+        if 'error' not in precise_1m_result:
+            conditions_status["stoch_rsi_precise_1min"] = precise_1m_result['condition_met']
+            conditions_status["dip_confirmation_1min"] = precise_1m_result['dip_confirmed'] # Extract dip condition for global logic
+        else:
+            conditions_status["stoch_rsi_precise_1min"] = False
+            conditions_status["dip_confirmation_1min"] = False
+            
+        # Condition 10: Dip Confirmation (15s)
+        print("\n--- Condition 10: Dip Confirmation (15s) ---")
+        print(f"Argmin > Argmax (Last 1200 values): {'YES' if conditions_status['dip_confirmation_15sec'] else 'NO'}")
+        print(f"Condition Met: {conditions_status['dip_confirmation_15sec']}")
+
+        # Condition 11: Dip Confirmation (1m)
+        print("\n--- Condition 11: Dip Confirmation (1m) ---")
+        print(f"Argmin > Argmax (Last 1200 values): {'YES' if conditions_status['dip_confirmation_1min'] else 'NO'}")
+        print(f"Condition Met: {conditions_status['dip_confirmation_1min']}")
+
+        # Condition 12: Stoch Oversold vs Overbought (15s) - NEW
+        print("\n--- Condition 12: Stoch Oversold vs Overbought (15s) ---")
+        oversold_result = check_stoch_oversold_vs_overbought_15sec(candles_15s)
+        conditions_status["stoch_oversold_vs_overbought_15sec"] = oversold_result[0]
+        print(f"Description: {oversold_result[1]}")
+        print(f"Condition Met: {oversold_result[0]}")
 
         # Print all conditions with true/false values
         print("\n" + "="*80)
