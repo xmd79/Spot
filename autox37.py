@@ -60,7 +60,7 @@ CONFIG = {
         "stoch_oversold_vs_overbought_1min": True,
         "rsi_oversold_vs_overbought_15sec": True,
     },
-    "min_conditions_met": 7  # UPDATED: Trigger trade if 7 out of 12 conditions are True
+    "min_conditions_met": 7  # Trigger trade if 7 out of 12 conditions are True
 }
 
 # Global variables for market state tracking
@@ -1671,16 +1671,37 @@ try:
             print(f"{condition_name:<50}{status}")
         print("-" * 65)
         
-        # UPDATED LOGIC: Check if count meets minimum threshold instead of requiring all
-        signal_triggered = true_conditions_count >= min_required
-        print(f"\nConditions Met for Entry: {'Yes' if signal_triggered else 'No'} ({true_conditions_count}/{min_required})")
+        # =========================================================
+        # UPDATED LOGIC: STRICT CONDITIONS + COUNT THRESHOLD
+        # =========================================================
+        
+        # 1. Check Strict Conditions
+        strict_volume_bullish_1m = conditions_status["volume_bullish_1min"]
+        strict_dip_conf_1m = conditions_status["dip_confirmation_1min"]
+        
+        # 2. Check Count Condition (7 from 12)
+        count_condition_met = true_conditions_count >= min_required
+        
+        # 3. Final Signal Trigger (Must be True AND True AND True)
+        signal_triggered = count_condition_met and strict_volume_bullish_1m and strict_dip_conf_1m
+        
+        # Print detailed status for the logic
+        print("\n" + "="*80)
+        print("FINAL TRIGGER LOGIC CHECK")
+        print("="*80)
+        print(f"[1/3] Count Requirement ({true_conditions_count} >= {min_required}): {'PASS' if count_condition_met else 'FAIL'}")
+        print(f"[2/3] Strict Volume Bullish 1m: {'PASS' if strict_volume_bullish_1m else 'FAIL'}")
+        print(f"[3/3] Strict Dip Confirmation 1m: {'PASS' if strict_dip_conf_1m else 'FAIL'}")
+        print("-" * 80)
+        print(f"FINAL SIGNAL TRIGGERED: {'YES' if signal_triggered else 'NO'}")
+        print("="*80)
 
         # Save signal to file if signal is triggered
         if signal_triggered:
             signal_data = {
                 "current_price": float(current_price),
                 "signal": "BUY",
-                "conditions_met": f"{true_conditions_count}/{len(active_conditions_results)}"
+                "conditions_met": f"{true_conditions_count}/{len(active_conditions_results)} (Strict: Vol 1m, Dip 1m)"
             }
             save_signal_to_file(signal_data)
 
@@ -1777,7 +1798,8 @@ try:
             if signal_triggered:
                 usdc_balance = get_balance('USDC')
                 if usdc_balance > Decimal('0'):
-                    print(f"\n!!! SIGNAL TRIGGERED: {true_conditions_count} CONDITIONS MET (>= {min_required}) - EXECUTING TRADE !!!")
+                    print(f"\n!!! SIGNAL TRIGGERED: {true_conditions_count} CONDITIONS MET (>= {min_required}) + STRICT CONDITIONS MET - EXECUTING TRADE !!!")
+                    print(f"Strict Conditions Check: Volume 1m ({strict_volume_bullish_1m}), Dip 1m ({strict_dip_conf_1m})")
                     print(f"Trigger signal detected! Attempting to buy {TRADE_SYMBOL} with entire USDC balance: {usdc_balance:.25f} at price {current_price:.25f}")
                     entry_price, quantity_bought, entry_datetime, cost = buy_asset()
                     if entry_price is not None and quantity_bought is not None and cost is not None:
@@ -1795,6 +1817,10 @@ try:
             else:
                 print(f"\n!!! INSUFFICIENT CONDITIONS MET - NO TRADE EXECUTED !!!")
                 print(f"Only {true_conditions_count}/{min_required} conditions met (Required: {min_required}).")
+                if not strict_volume_bullish_1m:
+                    print(f"STRICT CONDITION FAILED: Volume Bullish 1min is False.")
+                if not strict_dip_conf_1m:
+                    print(f"STRICT CONDITION FAILED: Dip Confirmation 1min is False.")
                 print("Waiting for next iteration...")
 
         print(f"\nCurrent USDC balance: {usdc_balance:.25f}")
