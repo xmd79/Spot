@@ -82,6 +82,7 @@ timeframe_extrema = {
 def get_dip_confirmation(closes, lookback=1200):
     """
     Analyzes price structure using GLOBAL Argmin vs Argmax for last 1200 values.
+    Returns: (is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max)
     """
     try:
         np_closes = np.array(closes, dtype=np.float64)
@@ -89,11 +90,11 @@ def get_dip_confirmation(closes, lookback=1200):
         n = len(recent_data)
         
         if n < 5:
-            return False, -1, -1
+            return False, -1, -1, 0.0, 0.0
 
         clean_data = recent_data[~np.isnan(recent_data)]
         if len(clean_data) == 0:
-            return False, -1, -1
+            return False, -1, -1, 0.0, 0.0
 
         min_val = np.nanmin(clean_data)
         max_val = np.nanmax(clean_data)
@@ -127,19 +128,23 @@ def get_dip_confirmation(closes, lookback=1200):
                 break
 
         if abs_min_idx == -1 or abs_max_idx == -1:
-            return False, -1, -1
+            return False, -1, -1, 0.0, 0.0
+
+        # Get price values at the found indices
+        val_at_min = np_closes[abs_min_idx]
+        val_at_max = np_closes[abs_max_idx]
 
         is_dip_confirmed = abs_min_idx > abs_max_idx
-        return is_dip_confirmed, abs_min_idx, abs_max_idx
+        return is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max
 
     except Exception as e:
         print(f"Error in get_dip_confirmation: {e}")
         import traceback
         traceback.print_exc()
-        return False, -1, -1
+        return False, -1, -1, 0.0, 0.0
 
 # =========================================================
-# NEW FUNCTION: STOCH OVERSOLD VS OVERBOUGHT (1MIN)
+# UPDATED FUNCTION: STOCH OVERSOLD VS OVERBOUGHT (1MIN)
 # =========================================================
 
 def check_stoch_oversold_vs_overbought_1min(candles_1m):
@@ -149,7 +154,7 @@ def check_stoch_oversold_vs_overbought_1min(candles_1m):
     """
     try:
         if not candles_1m or len(candles_1m) < 15:
-            return False, "Insufficient data", 0, 0
+            return False, "Insufficient data", -1, -1, 0.0
 
         closes = np.array([c['close'] for c in candles_1m], dtype=np.float64)
         highs = np.array([c['high'] for c in candles_1m], dtype=np.float64)
@@ -187,17 +192,19 @@ def check_stoch_oversold_vs_overbought_1min(candles_1m):
         else:
             description = "Most recent extreme was OVERBOUGHT (Bearish Potential) or None"
 
-        return condition_met, description, last_oversold_idx, last_overbought_idx
+        # Added current_val to return tuple for detailed printing
+        current_val = slowk[-1]
+        return condition_met, description, last_oversold_idx, last_overbought_idx, current_val
 
     except Exception as e:
         print(f"Error checking Stoch Oversold vs Overbought (1m): {e}")
         import traceback
         traceback.print_exc()
-        return False, str(e), -1, -1
+        return False, str(e), -1, -1, 0.0
 
 
 # =========================================================
-# NEW FUNCTION: RSI OVERSOLD VS OVERBOUGHT (15SEC)
+# UPDATED FUNCTION: RSI OVERSOLD VS OVERBOUGHT (15SEC)
 # =========================================================
 
 def check_rsi_oversold_vs_overbought_15sec(candles_15s):
@@ -208,7 +215,7 @@ def check_rsi_oversold_vs_overbought_15sec(candles_15s):
     """
     try:
         if not candles_15s or len(candles_15s) < 20:
-            return False, "Insufficient data", 0, 0
+            return False, "Insufficient data", -1, -1, 0.0
 
         closes = np.array([c['close'] for c in candles_15s], dtype=np.float64)
 
@@ -245,13 +252,15 @@ def check_rsi_oversold_vs_overbought_15sec(candles_15s):
         else:
             description = "Most recent extreme was OVERBOUGHT (Bearish Potential) or None"
 
-        return condition_met, description, last_oversold_idx, last_overbought_idx
+        # Added current_val to return tuple for detailed printing
+        current_val = rsi_values[-1]
+        return condition_met, description, last_oversold_idx, last_overbought_idx, current_val
 
     except Exception as e:
         print(f"Error checking RSI Oversold vs Overbought (15s): {e}")
         import traceback
         traceback.print_exc()
-        return False, str(e), -1, -1
+        return False, str(e), -1, -1, 0.0
 
 
 # =========================================================
@@ -287,7 +296,8 @@ def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
         current_stoch_d = slowd[-1]
 
         # --- 2. DIP CONFIRMATION (Argmin vs Argmax) ---
-        is_dip_15s, idx_min, idx_max = get_dip_confirmation(closes, lookback=1200)
+        # Updated to unpack 5 values (added price values at end)
+        is_dip_15s, idx_min, idx_max, val_min, val_max = get_dip_confirmation(closes, lookback=1200)
 
         # --- 3. TRIGGER CONDITIONS ---
         threshold = 61.8
@@ -360,7 +370,8 @@ def analyze_stoch_rsi_precise_strategy_1min(candles_1m):
         current_stoch_d = slowd[-1]
 
         # --- 2. DIP CONFIRMATION (Argmin vs Argmax) ---
-        is_dip_1m, idx_min, idx_max = get_dip_confirmation(closes, lookback=1200)
+        # Updated to unpack 5 values (added price values at end)
+        is_dip_1m, idx_min, idx_max, val_min, val_max = get_dip_confirmation(closes, lookback=1200)
 
         # --- 3. TRIGGER CONDITIONS ---
         threshold = 61.8
@@ -1621,27 +1632,49 @@ try:
             conditions_status["stoch_rsi_precise_1min"] = False
             conditions_status["dip_confirmation_1min"] = False
             
-        # Condition 9: Dip Confirmation (15s)
+        # Condition 9: Dip Confirmation (15s) - UPDATED PRINTS
         print("\n--- Condition 9: Dip Confirmation (15s) ---")
-        print(f"Argmin > Argmax (Last 1200 values): {'YES' if conditions_status['dip_confirmation_15sec'] else 'NO'}")
+        # Fetch indices and prices specifically for printing
+        is_dip_15s_print, idx_min_15s_print, idx_max_15s_print, price_min_15s, price_max_15s = get_dip_confirmation([c['close'] for c in candles_15s], lookback=1200)
+        print(f"Last Argmin Index (Global): {idx_min_15s_print}")
+        print(f"Last Argmin Price: {price_min_15s:.2f}")
+        print(f"Last Argmax Index (Global): {idx_max_15s_print}")
+        print(f"Last Argmax Price: {price_max_15s:.2f}")
+        print(f"Argmin > Argmax: {'YES' if is_dip_15s_print else 'NO'}")
         print(f"Condition Met: {conditions_status['dip_confirmation_15sec']}")
 
-        # Condition 10: Dip Confirmation (1m)
+        # Condition 10: Dip Confirmation (1m) - UPDATED PRINTS
         print("\n--- Condition 10: Dip Confirmation (1m) ---")
-        print(f"Argmin > Argmax (Last 1200 values): {'YES' if conditions_status['dip_confirmation_1min'] else 'NO'}")
+        # Fetch indices and prices specifically for printing
+        is_dip_1m_print, idx_min_1m_print, idx_max_1m_print, price_min_1m, price_max_1m = get_dip_confirmation([c['close'] for c in candles_1m], lookback=1200)
+        print(f"Last Argmin Index (Global): {idx_min_1m_print}")
+        print(f"Last Argmin Price: {price_min_1m:.2f}")
+        print(f"Last Argmax Index (Global): {idx_max_1m_print}")
+        print(f"Last Argmax Price: {price_max_1m:.2f}")
+        print(f"Argmin > Argmax: {'YES' if is_dip_1m_print else 'NO'}")
         print(f"Condition Met: {conditions_status['dip_confirmation_1min']}")
 
         # Condition 11: Stoch Oversold vs Overbought (1m) - REPLACED 15s
         print("\n--- Condition 11: Stoch Oversold vs Overbought (1m) ---")
         stoch_1m_os_result = check_stoch_oversold_vs_overbought_1min(candles_1m)
+        # Unpack: condition_met, description, last_oversold_idx, last_overbought_idx, current_val
         conditions_status["stoch_oversold_vs_overbought_1min"] = stoch_1m_os_result[0]
+        
+        print(f"Current Stoch %K: {stoch_1m_os_result[4]:.2f}")
+        print(f"Last Oversold Index (<20): {stoch_1m_os_result[2]}")
+        print(f"Last Overbought Index (>80): {stoch_1m_os_result[3]}")
         print(f"Description: {stoch_1m_os_result[1]}")
         print(f"Condition Met: {stoch_1m_os_result[0]}")
 
         # Condition 12: RSI Oversold vs Overbought (15s) - NEW
         print("\n--- Condition 12: RSI Oversold vs Overbought (15s) ---")
         rsi_15s_os_result = check_rsi_oversold_vs_overbought_15sec(candles_15s)
+        # Unpack: condition_met, description, last_oversold_idx, last_overbought_idx, current_val
         conditions_status["rsi_oversold_vs_overbought_15sec"] = rsi_15s_os_result[0]
+        
+        print(f"Current RSI: {rsi_15s_os_result[4]:.2f}")
+        print(f"Last Oversold Index (<30): {rsi_15s_os_result[2]}")
+        print(f"Last Overbought Index (>70): {rsi_15s_os_result[3]}")
         print(f"Description: {rsi_15s_os_result[1]}")
         print(f"Condition Met: {rsi_15s_os_result[0]}")
 
