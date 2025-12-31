@@ -622,8 +622,9 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
 def save_signal_to_file(signal_type, **kwargs):
     """
     Writes signal data to signals.txt.
-    signal_type can be "ENTRY" or "EXIT".
-    kwargs expected: entry_price, exit_price, profit, time_held, conditions_met
+    Format:
+    Recovery: ...,ENTRY,<price>,,DETAILS: ENTRY PRICE: <price> | EXIT PRICE: <target>
+    Standard: ...,ENTRY,<price>,,DETAILS: EXIT PRICE: <target> | <conditions_met>
     """
     try:
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -642,8 +643,25 @@ def save_signal_to_file(signal_type, **kwargs):
         if signal_type == "ENTRY":
             entry_price = kwargs.get('entry_price', 0.0)
             conditions_met = kwargs.get('conditions_met', "")
-            # Format: ENTRY,<Price>,<Conditions Met>
-            row_data = f"{timestamp},{symbol},ENTRY,{entry_price:.2f},,{conditions_met}\n"
+            target_price = kwargs.get('target_price', 0.0)
+            
+            # FIX: Detect Recovery vs Standard Entry
+            # If conditions_met contains "ENTRY PRICE:", it's a recovery.
+            # Otherwise, it's a standard entry.
+            
+            if "ENTRY PRICE:" in conditions_met or conditions_met.startswith("ENTRY PRICE:"):
+                # RECOVERY FORMAT
+                # User wants "ENTRY PRICE: ..." in Details, and entry price only once.
+                # Format: ...,ENTRY,<price>,,DETAILS: ENTRY PRICE: <price> | EXIT PRICE: <target>
+                details_str = f"ENTRY PRICE: {entry_price:.2f} | EXIT PRICE: {target_price:.2f}"
+                row_data = f"{timestamp},{symbol},ENTRY,{entry_price:.2f},,,{details_str}\n"
+            else:
+                # STANDARD ENTRY FORMAT
+                # User wants "EXIT PRICE: ..." in Details.
+                # Format: ...,ENTRY,<price>,,DETAILS: EXIT PRICE: <target> | <conditions_met>
+                details_str = f"EXIT PRICE: {target_price:.2f} | {conditions_met}"
+                row_data = f"{timestamp},{symbol},ENTRY,{entry_price:.2f},,,{details_str}\n"
+            
             print(f"Signal saved to signals.txt: {timestamp} - ENTRY")
             
         elif signal_type == "EXIT":
@@ -651,7 +669,7 @@ def save_signal_to_file(signal_type, **kwargs):
             profit = kwargs.get('profit', 0.0)
             profit_pct = kwargs.get('profit_pct', 0.0)
             time_held = kwargs.get('time_held', "")
-            # Format: EXIT,<Price>,<Profit>,<Profit%>,<Time Held>
+            # Format: ...,EXIT,<price>,<profit>,<pct>,<held>
             row_data = f"{timestamp},{symbol},EXIT,{exit_price:.2f},{profit:.2f},{profit_pct:.2f},{time_held}\n"
             print(f"Signal saved to signals.txt: {timestamp} - EXIT (Profit: {profit:.2f} USDC)")
 
@@ -1510,16 +1528,24 @@ try:
                 recovered_price = get_average_entry_price()
                 if recovered_price > Decimal('0.0'):
                     entry_price = recovered_price
+                    # FIXED: Calculate initial_investment properly here for target calculation
                     initial_investment = asset_balance * entry_price
                     last_trade = get_last_buy_trade()
                     if last_trade:
                         entry_datetime = datetime.datetime.fromtimestamp(last_trade['time'] / 1000)
                     
+                    # Calculate Target Price for Recovery
+                    total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
+                    target_multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
+                    target_value = initial_investment * target_multiplier
+                    target_price = target_value / asset_balance if asset_balance > Decimal('0') else Decimal('0.0')
+
                     # LOG ENTRY SIGNAL FOR RECOVERED TRADE
+                    # Uses the new format with separate PRICE and DETAILS columns
                     save_signal_to_file(
                         "ENTRY", 
                         entry_price=float(entry_price), 
-                        conditions_met="RECOVERY"
+                        target_price=float(target_price)
                     )
                     print(f"Recovered Entry Price: {entry_price}")
                 else:
@@ -1529,18 +1555,20 @@ try:
             print("Monitoring current position...")
             
             current_value_in_usdc = asset_balance * current_price
+            # Use global initial_investment if set, otherwise display placeholder
             initial_investment_display = initial_investment if initial_investment > Decimal('0') else Decimal('1.0')
             
             # Calculate Targets
             total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
             target_multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
-            target_value = initial_investment * target_multiplier
+            target_value = initial_investment_display * target_multiplier
             target_price = target_value / asset_balance if asset_balance > Decimal('0') else Decimal('0.0')
             
-            value_change_percentage = ((current_value_in_usdc - initial_investment) / initial_investment) * Decimal('100') if initial_investment > Decimal('0') else Decimal('0.0')
+            value_change_percentage = ((current_value_in_usdc - initial_investment_display) / initial_investment_display) * Decimal('100') if initial_investment_display > Decimal('0') else Decimal('0.0')
 
             # Time stats
-            entry_time_str = entry_datetime.strftime("%H:%M") if entry_datetime else "Unknown"
+            # FIX: Changed format from "%H:%M" to "%Y-%m-%d %H:%M:%S"
+            entry_time_str = entry_datetime.strftime("%Y-%m-%d %H:%M:%S") if entry_datetime else "Unknown"
             time_span = (current_local_time - entry_datetime) if entry_datetime else None
             time_span_str = "Unknown"
             if time_span:
@@ -1556,14 +1584,14 @@ try:
             print(f"Target Price ({PROFIT_TARGET_PERCENT}% Net + {TOTAL_FEE_PERCENT}% Fees): {target_price:.2f}")
 
             # CHECK EXIT CONDITION
-            is_profit_exit = check_exit_condition(initial_investment, asset_balance, entry_price)
+            is_profit_exit = check_exit_condition(initial_investment_display, asset_balance, entry_price)
             
             if is_profit_exit:
                 print(f"\n*** PROFIT TARGET REACHED. SELLING POSITION ***")
                 if sell_asset(float(asset_balance)):
                     exit_usdc_balance = get_balance('USDC')
-                    profit = exit_usdc_balance - initial_investment
-                    profit_percentage = (profit / initial_investment) * Decimal('100') if initial_investment > Decimal('0.0') else Decimal('0.0')
+                    profit = exit_usdc_balance - initial_investment_display
+                    profit_percentage = (profit / initial_investment_display) * Decimal('100') if initial_investment_display > Decimal('0.0') else Decimal('0.0')
                     print(f"Position closed successfully.")
                     print(f"Exit Balance: {exit_usdc_balance:.25f} USDC")
                     print(f"Realized Profit: {profit:.25f} USDC ({profit_percentage:.2f}%)")
@@ -1786,13 +1814,16 @@ try:
                 # Prepare details for log
                 conditions_summary = f"{true_conditions_count}/{len(active_conditions_results)} (Strict: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m)"
                 
-                signal_data = {
-                    "current_price": float(current_price),
-                    "signal": "BUY",
-                    "conditions_met": conditions_summary
-                }
+                # Calculate Target Price for Standard Entry
+                # Investment = Asset * Price (assuming 0 fees for simplicity, or just using Price * multiplier)
+                total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
+                multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
+                # We use usdc_balance to approximate investment cost before buying
+                approx_investment = usdc_balance * current_price
+                target_price = approx_investment * multiplier
+                
                 # We log the BUY trigger for reference
-                save_signal_to_file("ENTRY", entry_price=float(current_price), conditions_met=conditions_summary)
+                save_signal_to_file("ENTRY", entry_price=float(current_price), target_price=float(target_price), conditions_met=conditions_summary)
 
             # --- ENTRY LOGIC ---
             if signal_triggered:
@@ -1805,6 +1836,7 @@ try:
                     entry_price, quantity_bought, entry_datetime, cost = buy_asset()
                     
                     if entry_price is not None and quantity_bought is not None and cost is not None:
+                        # Update global initial_investment with actual cost
                         initial_investment = cost
                         print(f"*** ORDER FILLED ***")
                         print(f"Entry Price: {entry_price:.25f}")
