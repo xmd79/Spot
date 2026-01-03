@@ -76,13 +76,17 @@ timeframe_extrema = {
 }
 
 # =========================================================
-# UPDATED UTILITY: DIP CONFIRMATION (Argmin vs Argmax - MOST RECENT)
+# UPDATED UTILITY: DIP CONFIRMATION (DISTANCE BASED)
 # =========================================================
 
 def get_dip_confirmation(closes, lookback=1200):
     """
     Analyzes price structure using GLOBAL Argmin vs Argmax for last 1200 values.
     Returns: (is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max)
+    
+    Logic Updated:
+    Condition is True if dist from current close to argmin < dist from current close to argmax.
+    (Price is closer to the historical low than the historical high).
     """
     try:
         np_closes = np.array(closes, dtype=np.float64)
@@ -134,7 +138,13 @@ def get_dip_confirmation(closes, lookback=1200):
         val_at_min = np_closes[abs_min_idx]
         val_at_max = np_closes[abs_max_idx]
 
-        is_dip_confirmed = abs_min_idx > abs_max_idx
+        # UPDATED LOGIC: Compare Distance from Current Close
+        current_close = np_closes[-1]
+        dist_to_min = abs(current_close - val_at_min)
+        dist_to_max = abs(current_close - val_at_max)
+        
+        is_dip_confirmed = dist_to_min < dist_to_max
+        
         return is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max
 
     except Exception as e:
@@ -295,7 +305,7 @@ def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
         current_stoch_k = slowk[-1]
         current_stoch_d = slowd[-1]
 
-        # --- 2. DIP CONFIRMATION (Argmin vs Argmax) ---
+        # --- 2. DIP CONFIRMATION (Distance based) ---
         # Updated to unpack 5 values (added price values at end)
         is_dip_15s, idx_min, idx_max, val_min, val_max = get_dip_confirmation(closes, lookback=1200)
 
@@ -317,7 +327,7 @@ def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
         print(f"RSI %D (MA 3):         {current_rsi_d:.2f}") # NEW PRINT
         print(f"Stoch %K (14,1,4):     {current_stoch_k:.2f} < {threshold} : {stoch_k_condition_met}")
         print(f"Stoch %D:              {current_stoch_d:.2f}")
-        print(f"Dip Conf (MinIdx {idx_min} > MaxIdx {idx_max}): {is_dip_15s}")
+        print(f"Dip Conf (Dist Min < Dist Max): {is_dip_15s}")
         print(f"-----------------------------------")
         print(f"TOTAL CONDITION MET:   {condition_met}")
         print(f"===================================")
@@ -369,7 +379,7 @@ def analyze_stoch_rsi_precise_strategy_1min(candles_1m):
         current_stoch_k = slowk[-1]
         current_stoch_d = slowd[-1]
 
-        # --- 2. DIP CONFIRMATION (Argmin vs Argmax) ---
+        # --- 2. DIP CONFIRMATION (Distance based) ---
         # Updated to unpack 5 values (added price values at end)
         is_dip_1m, idx_min, idx_max, val_min, val_max = get_dip_confirmation(closes, lookback=1200)
 
@@ -391,7 +401,7 @@ def analyze_stoch_rsi_precise_strategy_1min(candles_1m):
         print(f"RSI %D (MA 3):         {current_rsi_d:.2f}") # NEW PRINT
         print(f"Stoch %K (14,1,4):     {current_stoch_k:.2f} < {threshold} : {stoch_k_condition_met}")
         print(f"Stoch %D:              {current_stoch_d:.2f}")
-        print(f"Dip Conf (MinIdx {idx_min} > MaxIdx {idx_max}): {is_dip_1m}")
+        print(f"Dip Conf (Dist Min < Dist Max): {is_dip_1m}")
         print(f"-----------------------------------")
         print(f"TOTAL CONDITION MET:   {condition_met}")
         print(f"===================================")
@@ -1815,11 +1825,11 @@ try:
             
         # Condition 9: Dip Confirmation (15s)
         print("\n--- Condition 9: Dip Confirmation (15s) ---")
-        print(f"Argmin > Argmax: {'YES' if is_dip_15s_print else 'NO'}")
+        print(f"Dist to Min < Dist to Max: {'YES' if is_dip_15s_print else 'NO'}")
 
         # Condition 10: Dip Confirmation (1m)
         print("\n--- Condition 10: Dip Confirmation (1m) ---")
-        print(f"Argmin > Argmax: {'YES' if is_dip_1m_print else 'NO'}")
+        print(f"Dist to Min < Dist to Max: {'YES' if is_dip_1m_print else 'NO'}")
 
         # Condition 11: Stoch Oversold vs Overbought (1m)
         print("\n--- Condition 11: Stoch Oversold vs Overbought (1m) ---")
