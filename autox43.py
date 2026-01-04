@@ -669,18 +669,15 @@ def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kw
             
             if signal_type == "ENTRY":
                 entry_price = kwargs.get('entry_price', 0.0)
-                # FIXED: Removed "RECOVERY ENTRY | " prefix, keeping only EXIT PRICE
                 details = kwargs.get('details', "")
                 target_price = kwargs.get('target_price', 0.0)
                 
                 f.write(f"ENTRY PRICE: {entry_price:.2f}\n")
                 f.write(f"USDC BALANCE (BEFORE ENTRY): {usdc_balance:.2f}\n")
                 f.write(f"TARGET PRICE: {target_price:.2f}\n")
-                # User requested: "DETAILS: RECOVERY take out this print... but leave EXIT PRICE: and its value at end"
-                # The details string passed from main is now expected to be just the target info or custom info.
-                # However, to be safe, if 'details' contains "RECOVERY", we strip it or just print clean Target Price.
-                # Assuming caller sends clean string or we handle it here.
-                if details:
+                
+                # UPDATED: Do not print DETAILS if it contains "EXIT PRICE" to avoid duplication
+                if details and not details.startswith("EXIT PRICE:"):
                     f.write(f"DETAILS: {details}\n")
                 
             elif signal_type == "EXIT":
