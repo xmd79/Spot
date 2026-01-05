@@ -55,8 +55,8 @@ CONFIG = {
         "volume_bullish_1min": True,
         "stoch_rsi_precise_15sec": True,
         "stoch_rsi_precise_1min": True,
-        "dip_confirmation_15sec": True,
-        "dip_confirmation_1min": True,
+        "dip_confirmation_15sec": False, # Disabled logic-wise but enabled for printing
+        "dip_confirmation_1min": False,  # Disabled logic-wise but enabled for printing
         "stoch_oversold_vs_overbought_1min": True,
         "rsi_oversold_vs_overbought_15sec": True,
     },
@@ -82,11 +82,7 @@ timeframe_extrema = {
 def get_dip_confirmation(closes, lookback=1200):
     """
     Analyzes price structure using GLOBAL Argmin vs Argmax for last 1200 values.
-    Returns: (is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max)
-    
-    Logic Updated:
-    Condition is True if dist from current close to argmin < dist from current close to argmax.
-    (Price is closer to the historical low than the historical high).
+    Returns: (is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max, dist_to_min, dist_to_max)
     """
     try:
         np_closes = np.array(closes, dtype=np.float64)
@@ -94,11 +90,11 @@ def get_dip_confirmation(closes, lookback=1200):
         n = len(recent_data)
         
         if n < 5:
-            return False, -1, -1, 0.0, 0.0
+            return False, -1, -1, 0.0, 0.0, 0.0, 0.0
 
         clean_data = recent_data[~np.isnan(recent_data)]
         if len(clean_data) == 0:
-            return False, -1, -1, 0.0, 0.0
+            return False, -1, -1, 0.0, 0.0, 0.0, 0.0
 
         min_val = np.nanmin(clean_data)
         max_val = np.nanmax(clean_data)
@@ -132,7 +128,7 @@ def get_dip_confirmation(closes, lookback=1200):
                 break
 
         if abs_min_idx == -1 or abs_max_idx == -1:
-            return False, -1, -1, 0.0, 0.0
+            return False, -1, -1, 0.0, 0.0, 0.0, 0.0
 
         # Get price values at the found indices
         val_at_min = np_closes[abs_min_idx]
@@ -145,13 +141,13 @@ def get_dip_confirmation(closes, lookback=1200):
         
         is_dip_confirmed = dist_to_min < dist_to_max
         
-        return is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max
+        return is_dip_confirmed, abs_min_idx, abs_max_idx, val_at_min, val_at_max, dist_to_min, dist_to_max
 
     except Exception as e:
         print(f"Error in get_dip_confirmation: {e}")
         import traceback
         traceback.print_exc()
-        return False, -1, -1, 0.0, 0.0
+        return False, -1, -1, 0.0, 0.0, 0.0, 0.0
 
 # =========================================================
 # UPDATED FUNCTION: STOCH OVERSOLD VS OVERBOUGHT (1MIN)
@@ -161,10 +157,11 @@ def check_stoch_oversold_vs_overbought_1min(candles_1m):
     """
     Checks if Oversold (<20) happened more recently than Overbought (>80)
     on the Stochastic %K line for the 1m timeframe.
+    Returns: condition_met, description, idx_os, idx_ob, curr_val, val_at_os, val_at_ob
     """
     try:
         if not candles_1m or len(candles_1m) < 15:
-            return False, "Insufficient data", -1, -1, 0.0
+            return False, "Insufficient data", -1, -1, 0.0, 0.0, 0.0
 
         closes = np.array([c['close'] for c in candles_1m], dtype=np.float64)
         highs = np.array([c['high'] for c in candles_1m], dtype=np.float64)
@@ -178,6 +175,8 @@ def check_stoch_oversold_vs_overbought_1min(candles_1m):
 
         last_oversold_idx = -1
         last_overbought_idx = -1
+        val_at_oversold = 0.0
+        val_at_overbought = 0.0
         
         # Iterate backwards to find most recent occurrences
         for i in range(len(slowk) - 1, -1, -1):
@@ -187,9 +186,11 @@ def check_stoch_oversold_vs_overbought_1min(candles_1m):
             
             if last_oversold_idx == -1 and val <= oversold_limit:
                 last_oversold_idx = i
+                val_at_oversold = val
             
             if last_overbought_idx == -1 and val >= overbought_limit:
                 last_overbought_idx = i
+                val_at_overbought = val
                 
             if last_oversold_idx != -1 and last_overbought_idx != -1:
                 break
@@ -202,15 +203,14 @@ def check_stoch_oversold_vs_overbought_1min(candles_1m):
         else:
             description = "Most recent extreme was OVERBOUGHT (Bearish Potential) or None"
 
-        # Added current_val to return tuple for detailed printing
         current_val = slowk[-1]
-        return condition_met, description, last_oversold_idx, last_overbought_idx, current_val
+        return condition_met, description, last_oversold_idx, last_overbought_idx, current_val, val_at_oversold, val_at_overbought
 
     except Exception as e:
         print(f"Error checking Stoch Oversold vs Overbought (1m): {e}")
         import traceback
         traceback.print_exc()
-        return False, str(e), -1, -1, 0.0
+        return False, str(e), -1, -1, 0.0, 0.0, 0.0
 
 
 # =========================================================
@@ -221,11 +221,11 @@ def check_rsi_oversold_vs_overbought_15sec(candles_15s):
     """
     Checks if Oversold (<30) happened more recently than Overbought (>70)
     on the RSI line for the 15s timeframe.
-    Uses RSI Length 14.
+    Returns: condition_met, description, idx_os, idx_ob, curr_val, val_at_os, val_at_ob
     """
     try:
         if not candles_15s or len(candles_15s) < 20:
-            return False, "Insufficient data", -1, -1, 0.0
+            return False, "Insufficient data", -1, -1, 0.0, 0.0, 0.0
 
         closes = np.array([c['close'] for c in candles_15s], dtype=np.float64)
 
@@ -238,8 +238,9 @@ def check_rsi_oversold_vs_overbought_15sec(candles_15s):
 
         last_oversold_idx = -1
         last_overbought_idx = -1
+        val_at_oversold = 0.0
+        val_at_overbought = 0.0
         
-        # Iterate backwards to find most recent occurrences
         for i in range(len(rsi_values) - 1, -1, -1):
             val = rsi_values[i]
             if np.isnan(val):
@@ -247,9 +248,11 @@ def check_rsi_oversold_vs_overbought_15sec(candles_15s):
             
             if last_oversold_idx == -1 and val <= oversold_limit:
                 last_oversold_idx = i
+                val_at_oversold = val
             
             if last_overbought_idx == -1 and val >= overbought_limit:
                 last_overbought_idx = i
+                val_at_overbought = val
                 
             if last_oversold_idx != -1 and last_overbought_idx != -1:
                 break
@@ -262,15 +265,14 @@ def check_rsi_oversold_vs_overbought_15sec(candles_15s):
         else:
             description = "Most recent extreme was OVERBOUGHT (Bearish Potential) or None"
 
-        # Added current_val to return tuple for detailed printing
         current_val = rsi_values[-1]
-        return condition_met, description, last_oversold_idx, last_overbought_idx, current_val
+        return condition_met, description, last_oversold_idx, last_overbought_idx, current_val, val_at_oversold, val_at_overbought
 
     except Exception as e:
         print(f"Error checking RSI Oversold vs Overbought (15s): {e}")
         import traceback
         traceback.print_exc()
-        return False, str(e), -1, -1, 0.0
+        return False, str(e), -1, -1, 0.0, 0.0, 0.0
 
 
 # =========================================================
@@ -278,11 +280,6 @@ def check_rsi_oversold_vs_overbought_15sec(candles_15s):
 # =========================================================
 
 def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
-    """
-    Analyzes 15s timeframe.
-    Trigger: RSI < 61.8 AND Stoch %K < 61.8 AND Dip Confirmation.
-    Added: RSI %D Calculation and Print.
-    """
     try:
         if not candles_15s or len(candles_15s) < 20:
             return {"error": "Insufficient 15s data", "condition_met": False}
@@ -292,41 +289,30 @@ def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
         lows = np.array([c['low'] for c in candles_15s], dtype=np.float64)
 
         # --- 1. CALCULATE INDICATORS ---
-        # RSI Length: 3
         rsi_values = talib.RSI(closes, timeperiod=3)
-        
-        # RSI %D: Smoothed RSI (Simple Moving Average of RSI, period 3)
-        rsi_d_values = talib.MA(rsi_values, timeperiod=3, matype=0) # 0=SMA
+        rsi_d_values = talib.MA(rsi_values, timeperiod=3, matype=0)
         current_rsi = rsi_values[-1]
         current_rsi_d = rsi_d_values[-1]
         
-        # Stoch: %K 14, Smooth 1, %D 4
         slowk, slowd = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=1, slowd_period=4)
         current_stoch_k = slowk[-1]
         current_stoch_d = slowd[-1]
 
-        # --- 2. DIP CONFIRMATION (Distance based) ---
-        # Updated to unpack 5 values (added price values at end)
-        is_dip_15s, idx_min, idx_max, val_min, val_max = get_dip_confirmation(closes, lookback=1200)
+        # --- 2. DIP CONFIRMATION ---
+        is_dip_15s, idx_min, idx_max, val_min, val_max, dist_min, dist_max = get_dip_confirmation(closes, lookback=1200)
 
         # --- 3. TRIGGER CONDITIONS ---
         threshold = 61.8
-        
-        # Condition: RSI < 61.8
         rsi_condition_met = current_rsi < threshold
-        
-        # Condition: Stoch %K < 61.8
         stoch_k_condition_met = current_stoch_k < threshold
-        
-        # Combined Logic: RSI, Stoch K, AND Dip Confirmation must all be True
         condition_met = rsi_condition_met and stoch_k_condition_met and is_dip_15s
 
         # --- PRINT SPECS ---
         print(f"====== 15s PRECISE STRATEGY ======")
-        print(f"RSI (Len 3):           {current_rsi:.2f} < {threshold} : {rsi_condition_met}")
-        print(f"RSI %D (MA 3):         {current_rsi_d:.2f}") # NEW PRINT
-        print(f"Stoch %K (14,1,4):     {current_stoch_k:.2f} < {threshold} : {stoch_k_condition_met}")
-        print(f"Stoch %D:              {current_stoch_d:.2f}")
+        print(f"RSI (Len 3):           {current_rsi:.25f} < {threshold} : {rsi_condition_met}")
+        print(f"RSI %D (MA 3):         {current_rsi_d:.25f}")
+        print(f"Stoch %K (14,1,4):     {current_stoch_k:.25f} < {threshold} : {stoch_k_condition_met}")
+        print(f"Stoch %D:              {current_stoch_d:.25f}")
         print(f"Dip Conf (Dist Min < Dist Max): {is_dip_15s}")
         print(f"-----------------------------------")
         print(f"TOTAL CONDITION MET:   {condition_met}")
@@ -352,11 +338,6 @@ def analyze_stoch_rsi_precise_strategy_15sec(candles_15s):
 
 
 def analyze_stoch_rsi_precise_strategy_1min(candles_1m):
-    """
-    Analyzes 1min timeframe.
-    Trigger: RSI < 61.8 AND Stoch %K < 61.8 AND Dip Confirmation.
-    Added: RSI %D Calculation and Print.
-    """
     try:
         if not candles_1m or len(candles_1m) < 20:
             return {"error": "Insufficient 1m data", "condition_met": False}
@@ -365,42 +346,27 @@ def analyze_stoch_rsi_precise_strategy_1min(candles_1m):
         highs = np.array([c['high'] for c in candles_1m], dtype=np.float64)
         lows = np.array([c['low'] for c in candles_1m], dtype=np.float64)
 
-        # --- 1. CALCULATE INDICATORS ---
-        # RSI Length: 3
         rsi_values = talib.RSI(closes, timeperiod=3)
-        
-        # RSI %D: Smoothed RSI (Simple Moving Average of RSI, period 3)
-        rsi_d_values = talib.MA(rsi_values, timeperiod=3, matype=0) # 0=SMA
+        rsi_d_values = talib.MA(rsi_values, timeperiod=3, matype=0)
         current_rsi = rsi_values[-1]
         current_rsi_d = rsi_d_values[-1]
 
-        # Stoch: %K 14, Smooth 1, %D 4
         slowk, slowd = talib.STOCH(highs, lows, closes, fastk_period=14, slowk_period=1, slowd_period=4)
         current_stoch_k = slowk[-1]
         current_stoch_d = slowd[-1]
 
-        # --- 2. DIP CONFIRMATION (Distance based) ---
-        # Updated to unpack 5 values (added price values at end)
-        is_dip_1m, idx_min, idx_max, val_min, val_max = get_dip_confirmation(closes, lookback=1200)
+        is_dip_1m, idx_min, idx_max, val_min, val_max, dist_min, dist_max = get_dip_confirmation(closes, lookback=1200)
 
-        # --- 3. TRIGGER CONDITIONS ---
         threshold = 61.8
-        
-        # Condition: RSI < 61.8
         rsi_condition_met = current_rsi < threshold
-        
-        # Condition: Stoch %K < 61.8
         stoch_k_condition_met = current_stoch_k < threshold
-        
-        # Combined Logic: RSI, Stoch K, AND Dip Confirmation must all be True
         condition_met = rsi_condition_met and stoch_k_condition_met and is_dip_1m
 
-        # --- PRINT SPECS ---
         print(f"====== 1m PRECISE STRATEGY ======")
-        print(f"RSI (Len 3):           {current_rsi:.2f} < {threshold} : {rsi_condition_met}")
-        print(f"RSI %D (MA 3):         {current_rsi_d:.2f}") # NEW PRINT
-        print(f"Stoch %K (14,1,4):     {current_stoch_k:.2f} < {threshold} : {stoch_k_condition_met}")
-        print(f"Stoch %D:              {current_stoch_d:.2f}")
+        print(f"RSI (Len 3):           {current_rsi:.25f} < {threshold} : {rsi_condition_met}")
+        print(f"RSI %D (MA 3):         {current_rsi_d:.25f}")
+        print(f"Stoch %K (14,1,4):     {current_stoch_k:.25f} < {threshold} : {stoch_k_condition_met}")
+        print(f"Stoch %D:              {current_stoch_d:.25f}")
         print(f"Dip Conf (Dist Min < Dist Max): {is_dip_1m}")
         print(f"-----------------------------------")
         print(f"TOTAL CONDITION MET:   {condition_met}")
@@ -544,11 +510,7 @@ def get_average_entry_price():
 # =========================================================
 
 def buy_asset():
-    """
-    Executes a Market Buy order for the MAXIMUM available USDC balance.
-    """
     try:
-        # 1. Fresh Data Fetch
         current_price = get_current_price()
         if current_price <= Decimal('0'):
             return None, None, None, None
@@ -557,57 +519,46 @@ def buy_asset():
         if usdc_balance <= Decimal('0'):
             return None, None, None, None
         
-        # 2. Get Exchange Filters
         lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
         step_size = lot_size_info['stepSize']
         min_trade_size = lot_size_info['minQty']
         
-        # 3. Calculate Max Quantity (Raw)
         raw_quantity = usdc_balance / current_price
-        
-        # 4. Apply Step Size (Flooring) - This is the KEY to finding max tradeable amount
-        # We floor down to the nearest valid step size to ensure the order is accepted.
         step_precision = int(-math.log10(float(step_size))) if step_size > Decimal('0') else 8
         adjusted_quantity = (raw_quantity // step_size) * step_size
         adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
         
-        # 5. Check Min Notional (Usually 10 USDC)
         min_notional = Decimal('10.0')
         cost = adjusted_quantity * current_price
         
         if cost < min_notional:
-            print(f"Warning: Max balance trade (${cost:.2f}) is below Minimum Notional (${min_notional}). Adjusting to meet min trade size.")
+            print(f"Warning: Max balance trade (${cost:.25f}) is below Minimum Notional (${min_notional:.25f}). Adjusting to meet min trade size.")
             min_quantity_for_notional = min_notional / current_price
             adjusted_quantity = ((min_quantity_for_notional + step_size - Decimal('1E-25')) // step_size) * step_size
             adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
             cost = adjusted_quantity * current_price
             
-        # 6. Verify we have enough funds (Safety check against slippage)
         if cost > usdc_balance:
-            print(f"Warning: Adjusted cost (${cost:.2f}) exceeds balance (${usdc_balance:.2f}). Reducing to fit exact balance.")
+            print(f"Warning: Adjusted cost (${cost:.25f}) exceeds balance (${usdc_balance:.25f}). Reducing to fit exact balance.")
             adjusted_quantity = ((usdc_balance / current_price) // step_size) * step_size
             adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
             cost = adjusted_quantity * current_price
         
         if adjusted_quantity < min_trade_size:
-            print(f"Error: Adjusted quantity {adjusted_quantity} is below Min Trade Size {min_trade_size}. Cannot trade.")
+            print(f"Error: Adjusted quantity {adjusted_quantity:.25f} is below Min Trade Size {min_trade_size:.25f}. Cannot trade.")
             return None, None, None, None
         
-        # 7. Execute Order
         print(f"\n>>> EXECUTING MAX BUY ORDER <<<")
-        print(f"USDC Balance Available : {usdc_balance:.2f}")
-        print(f"Max BTC Quantity      : {adjusted_quantity:.8f}")
-        print(f"Estimated Cost        : {cost:.2f} USDC")
+        print(f"USDC Balance Available : {usdc_balance:.25f}")
+        print(f"Max BTC Quantity      : {adjusted_quantity:.25f}")
+        print(f"Estimated Cost        : {cost:.25f} USDC")
         
         order = client.order_market_buy(symbol=TRADE_SYMBOL, quantity=float(adjusted_quantity))
         print(f"Market Buy Order Executed Successfully.")
         
-        # 8. Parse Result
         entry_price = Decimal(str(order['fills'][0]['price']))
         entry_datetime = datetime.datetime.now(LOCAL_TIMEZONE)
         
-        # We return 'cost' as the estimated initial investment, 
-        # but actual USDC spent might differ slightly due to market slippage.
         return entry_price, adjusted_quantity, entry_datetime, cost
         
     except BinanceAPIException as e:
@@ -619,9 +570,6 @@ def buy_asset():
 
 
 def sell_asset(asset_balance):
-    """
-    Executes a Market Sell order for the MAXIMUM available Asset (BTC) balance.
-    """
     try:
         current_price = get_current_price()
         if current_price <= Decimal('0'):
@@ -629,26 +577,23 @@ def sell_asset(asset_balance):
         
         asset_balance_dec = Decimal(str(asset_balance))
         
-        # 1. Get Exchange Filters
         lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
         step_size = lot_size_info['stepSize']
         min_trade_size = lot_size_info['minQty']
         
-        # 2. Calculate Max Quantity (Apply Step Size)
         step_precision = int(-math.log10(float(step_size))) if step_size > Decimal('0') else 8
         sell_quantity = (asset_balance_dec // step_size) * step_size
         sell_quantity = sell_quantity.quantize(Decimal('0.' + '0' * step_precision))
         
         if sell_quantity < min_trade_size:
-            print(f"Error: Asset balance {asset_balance_dec} is too small to trade (Min: {min_trade_size}).")
+            print(f"Error: Asset balance {asset_balance_dec:.25f} is too small to trade (Min: {min_trade_size:.25f}).")
             return False
         
-        # 3. Execute Order
         estimated_value = sell_quantity * current_price
         print(f"\n>>> EXECUTING MAX SELL ORDER <<<")
-        print(f"Asset Balance Available : {asset_balance_dec:.8f}")
-        print(f"Max BTC Quantity Sell   : {sell_quantity:.8f}")
-        print(f"Estimated Value         : {estimated_value:.2f} USDC")
+        print(f"Asset Balance Available : {asset_balance_dec:.25f}")
+        print(f"Max BTC Quantity Sell   : {sell_quantity:.25f}")
+        print(f"Estimated Value         : {estimated_value:.25f} USDC")
         
         sell_order = client.order_market_sell(symbol=TRADE_SYMBOL, quantity=float(sell_quantity))
         print(f"Market Sell Order Executed Successfully.")
@@ -663,16 +608,12 @@ def sell_asset(asset_balance):
         return False
 
 def check_exit_condition(initial_investment, asset_balance, entry_price):
-    """
-    Calculates exit condition based on Clean Net Profit Target + Fees.
-    """
     if initial_investment <= Decimal('0.0') or asset_balance <= Decimal('0.0') or entry_price <= Decimal('0.0'):
         return False
     current_price = get_current_price()
     if current_price <= Decimal('0.0'):
         return False
     
-    # Calculate Gross Percentage Required: Net Profit + Fees
     total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
     multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
     
@@ -682,13 +623,7 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
     return current_price >= target_price
 
 def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kwargs):
-    """
-    Writes signal data to signals.txt.
-    NEW FORMAT: Separated prints one below each other without commas.
-    FIXED: Handles empty lines at start by checking file size.
-    """
     try:
-        # Use override timestamp if provided, else current time
         if timestamp_override:
             timestamp = timestamp_override
         else:
@@ -696,9 +631,6 @@ def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kw
             
         symbol = TRADE_SYMBOL
         
-        # Logic to ensure no empty lines at start
-        # If file doesn't exist, use 'w'. If exists but is empty (0 bytes), use 'w'.
-        # If exists and has content, use 'a'.
         mode = 'a'
         write_header = False
         if not os.path.exists("signals.txt"):
@@ -722,11 +654,10 @@ def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kw
                 details = kwargs.get('details', "")
                 target_price = kwargs.get('target_price', 0.0)
                 
-                f.write(f"ENTRY PRICE: {entry_price:.2f}\n")
-                f.write(f"USDC BALANCE (BEFORE ENTRY): {usdc_balance:.2f}\n")
-                f.write(f"TARGET PRICE: {target_price:.2f}\n")
+                f.write(f"ENTRY PRICE: {entry_price:.25f}\n")
+                f.write(f"USDC BALANCE (BEFORE ENTRY): {usdc_balance:.25f}\n")
+                f.write(f"TARGET PRICE: {target_price:.25f}\n")
                 
-                # UPDATED: Do not print DETAILS if it contains "EXIT PRICE" to avoid duplication
                 if details and not details.startswith("EXIT PRICE:"):
                     f.write(f"DETAILS: {details}\n")
                 
@@ -736,11 +667,11 @@ def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kw
                 profit_pct = kwargs.get('profit_pct', 0.0)
                 time_held = kwargs.get('time_held', "")
                 
-                f.write(f"EXIT PRICE: {exit_price:.2f}\n")
-                f.write(f"PROFIT (USDC): {profit:.2f}\n")
-                f.write(f"PROFIT (%): {profit_pct:.2f}\n")
+                f.write(f"EXIT PRICE: {exit_price:.25f}\n")
+                f.write(f"PROFIT (USDC): {profit:.25f}\n")
+                f.write(f"PROFIT (%): {profit_pct:.25f}\n")
                 f.write(f"TIME HELD: {time_held}\n")
-                f.write(f"USDC BALANCE (AFTER EXIT): {usdc_balance:.2f}\n")
+                f.write(f"USDC BALANCE (AFTER EXIT): {usdc_balance:.25f}\n")
             
             f.write("-" * 40 + "\n\n")
                 
@@ -783,10 +714,6 @@ def calculate_thresholds(close_prices, period=14, minimum_percentage=3, maximum_
 # =========================================================
 
 def analyze_volume_sentiment(candles):
-    """
-    Calculates bullish vs bearish volume ratio.
-    Returns: condition_met (bullish > bearish), bull_pct, bear_pct
-    """
     try:
         if not candles:
             return False, 0.0, 0.0, {"error": "No candles provided"}
@@ -825,11 +752,6 @@ def analyze_volume_sentiment(candles):
 # =========================================================
 
 def analyze_thresholds_15sec(candles_15s):
-    """
-    Calculates thresholds for 15s timeframe.
-    Logic: Condition is True if current close is below the middle point
-    between Min and Max of the last 1200 values.
-    """
     try:
         if not candles_15s:
             return {"error": "No 15s data provided", "condition_met": False}
@@ -856,7 +778,7 @@ def analyze_thresholds_15sec(candles_15s):
             "min_value": min_value,
             "max_value": max_value,
             "midpoint": midpoint,
-            "description": f"Current Price ({current_price:.2f}) is {'below' if condition_met else 'above'} Midpoint ({midpoint:.2f})"
+            "description": f"Current Price ({current_price:.25f}) is {'below' if condition_met else 'above'} Midpoint ({midpoint:.25f})"
         }
         
     except Exception as e:
@@ -868,10 +790,6 @@ def analyze_thresholds_15sec(candles_15s):
 # =========================================================
 
 def analyze_sine_wave_oscillator_15sec(candles_15s):
-    """
-    Analyzes sine wave cycles on the 15s timeframe.
-    Uses simulated 15s candles.
-    """
     try:
         if not candles_15s:
             return {"error": "No 15s data provided", "condition_met": False}
@@ -1026,7 +944,7 @@ def analyze_sine_wave_oscillator_15sec(candles_15s):
             "threshold_signal": threshold_signal,
             "stage_description": stage_description,
             "avg_period_between_extrema": avg_period_between_extrema,
-            "description": f"Current cycle is {cycle_type}, expecting a new {next_extremum_type} at price {forecast_price:.2f}. {stage_description}"
+            "description": f"Current cycle is {cycle_type}, expecting a new {next_extremum_type} at price {forecast_price:.25f}. {stage_description}"
         }
         
     except Exception as e:
@@ -1038,32 +956,23 @@ def analyze_sine_wave_oscillator_15sec(candles_15s):
 # =========================================================
 
 def analyze_stoch_conditions(candles_1m, candles_15s, lookback=200):
-    """
-    Analyzes Stoch on BOTH 1m and 15s timeframes independently.
-    RSI has been removed as per request.
-    - Checks Most Recent State (Oversold vs Overbought).
-    - Returns 2 separate boolean conditions.
-    """
     
     def get_most_recent_state(values, oversold_limit, overbought_limit):
-        # Iterate backwards to find most recent extreme
         for val in reversed(values):
             if val <= oversold_limit:
-                return "OVERSOLD", True  # Strict: Found Oversold
+                return "OVERSOLD", True
             if val >= overbought_limit:
-                return "OVERBOUGHT", False # Strict: Found Overbought
+                return "OVERBOUGHT", False
         return "NEUTRAL", False 
 
     results = {}
 
-    # --- 1m Analysis ---
     try:
         df_1m = pd.DataFrame(candles_1m)
         high_1m = df_1m["high"]
         low_1m = df_1m["low"]
         close_1m = df_1m["close"]
 
-        # 1m Stoch
         lowest_low = low_1m.rolling(14).min()
         highest_high = high_1m.rolling(14).max()
         stoch_k_1m = 100 * (close_1m - lowest_low) / (highest_high - lowest_low)
@@ -1075,14 +984,12 @@ def analyze_stoch_conditions(candles_1m, candles_15s, lookback=200):
         print(f"Error analyzing 1m indicators: {e}")
         results["stoch_1m"] = {"state": "ERROR", "condition_met": False, "current_val": 0}
 
-    # --- 15s Analysis ---
     try:
         df_15s = pd.DataFrame(candles_15s)
         high_15s = df_15s["high"]
         low_15s = df_15s["low"]
         close_15s = df_15s["close"]
 
-        # 15s Stoch
         lowest_low = low_15s.rolling(14).min()
         highest_high = high_15s.rolling(14).max()
         stoch_k_15s = 100 * (close_15s - lowest_low) / (highest_high - lowest_low)
@@ -1182,7 +1089,6 @@ def analyze_multiple_timeframe_extrema(candles_1m, candles_3m=None, candles_5m=N
                     'aroon_down': aroon_3m[1]
                 }
         
-        # 5m Extrema calculation kept but logic removed from active conditions
         if candles_5m and len(candles_5m) >= 14:
             close_5m = [c["close"] for c in candles_5m]
             high_5m = [c["high"] for c in candles_5m]
@@ -1237,11 +1143,6 @@ def calculate_momentum(candles, period=10):
         return False, 0.0, {"error": str(e)}
 
 def generate_15s_data_from_1m(df_1m):
-    """
-    UPDATED: Simulates realistic price movement inside a 1m candle.
-    Instead of linear interpolation (which causes 100% identical volume sentiment),
-    this uses the Highs and Lows to create micro-trends.
-    """
     if df_1m is None or df_1m.empty:
         return None
     
@@ -1424,9 +1325,6 @@ def calculate_linear_regression_channel(candles, period=500, dev_multiplier=2.0)
         return {"error": str(e)}
 
 def analyze_linear_regression_channel_break(candles):
-    """
-    Note: Parameter 'candles' is now expected to be 15s timeframe data.
-    """
     try:
         if not candles:
             return {"error": "No data provided"}
@@ -1448,7 +1346,27 @@ def analyze_linear_regression_channel_break(candles):
         is_most_recent_below_lower = False
         is_most_recent_above_upper = False
         
+        # Determine breach prices
+        price_at_low_breach = 0.0
+        price_at_high_breach = 0.0
+        
         if most_recent_below_lower_index is not None and most_recent_above_upper_index is not None:
+            # Get actual prices at these breach indices
+            # Need to map local index (from last 500) back to full candles list if needed
+            # But here `candles` passed is the 15s list.
+            # The calculation used candles[-period:], so index 0 in result is candles[-period+0].
+            # Let's look up the prices.
+            offset = len(candles) - 500
+            if offset < 0: offset = 0
+            
+            if most_recent_below_lower_index is not None:
+                real_idx = offset + most_recent_below_lower_index
+                price_at_low_breach = candles[real_idx]['close']
+                
+            if most_recent_above_upper_index is not None:
+                real_idx = offset + most_recent_above_upper_index
+                price_at_high_breach = candles[real_idx]['close']
+
             if most_recent_below_lower_index > most_recent_above_upper_index:
                 condition_met = True
                 description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
@@ -1457,14 +1375,22 @@ def analyze_linear_regression_channel_break(candles):
                 condition_met = False
                 description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
                 is_most_recent_above_upper = True
+                
         elif most_recent_below_lower_index is not None:
             condition_met = True
             description = "Most recent occurrence was price below the lower channel (indicating upward cycle)"
             is_most_recent_below_lower = True
+            offset = len(candles) - 500
+            real_idx = offset + most_recent_below_lower_index
+            price_at_low_breach = candles[real_idx]['close']
+            
         elif most_recent_above_upper_index is not None:
             condition_met = False
             description = "Most recent occurrence was price above the upper channel (indicating downward cycle)"
             is_most_recent_above_upper = True
+            offset = len(candles) - 500
+            real_idx = offset + most_recent_above_upper_index
+            price_at_high_breach = candles[real_idx]['close']
         
         return {
             "condition_met": condition_met,
@@ -1479,8 +1405,8 @@ def analyze_linear_regression_channel_break(candles):
             "most_recent_above_upper_index": most_recent_above_upper_index,
             "up_cycle": condition_met,
             "description": description,
-            "below_lower_indices": below_lower_indices[-10:] if len(below_lower_indices) > 0 else [],
-            "above_upper_indices": above_upper_indices[-10:] if len(above_upper_indices) > 0 else []
+            "price_at_low_breach": price_at_low_breach,
+            "price_at_high_breach": price_at_high_breach
         }
         
     except Exception as e:
@@ -1491,9 +1417,6 @@ def analyze_linear_regression_channel_break(candles):
 # AROON-ONLY SIGNAL ANALYSIS FUNCTION
 # =========================================================
 def analyze_aroon_only_signal(candles, aroon_period=14):
-    """
-    Generates a definitive "UP" or "DOWN" signal based solely on the Aroon indicator.
-    """
     try:
         if not candles or len(candles) < aroon_period + 1:
             return {"error": "Insufficient data for Aroon analysis", "condition_met": False, "signal": "DOWN"}
@@ -1523,12 +1446,12 @@ def analyze_aroon_only_signal(candles, aroon_period=14):
         return {
             "signal": signal,
             "condition_met": condition_met,
-            "signal_reason": f"Aroon Up ({aroon_up:.2f}) is {'greater than' if condition_met else 'less than'} Aroon Down ({aroon_down:.2f})",
-            "aroon_up": round(aroon_up, 2),
-            "aroon_down": round(aroon_down, 2),
-            "current_price": round(current_price, 2),
-            "recent_high": round(recent_high, 2) if recent_high is not None else None,
-            "recent_low": round(recent_low, 2) if recent_low is not None else None,
+            "signal_reason": f"Aroon Up ({aroon_up:.25f}) is {'greater than' if condition_met else 'less than'} Aroon Down ({aroon_down:.25f})",
+            "aroon_up": round(aroon_up, 25),
+            "aroon_down": round(aroon_down, 25),
+            "current_price": round(current_price, 25),
+            "recent_high": round(recent_high, 25) if recent_high is not None else None,
+            "recent_low": round(recent_low, 25) if recent_low is not None else None,
         }
         
     except Exception as e:
@@ -1541,13 +1464,11 @@ def analyze_aroon_only_signal(candles, aroon_period=14):
 # MAIN TRADING LOOP
 # =========================================================
 
-# Initialize lot size info
 lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
 min_trade_size = lot_size_info['minQty']
 step_size = lot_size_info['stepSize']
 print(f"Initialized {TRADE_SYMBOL} - Min Trade Size: {min_trade_size:.25f}, Step Size: {step_size:.25f}")
 
-# Initialize trade state
 initial_investment = Decimal('0.0')
 asset_balance = Decimal('0.0')
 entry_price = Decimal('0.0')
@@ -1555,10 +1476,8 @@ entry_datetime = None
 
 print("Trading Bot Initialized!")
 
-# Main trading loop
 try:
     while True:
-        # FIX: Make current_local_time timezone-aware
         current_local_time = datetime.datetime.now(LOCAL_TIMEZONE)
         current_local_time_str = current_local_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"\nCurrent Local Time: {current_local_time_str}")
@@ -1578,13 +1497,11 @@ try:
         # =========================================================
         # FETCHING AND ANALYZING MARKET CONDITIONS (RUNS ALWAYS)
         # =========================================================
-        # Moved to top of loop so data is available for IN TRADE logic
         
         candle_map = fetch_candles_in_parallel(['1m', '3m'])
         candles_1m = candle_map.get('1m', [])
         candles_3m = candle_map.get('3m', [])
         
-        # Initialize all condition results
         conditions_status = {
             "momentum_positive_1m": False,
             "momentum_positive_15sec": False,
@@ -1601,61 +1518,51 @@ try:
         }
 
         if candles_1m:
-            # Generate 15s candles early for other conditions
             momentum_15s_result = analyze_momentum_15sec(candles_1m)
             candles_15s = []
             if 'error' not in momentum_15s_result:
                 candles_15s = momentum_15s_result.get('candles_15s', [])
 
-            # --- ANALYSIS BLOCK (No prints yet) ---
-            
-            # Condition 1
+            # --- ANALYSIS BLOCK ---
             momentum_1m_positive, momentum_1m_value, _ = calculate_momentum(candles_1m)
             conditions_status["momentum_positive_1m"] = momentum_1m_positive
             
-            # Condition 2
             if 'error' not in momentum_15s_result:
                 conditions_status["momentum_positive_15sec"] = momentum_15s_result['momentum_positive']
                 
-            # Condition 3
             lrc_break_result = analyze_linear_regression_channel_break(candles_15s) 
             if 'error' not in lrc_break_result:
                 conditions_status["linear_regression_channel_break"] = lrc_break_result['condition_met']
             
-            # Condition 4
             aroon_signal_result = analyze_aroon_only_signal(candles_1m, aroon_period=14)
             if 'error' not in aroon_signal_result:
                 conditions_status["aroon_only_signal"] = aroon_signal_result['condition_met']
 
-            # Condition 5
             thresholds_15s_result = analyze_thresholds_15sec(candles_15s)
             if 'error' not in thresholds_15s_result:
                 conditions_status["thresholds_15sec"] = thresholds_15s_result['condition_met']
 
-            # Condition 6
-            vol_1m_cond, _, _, err_1m = analyze_volume_sentiment(candles_1m)
+            vol_1m_cond, bull_pct, bear_pct, err_1m = analyze_volume_sentiment(candles_1m)
             if not err_1m:
                 conditions_status["volume_bullish_1min"] = vol_1m_cond
 
-            # Condition 7
             precise_15s_result = analyze_stoch_rsi_precise_strategy_15sec(candles_15s)
             if 'error' not in precise_15s_result:
                 conditions_status["stoch_rsi_precise_15sec"] = precise_15s_result['condition_met']
                 conditions_status["dip_confirmation_15sec"] = precise_15s_result['dip_confirmed'] 
 
-            # Condition 8
             precise_1m_result = analyze_stoch_rsi_precise_strategy_1min(candles_1m)
             if 'error' not in precise_1m_result:
                 conditions_status["stoch_rsi_precise_1min"] = precise_1m_result['condition_met']
                 conditions_status["dip_confirmation_1min"] = precise_1m_result['dip_confirmed'] 
                 
             # Condition 9
-            is_dip_15s_print, _, _, _, _ = get_dip_confirmation([c['close'] for c in candles_15s], lookback=1200)
-            conditions_status["dip_confirmation_15sec"] = is_dip_15s_print
+            is_dip_15s, idx_min_15s, idx_max_15s, val_min_15s, val_max_15s, dist_min_15s, dist_max_15s = get_dip_confirmation([c['close'] for c in candles_15s], lookback=1200)
+            conditions_status["dip_confirmation_15sec"] = is_dip_15s
 
             # Condition 10
-            is_dip_1m_print, _, _, _, _ = get_dip_confirmation([c['close'] for c in candles_1m], lookback=1200)
-            conditions_status["dip_confirmation_1min"] = is_dip_1m_print
+            is_dip_1m, idx_min_1m, idx_max_1m, val_min_1m, val_max_1m, dist_min_1m, dist_max_1m = get_dip_confirmation([c['close'] for c in candles_1m], lookback=1200)
+            conditions_status["dip_confirmation_1min"] = is_dip_1m
 
             # Condition 11
             stoch_1m_os_result = check_stoch_oversold_vs_overbought_1min(candles_1m)
@@ -1677,7 +1584,6 @@ try:
         ]
         
         all_strict_conditions_met = all(passed for _, passed in strict_checks_list)
-        # failed_strict = [name for name, passed in strict_checks_list if not passed] # Removed unused var
 
         active_conditions_results = [
             conditions_status[condition_name]
@@ -1687,9 +1593,6 @@ try:
         min_required = CONFIG['min_conditions_met']
         count_condition_met = true_conditions_count >= min_required
 
-        # 2. STRICTLY DETERMINE SCENARIO
-        # Condition: If BTC Value > USDC Balance, we are IN TRADE.
-        # Else, we are OUT OF TRADE.
         position_open = btc_value_in_usdc > usdc_balance
         
         # ==========================================
@@ -1697,35 +1600,27 @@ try:
         # ==========================================
         if position_open:
             print(f"=== SCENARIO: IN TRADE ===")
-            print(f"BTC Value: {btc_value_in_usdc:.2f} | USDC Balance: {usdc_balance:.2f}")
+            print(f"BTC Value: {btc_value_in_usdc:.25f} | USDC Balance: {usdc_balance:.25f}")
             
-            # Recovery Check: If script restarted holding BTC, vars might be 0
             if entry_price <= Decimal('0.0') or initial_investment <= Decimal('0.0'):
                 print("Bot detected open position but missing entry data. Attempting recovery...")
                 recovered_price = get_average_entry_price()
                 if recovered_price > Decimal('0.0'):
                     entry_price = recovered_price
-                    # FIXED: Calculate initial_investment properly here for target calculation
                     initial_investment = asset_balance * entry_price
                     last_trade = get_last_buy_trade()
                     
-                    # CHANGED: Handle timestamp for recovery logging
                     formatted_entry_dt = ""
                     if last_trade:
-                        # Ensure entry_datetime is timezone-aware
                         entry_datetime = datetime.datetime.fromtimestamp(last_trade['time'] / 1000, tz=LOCAL_TIMEZONE)
                         formatted_entry_dt = entry_datetime.strftime("%Y-%m-%d %H:%M:%S")
                     
-                    # Calculate Target Price for Recovery
                     total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
                     target_multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
                     target_value = initial_investment * target_multiplier
                     target_price = target_value / asset_balance if asset_balance > Decimal('0') else Decimal('0.0')
 
-                    # LOG ENTRY SIGNAL FOR RECOVERED TRADE
-                    # FIX: Pass 'initial_investment' (calculated USDC cost) instead of 'usdc_balance' (which is 0)
-                    # FIXED: Removed "RECOVERY ENTRY | " from details
-                    details_str = f"EXIT PRICE: {target_price:.2f}"
+                    details_str = f"EXIT PRICE: {target_price:.25f}"
                     save_signal_to_file(
                         "ENTRY",
                         initial_investment,
@@ -1734,19 +1629,16 @@ try:
                         target_price=float(target_price),
                         details=details_str
                     )
-                    print(f"Recovered Entry Price: {entry_price}")
-                    print(f"Recovered Initial Investment (USDC): {initial_investment:.2f}")
+                    print(f"Recovered Entry Price: {entry_price:.25f}")
+                    print(f"Recovered Initial Investment (USDC): {initial_investment:.25f}")
                 else:
                     print("WARNING: Could not recover entry price. PnL will be incorrect.")
 
-            # MONITOR STATUS
             print("Monitoring current position...")
             
             current_value_in_usdc = asset_balance * current_price
-            # Use global initial_investment if set, otherwise display placeholder
             initial_investment_display = initial_investment if initial_investment > Decimal('0') else Decimal('1.0')
             
-            # Calculate Targets
             total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
             target_multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
             target_value = initial_investment_display * target_multiplier
@@ -1754,9 +1646,6 @@ try:
             
             value_change_percentage = ((current_value_in_usdc - initial_investment_display) / initial_investment_display) * Decimal('100') if initial_investment_display > Decimal('0') else Decimal('0.0')
 
-            # Time stats
-            # FIX: Changed format from "%H:%M" to "%Y-%m-%d %H:%M:%S"
-            # Also ensure subtraction works (both now timezone-aware)
             entry_time_str = entry_datetime.strftime("%Y-%m-%d %H:%M:%S") if entry_datetime else "Unknown"
             time_span = (current_local_time - entry_datetime) if entry_datetime else None
             time_span_str = "Unknown"
@@ -1767,125 +1656,161 @@ try:
                 minutes = (total_seconds % 3600) // 60
                 time_span_str = f"{days}d {hours}h {minutes}m"
 
-            print(f"Entry Price: {entry_price:.2f} | Current Price: {current_price:.2f}")
+            print(f"Entry Price: {entry_price:.25f} | Current Price: {current_price:.25f}")
             print(f"Entry Time: {entry_time_str} | Held: {time_span_str}")
-            print(f"Net PnL: {value_change_percentage:.2f}%")
-            print(f"Target Price ({PROFIT_TARGET_PERCENT}% Net + {TOTAL_FEE_PERCENT}% Fees): {target_price:.2f}")
-            print(f"Current USDC Value: {current_value_in_usdc:.2f} | Target USDC Value: {target_value:.2f}")
+            print(f"Net PnL: {value_change_percentage:.25f}%")
+            print(f"Target Price ({PROFIT_TARGET_PERCENT}% Net + {TOTAL_FEE_PERCENT}% Fees): {target_price:.25f}")
+            print(f"Current USDC Value: {current_value_in_usdc:.25f} | Target USDC Value: {target_value:.25f}")
 
-            # CHECK EXIT CONDITION
             is_profit_exit = check_exit_condition(initial_investment_display, asset_balance, entry_price)
             
             if is_profit_exit:
                 print(f"\n*** PROFIT TARGET REACHED. SELLING POSITION ***")
-                print(f"Current Price {current_price:.2f} >= Target Price {target_price:.2f}")
+                print(f"Current Price {current_price:.25f} >= Target Price {target_price:.25f}")
                 if sell_asset(float(asset_balance)):
                     exit_usdc_balance = get_balance('USDC')
                     profit = exit_usdc_balance - initial_investment_display
                     profit_percentage = (profit / initial_investment_display) * Decimal('100') if initial_investment_display > Decimal('0.0') else Decimal('0.0')
                     print(f"Position closed successfully.")
                     print(f"Exit Balance: {exit_usdc_balance:.25f} USDC (Clean Balance)")
-                    print(f"Realized Profit: {profit:.25f} USDC ({profit_percentage:.2f}%)")
+                    print(f"Realized Profit: {profit:.25f} USDC ({profit_percentage:.25f}%)")
                     
-                    # LOG EXIT SIGNAL
                     save_signal_to_file(
                         "EXIT",
-                        exit_usdc_balance, # Balance after exit
+                        exit_usdc_balance, 
                         exit_price=float(current_price),
                         profit=float(profit),
                         profit_pct=float(profit_percentage),
                         time_held=time_span_str
                     )
                     
-                    # Reset Global Variables
                     initial_investment = Decimal('0.0')
                     asset_balance = Decimal('0.0')
                     entry_price = Decimal('0.0')
                     entry_datetime = None
-                    # Position becomes False in next loop iteration check
                 else:
                     print("Error executing sell order. Retrying in next loop...")
             else:
                 print("Target not yet reached. Holding...")
-                
-                # --- REMOVED STRICT CONDITIONS FAILED PRINT ---
         
         # ==========================================
-        # SCENARIO B: MARKET SCANNING (LOGGING ONLY)
+        # SCENARIO B: MARKET SCANNING (DETAILED PRINTS)
         # ==========================================
-        # As requested: "add also prints for out of trade scenario... but keep current trade position"
-        # We run analysis block regardless of position_open, but only act (buy/write) if NOT position_open.
         
         print(f"\n=== SCENARIO: MARKET SCANNING (OUT OF TRADE SIMULATION) ===")
-        # If position_open, we print this just for monitoring signals
         if position_open:
             print("NOTE: Currently holding position. New signals will be ignored and not logged.")
         
-        print(f"USDC Balance: {usdc_balance:.2f} | BTC Value: {btc_value_in_usdc:.2f}")
+        print(f"USDC Balance: {usdc_balance:.25f} | BTC Value: {btc_value_in_usdc:.25f}")
         print("Scanning market conditions & Generating Signals...")
 
         print("\n" + "="*80)
-        print("TRADING CONDITIONS")
+        print("TRADING CONDITIONS (DETAILED SPECS)")
         print("="*80)
         
-        # --- PRINT LOGS FOR CONDITIONS (Calculations moved to top) ---
-        
-        # Condition 1: Momentum Positive (1m)
+        # --- Condition 1: Momentum Positive (1m) ---
         print("\n--- Condition 1: Momentum Positive (1m) ---")
-        print(f"Current Momentum: {momentum_1m_value:.4f}")
-        print(f"Condition Met: {conditions_status['momentum_positive_1m']}")
+        print(f"Current Momentum Value: {momentum_1m_value:.25f}")
+        print(f"Momentum Positive (>0): {conditions_status['momentum_positive_1m']}")
         
-        # Condition 2: Momentum Positive (15s)
+        # --- Condition 2: Momentum Positive (15s) ---
         print("\n--- Condition 2: Momentum Positive (15s) ---")
         if 'error' not in momentum_15s_result:
-            print(f"Current Momentum: {momentum_15s_result['current_momentum']:.4f}")
-            print(f"Condition Met: {conditions_status['momentum_positive_15sec']}")
+            mom_val = momentum_15s_result['current_momentum']
+            print(f"Current Momentum Value: {mom_val:.25f}")
+            print(f"Momentum Positive (>0): {conditions_status['momentum_positive_15sec']}")
         
-        # Condition 3: Linear Regression Channel Break (15s)
+        # --- Condition 3: Linear Regression Channel Break (15s) ---
         print("\n--- Condition 3: Linear Regression Channel Break (15s) ---")
         if 'error' not in lrc_break_result:
             print(f"Description: {lrc_break_result['description']}")
+            print(f"Current Price:        {lrc_break_result['current_price']:.25f}")
+            print(f"Upper Channel Limit:  {lrc_break_result['upper_channel']:.25f}")
+            print(f"Lower Channel Limit:  {lrc_break_result['lower_channel']:.25f}")
+            if lrc_break_result['price_at_high_breach'] != 0.0:
+                print(f"Most Recent High Breach Price: {lrc_break_result['price_at_high_breach']:.25f} (at idx {lrc_break_result['most_recent_above_upper_index']})")
+            else:
+                print(f"Most Recent High Breach Price: None")
+            
+            if lrc_break_result['price_at_low_breach'] != 0.0:
+                print(f"Most Recent Low Breach Price:  {lrc_break_result['price_at_low_breach']:.25f} (at idx {lrc_break_result['most_recent_below_lower_index']})")
+            else:
+                print(f"Most Recent Low Breach Price: None")
             print(f"Condition Met: {conditions_status['linear_regression_channel_break']}")
             
-        # Condition 4: Aroon-Only Signal
+        # --- Condition 4: Aroon-Only Signal ---
         print("\n--- Condition 4: Aroon-Only Signal ---")
         if 'error' not in aroon_signal_result:
             print(f"Signal: {aroon_signal_result['signal']}")
+            print(f"Aroon Up:   {aroon_signal_result['aroon_up']:.25f}")
+            print(f"Aroon Down: {aroon_signal_result['aroon_down']:.25f}")
+            print(f"Recent High (14p): {aroon_signal_result['recent_high']:.25f}")
+            print(f"Recent Low (14p):  {aroon_signal_result['recent_low']:.25f}")
             print(f"Condition Met: {conditions_status['aroon_only_signal']}")
 
-        # Condition 5: Thresholds 15sec
+        # --- Condition 5: Thresholds 15sec ---
         print("\n--- Condition 5: Thresholds Analysis (15s) ---")
         if 'error' not in thresholds_15s_result:
             print(f"Description: {thresholds_15s_result['description']}")
-            print(f"Condition Met: {conditions_status['thresholds_15sec']}")
+            print(f"Current Price: {thresholds_15s_result['current_price']:.25f}")
+            print(f"Max Value:    {thresholds_15s_result['max_value']:.25f}")
+            print(f"Min Value:    {thresholds_15s_result['min_value']:.25f}")
+            print(f"Midpoint:     {thresholds_15s_result['midpoint']:.25f}")
+            print(f"Condition Met (Price < Midpoint): {conditions_status['thresholds_15sec']}")
 
-        # Condition 6: Volume 1m Sentiment
+        # --- Condition 6: Volume 1m Sentiment ---
         print("\n--- Condition 6: Volume Sentiment (1m) ---")
         if not err_1m:
-            print(f"Bullish Vol %: {52.13:.2f}%") # Using placeholder since specific var not saved
-            print(f"Condition Met: {vol_1m_cond}")
+            print(f"Bullish Volume %: {bull_pct:.25f}%")
+            print(f"Bearish Volume %: {bear_pct:.25f}%")
+            print(f"Condition Met (Bull > Bear): {conditions_status['volume_bullish_1min']}")
 
-        # Condition 7: Stoch RSI Precise (15sec)
-        # (Already printed inside function call above)
-        # Condition 8: Stoch RSI Precise (1min)
-        # (Already printed inside function call above)
+        # --- Condition 7: Stoch RSI Precise (15sec) ---
+        # (Already printed inside function)
             
-        # Condition 9: Dip Confirmation (15s)
+        # --- Condition 8: Stoch RSI Precise (1min) ---
+        # (Already printed inside function)
+            
+        # --- Condition 9: Dip Confirmation (15s) ---
         print("\n--- Condition 9: Dip Confirmation (15s) ---")
-        print(f"Dist to Min < Dist to Max: {'YES' if is_dip_15s_print else 'NO'}")
+        print(f"Distance to Min: {dist_min_15s:.25f} (Value: {val_min_15s:.25f})")
+        print(f"Distance to Max: {dist_max_15s:.25f} (Value: {val_max_15s:.25f})")
+        print(f"Dist to Min < Dist to Max: {'YES' if is_dip_15s else 'NO'}")
+        print(f"Condition Met: {conditions_status['dip_confirmation_15sec']}")
 
-        # Condition 10: Dip Confirmation (1m)
+        # --- Condition 10: Dip Confirmation (1m) ---
         print("\n--- Condition 10: Dip Confirmation (1m) ---")
-        print(f"Dist to Min < Dist to Max: {'YES' if is_dip_1m_print else 'NO'}")
+        print(f"Distance to Min: {dist_min_1m:.25f} (Value: {val_min_1m:.25f})")
+        print(f"Distance to Max: {dist_max_1m:.25f} (Value: {val_max_1m:.25f})")
+        print(f"Dist to Min < Dist to Max: {'YES' if is_dip_1m else 'NO'}")
+        print(f"Condition Met: {conditions_status['dip_confirmation_1min']}")
 
-        # Condition 11: Stoch Oversold vs Overbought (1m)
+        # --- Condition 11: Stoch Oversold vs Overbought (1m) ---
         print("\n--- Condition 11: Stoch Oversold vs Overbought (1m) ---")
         print(f"Description: {stoch_1m_os_result[1]}")
+        print(f"Current Stoch %K: {stoch_1m_os_result[4]:.25f}")
+        if stoch_1m_os_result[5] != 0.0:
+            print(f"Value at Last Oversold Event (<20): {stoch_1m_os_result[5]:.25f}")
+        else:
+            print(f"Value at Last Oversold Event (<20): None")
+        if stoch_1m_os_result[6] != 0.0:
+            print(f"Value at Last Overbought Event (>80): {stoch_1m_os_result[6]:.25f}")
+        else:
+            print(f"Value at Last Overbought Event (>80): None")
         print(f"Condition Met: {stoch_1m_os_result[0]}")
 
-        # Condition 12: RSI Oversold vs Overbought (15s)
+        # --- Condition 12: RSI Oversold vs Overbought (15s) ---
         print("\n--- Condition 12: RSI Oversold vs Overbought (15s) ---")
         print(f"Description: {rsi_15s_os_result[1]}")
+        print(f"Current RSI (14): {rsi_15s_os_result[4]:.25f}")
+        if rsi_15s_os_result[5] != 0.0:
+            print(f"Value at Last Oversold Event (<30): {rsi_15s_os_result[5]:.25f}")
+        else:
+            print(f"Value at Last Oversold Event (<30): None")
+        if rsi_15s_os_result[6] != 0.0:
+            print(f"Value at Last Overbought Event (>70): {rsi_15s_os_result[6]:.25f}")
+        else:
+            print(f"Value at Last Overbought Event (>70): None")
         print(f"Condition Met: {rsi_15s_os_result[0]}")
 
         # --- FINAL LOGIC CHECK ---
@@ -1927,14 +1852,10 @@ try:
 
         # --- ENTRY LOGIC (DISABLED AS REQUESTED) ---
         if signal_triggered:
-            # Prepare details for log
             conditions_summary = f"{true_conditions_count}/{len(active_conditions_results)} (Strict: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m)"
             
-            # Calculate Target Price for Standard Entry
-            # Investment = Asset * Price (assuming 0 fees for simplicity, or just using Price * multiplier)
             total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
             multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
-            # We use usdc_balance to approximate investment cost before buying
             approx_investment = usdc_balance * current_price
             target_price = approx_investment * multiplier
             
@@ -1952,8 +1873,6 @@ try:
             print(f"\nINSUFFICIENT CONDITIONS MET - NO TRADE EXECUTED")
             print(f"Only {true_conditions_count}/{min_required} conditions met (Required: {min_required}).")
             
-            # --- REMOVED STRICT CONDITIONS FAILED PRINT HERE ---
-            
             print("Waiting for next iteration...")
 
         # ==========================================
@@ -1962,7 +1881,6 @@ try:
         if signal_triggered and not position_open:
             print("\n>>> ATTEMPTING TO OPEN TRADE <<<")
             
-            # Calculate precise target price based on expected execution
             total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
             multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
             approx_investment = usdc_balance * current_price
@@ -1974,15 +1892,14 @@ try:
             if ep is not None and edt is not None:
                 entry_price = ep
                 entry_datetime = edt
-                initial_investment = cost # The actual cost incurred
+                initial_investment = cost 
                 
-                # Re-fetch balance to confirm what we actually got
                 asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
                 
-                details_str = f"EXIT PRICE: {target_price:.2f}"
+                details_str = f"EXIT PRICE: {target_price:.25f}"
                 save_signal_to_file(
                     "ENTRY",
-                    usdc_balance, # Balance before trade
+                    usdc_balance, 
                     entry_price=float(entry_price),
                     target_price=float(target_price),
                     details=details_str
@@ -1995,32 +1912,28 @@ try:
         # END OF ITERATION: FRESH BALANCE UPDATE
         # ==========================================
         
-        # Fetch fresh data from exchange to account for fees, trades, and price changes
         final_usdc = get_balance('USDC')
         final_btc = get_balance(TRADE_SYMBOL.split('USDC')[0])
         final_price = get_current_price()
         
-        # Calculate total portfolio value for clarity
         portfolio_value_usdc = final_usdc + (final_btc * final_price)
 
         print(f"\n{'='*60}")
         print(f"   END OF ITERATION BALANCE UPDATE (FRESH DATA)")
         print(f"{'='*60}")
-        print(f"Updated USDC Balance : {final_usdc:.4f}")
-        print(f"Updated BTC Balance  : {final_btc:.8f}")
-        print(f"Current BTC Price    : {final_price:.2f}")
-        print(f"Total Portfolio Value: {portfolio_value_usdc:.2f} USDC")
+        print(f"Updated USDC Balance : {final_usdc:.25f}")
+        print(f"Updated BTC Balance  : {final_btc:.25f}")
+        print(f"Current BTC Price    : {final_price:.25f}")
+        print(f"Total Portfolio Value: {portfolio_value_usdc:.25f} USDC")
         
-        # Debug for "Dust" logic
         if final_btc > Decimal('0') and final_btc < Decimal('0.001'):
              btc_val_usdc = final_btc * final_price
-             print(f"NOTE: BTC Dust detected. Value: {btc_val_usdc:.4f} USDC")
+             print(f"NOTE: BTC Dust detected. Value: {btc_val_usdc:.25f} USDC")
         
         print(f"{'='*60}\n")
 
         print(f"Loop Complete. Sleeping for 5 seconds...")
         
-        # FIX: Only delete candle_map if it exists
         if candle_map is not None:
             del candle_map
             
