@@ -7,7 +7,7 @@ import concurrent.futures
 import talib
 import gc
 import math
-from decimal import Decimal, getcontext, ROUND_DOWN
+from decimal import Decimal, getcontext
 import pandas as pd
 import warnings
 import os
@@ -19,8 +19,6 @@ getcontext().prec = 25
 
 # Exchange constants
 TRADE_SYMBOL = "BTCUSDC"
-BASE_ASSET = TRADE_SYMBOL.replace('USDC', '')  # 'BTC'
-QUOTE_ASSET = 'USDC'
 
 # Timezone Configuration
 LOCAL_TIMEZONE = datetime.timezone(datetime.timedelta(hours=2))  # GMT+2
@@ -76,78 +74,6 @@ timeframe_extrema = {
     '3m': {'recent_high': None, 'recent_low': None, 'recent_high_idx': None, 'recent_low_idx': None},
     '5m': {'recent_high': None, 'recent_low': None, 'recent_high_idx': None, 'recent_low_idx': None}
 }
-
-# =========================================================
-# NEW FUNCTION: CONVERT REMAINING BALANCE (DUST SWEEP)
-# =========================================================
-
-def convert_remaining_balance(from_asset, to_asset, symbol):
-    """
-    Attempts to convert the entire remaining balance of 'from_asset' to 'to_asset'
-    using a market order. Useful for clearing dust after a trade.
-    """
-    try:
-        balance = get_balance(from_asset)
-        if balance <= Decimal('0'):
-            return Decimal('0.0')
-        
-        current_price = get_current_price()
-        if current_price <= Decimal('0'):
-            print(f"Could not fetch price for {symbol} to convert {from_asset} dust.")
-            return balance
-
-        lot_size_info = get_symbol_lot_size_info(symbol)
-        step_size = lot_size_info['stepSize']
-        min_qty = lot_size_info['minQty']
-        
-        # Determine side and quantity
-        if from_asset == QUOTE_ASSET and to_asset == BASE_ASSET:
-            # Convert USDC -> BTC (Buy)
-            side = 'BUY'
-            raw_qty = balance / current_price
-        elif from_asset == BASE_ASSET and to_asset == QUOTE_ASSET:
-            # Convert BTC -> USDC (Sell)
-            side = 'SELL'
-            raw_qty = balance
-        else:
-            print(f"Invalid asset pair for conversion: {from_asset} to {to_asset}")
-            return balance
-
-        # Round quantity to step size
-        step_precision = int(-math.log10(float(step_size))) if step_size > Decimal('0') else 8
-        adjusted_qty = (raw_qty // step_size) * step_size
-        adjusted_qty = adjusted_qty.quantize(Decimal('0.' + '0' * step_precision), rounding=ROUND_DOWN)
-        
-        # Check if quantity is tradeable
-        if adjusted_qty < min_qty:
-            # Check notional value for USDC -> BTC
-            if side == 'BUY':
-                notional = adjusted_qty * current_price
-                if notional < Decimal(str(MIN_TRADE_AMOUNT)):
-                    print(f"Remaining {from_asset} balance ({balance}) is too small to convert (Notional: {notional:.2f} < Min: {MIN_TRADE_AMOUNT}). Leaving as dust.")
-                    return balance
-            else:
-                print(f"Remaining {from_asset} balance ({balance}) is too small to convert (Qty: {adjusted_qty} < Min: {min_qty}). Leaving as dust.")
-                return balance
-
-        # Execute Market Order
-        print(f"Converting remaining {from_asset} ({adjusted_qty}) to {to_asset}...")
-        if side == 'BUY':
-            order = client.order_market_buy(symbol=symbol, quantity=float(adjusted_qty))
-        else:
-            order = client.order_market_sell(symbol=symbol, quantity=float(adjusted_qty))
-            
-        print(f"Conversion order successful: {order}")
-        
-        # Return new balance (approximate or refetch)
-        return get_balance(from_asset)
-        
-    except BinanceAPIException as e:
-        print(f"API Error during dust conversion of {from_asset}: {e.message}")
-        return get_balance(from_asset)
-    except Exception as e:
-        print(f"Error during dust conversion of {from_asset}: {e}")
-        return get_balance(from_asset)
 
 # =========================================================
 # UPDATED UTILITY: DIP CONFIRMATION (DISTANCE BASED)
@@ -613,77 +539,127 @@ def get_average_entry_price():
     print(f"No valid last buy trade found for {TRADE_SYMBOL}; cannot calculate entry price.")
     return Decimal('0.0')
 
+# =========================================================
+# UPDATED TRADING FUNCTIONS (MAX BALANCE LOGIC)
+# =========================================================
+
 def buy_asset():
+    """
+    Executes a Market Buy order for the MAXIMUM available USDC balance.
+    """
     try:
+        # 1. Fresh Data Fetch
         current_price = get_current_price()
         if current_price <= Decimal('0'):
             return None, None, None, None
+        
         usdc_balance = get_balance('USDC')
         if usdc_balance <= Decimal('0'):
             return None, None, None, None
-        raw_quantity = usdc_balance / current_price
         
+        # 2. Get Exchange Filters
         lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
         step_size = lot_size_info['stepSize']
         min_trade_size = lot_size_info['minQty']
         
+        # 3. Calculate Max Quantity (Raw)
+        raw_quantity = usdc_balance / current_price
+        
+        # 4. Apply Step Size (Flooring) - This is the KEY to finding max tradeable amount
+        # We floor down to the nearest valid step size to ensure the order is accepted.
         step_precision = int(-math.log10(float(step_size))) if step_size > Decimal('0') else 8
         adjusted_quantity = (raw_quantity // step_size) * step_size
         adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
+        
+        # 5. Check Min Notional (Usually 10 USDC)
+        min_notional = Decimal('10.0')
         cost = adjusted_quantity * current_price
         
-        min_notional = Decimal('10.0')
         if cost < min_notional:
+            print(f"Warning: Max balance trade (${cost:.2f}) is below Minimum Notional (${min_notional}). Adjusting to meet min trade size.")
             min_quantity_for_notional = min_notional / current_price
             adjusted_quantity = ((min_quantity_for_notional + step_size - Decimal('1E-25')) // step_size) * step_size
             adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
             cost = adjusted_quantity * current_price
-        
-        if adjusted_quantity < min_trade_size:
-            return None, None, None, None
-        
+            
+        # 6. Verify we have enough funds (Safety check against slippage)
         if cost > usdc_balance:
+            print(f"Warning: Adjusted cost (${cost:.2f}) exceeds balance (${usdc_balance:.2f}). Reducing to fit exact balance.")
             adjusted_quantity = ((usdc_balance / current_price) // step_size) * step_size
             adjusted_quantity = adjusted_quantity.quantize(Decimal('0.' + '0' * step_precision))
             cost = adjusted_quantity * current_price
         
         if adjusted_quantity < min_trade_size:
+            print(f"Error: Adjusted quantity {adjusted_quantity} is below Min Trade Size {min_trade_size}. Cannot trade.")
             return None, None, None, None
         
-        order = client.order_market_buy(symbol=TRADE_SYMBOL, quantity=float(adjusted_quantity))
-        print(f"Market buy order executed: {order}")
-        entry_price = Decimal(str(order['fills'][0]['price']))
+        # 7. Execute Order
+        print(f"\n>>> EXECUTING MAX BUY ORDER <<<")
+        print(f"USDC Balance Available : {usdc_balance:.2f}")
+        print(f"Max BTC Quantity      : {adjusted_quantity:.8f}")
+        print(f"Estimated Cost        : {cost:.2f} USDC")
         
-        # FIX: Make entry_datetime timezone-aware to match recovery logic
+        order = client.order_market_buy(symbol=TRADE_SYMBOL, quantity=float(adjusted_quantity))
+        print(f"Market Buy Order Executed Successfully.")
+        
+        # 8. Parse Result
+        entry_price = Decimal(str(order['fills'][0]['price']))
         entry_datetime = datetime.datetime.now(LOCAL_TIMEZONE)
+        
+        # We return 'cost' as the estimated initial investment, 
+        # but actual USDC spent might differ slightly due to market slippage.
         return entry_price, adjusted_quantity, entry_datetime, cost
+        
     except BinanceAPIException as e:
         print(f"Error executing buy order: {e.message}")
         return None, None, None, None
+    except Exception as e:
+        print(f"Unexpected error in buy_asset: {e}")
+        return None, None, None, None
+
 
 def sell_asset(asset_balance):
+    """
+    Executes a Market Sell order for the MAXIMUM available Asset (BTC) balance.
+    """
     try:
         current_price = get_current_price()
         if current_price <= Decimal('0'):
             return False
+        
         asset_balance_dec = Decimal(str(asset_balance))
         
+        # 1. Get Exchange Filters
         lot_size_info = get_symbol_lot_size_info(TRADE_SYMBOL)
         step_size = lot_size_info['stepSize']
         min_trade_size = lot_size_info['minQty']
         
+        # 2. Calculate Max Quantity (Apply Step Size)
         step_precision = int(-math.log10(float(step_size))) if step_size > Decimal('0') else 8
         sell_quantity = (asset_balance_dec // step_size) * step_size
         sell_quantity = sell_quantity.quantize(Decimal('0.' + '0' * step_precision))
         
         if sell_quantity < min_trade_size:
+            print(f"Error: Asset balance {asset_balance_dec} is too small to trade (Min: {min_trade_size}).")
             return False
         
+        # 3. Execute Order
+        estimated_value = sell_quantity * current_price
+        print(f"\n>>> EXECUTING MAX SELL ORDER <<<")
+        print(f"Asset Balance Available : {asset_balance_dec:.8f}")
+        print(f"Max BTC Quantity Sell   : {sell_quantity:.8f}")
+        print(f"Estimated Value         : {estimated_value:.2f} USDC")
+        
         sell_order = client.order_market_sell(symbol=TRADE_SYMBOL, quantity=float(sell_quantity))
-        print(f"Market sell order executed: {sell_order}")
+        print(f"Market Sell Order Executed Successfully.")
+        
         return True
+        
     except BinanceAPIException as e:
         print(f"Error executing sell order: {e.message}")
+        return False
+    except Exception as e:
+        print(f"Unexpected error in sell_asset: {e}")
         return False
 
 def check_exit_condition(initial_investment, asset_balance, entry_price):
@@ -705,7 +681,7 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
     
     return current_price >= target_price
 
-def save_signal_to_file(signal_type, usdc_balance, btc_balance=Decimal('0.0'), timestamp_override=None, **kwargs):
+def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kwargs):
     """
     Writes signal data to signals.txt.
     NEW FORMAT: Separated prints one below each other without commas.
@@ -747,15 +723,12 @@ def save_signal_to_file(signal_type, usdc_balance, btc_balance=Decimal('0.0'), t
                 target_price = kwargs.get('target_price', 0.0)
                 
                 f.write(f"ENTRY PRICE: {entry_price:.2f}\n")
+                f.write(f"USDC BALANCE (BEFORE ENTRY): {usdc_balance:.2f}\n")
                 f.write(f"TARGET PRICE: {target_price:.2f}\n")
                 
                 # UPDATED: Do not print DETAILS if it contains "EXIT PRICE" to avoid duplication
                 if details and not details.startswith("EXIT PRICE:"):
                     f.write(f"DETAILS: {details}\n")
-
-                # UPDATED: Log FINAL balances (after conversion)
-                f.write(f"USDC BALANCE (AFTER ENTRY): {usdc_balance:.2f}\n")
-                f.write(f"BTC BALANCE (AFTER ENTRY): {btc_balance:.6f}\n")
                 
             elif signal_type == "EXIT":
                 exit_price = kwargs.get('exit_price', 0.0)
@@ -767,9 +740,6 @@ def save_signal_to_file(signal_type, usdc_balance, btc_balance=Decimal('0.0'), t
                 f.write(f"PROFIT (USDC): {profit:.2f}\n")
                 f.write(f"PROFIT (%): {profit_pct:.2f}\n")
                 f.write(f"TIME HELD: {time_held}\n")
-                
-                # UPDATED: Log FINAL balances (after conversion)
-                f.write(f"BTC BALANCE (AFTER EXIT): {btc_balance:.6f}\n")
                 f.write(f"USDC BALANCE (AFTER EXIT): {usdc_balance:.2f}\n")
             
             f.write("-" * 40 + "\n\n")
@@ -1593,14 +1563,9 @@ try:
         current_local_time_str = current_local_time.strftime("%Y-%m-%d %H:%M:%S")
         print(f"\nCurrent Local Time: {current_local_time_str}")
 
-        # =========================================================
-        # BALANCE CHECKS (BEGINNING OF LOOP)
-        # =========================================================
+        # 1. FETCH CURRENT STATE DATA
         usdc_balance = get_balance('USDC')
-        btc_balance = get_balance(BASE_ASSET)
-        print(f"START OF LOOP - USDC Balance: {usdc_balance:.2f}")
-        print(f"START OF LOOP - BTC Balance: {btc_balance:.6f}")
-        
+        asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
         current_price = get_current_price()
         
         if current_price <= Decimal('0.0'):
@@ -1608,7 +1573,7 @@ try:
             time.sleep(5)
             continue
             
-        btc_value_in_usdc = btc_balance * current_price
+        btc_value_in_usdc = asset_balance * current_price
 
         # =========================================================
         # FETCHING AND ANALYZING MARKET CONDITIONS (RUNS ALWAYS)
@@ -1712,6 +1677,7 @@ try:
         ]
         
         all_strict_conditions_met = all(passed for _, passed in strict_checks_list)
+        # failed_strict = [name for name, passed in strict_checks_list if not passed] # Removed unused var
 
         active_conditions_results = [
             conditions_status[condition_name]
@@ -1740,7 +1706,7 @@ try:
                 if recovered_price > Decimal('0.0'):
                     entry_price = recovered_price
                     # FIXED: Calculate initial_investment properly here for target calculation
-                    initial_investment = btc_balance * entry_price
+                    initial_investment = asset_balance * entry_price
                     last_trade = get_last_buy_trade()
                     
                     # CHANGED: Handle timestamp for recovery logging
@@ -1754,7 +1720,7 @@ try:
                     total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
                     target_multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
                     target_value = initial_investment * target_multiplier
-                    target_price = target_value / btc_balance if btc_balance > Decimal('0') else Decimal('0.0')
+                    target_price = target_value / asset_balance if asset_balance > Decimal('0') else Decimal('0.0')
 
                     # LOG ENTRY SIGNAL FOR RECOVERED TRADE
                     # FIX: Pass 'initial_investment' (calculated USDC cost) instead of 'usdc_balance' (which is 0)
@@ -1762,8 +1728,7 @@ try:
                     details_str = f"EXIT PRICE: {target_price:.2f}"
                     save_signal_to_file(
                         "ENTRY",
-                        usdc_balance, # 0 in this case
-                        btc_balance,
+                        initial_investment,
                         timestamp_override=formatted_entry_dt,
                         entry_price=float(entry_price), 
                         target_price=float(target_price),
@@ -1777,7 +1742,7 @@ try:
             # MONITOR STATUS
             print("Monitoring current position...")
             
-            current_value_in_usdc = btc_balance * current_price
+            current_value_in_usdc = asset_balance * current_price
             # Use global initial_investment if set, otherwise display placeholder
             initial_investment_display = initial_investment if initial_investment > Decimal('0') else Decimal('1.0')
             
@@ -1785,7 +1750,7 @@ try:
             total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
             target_multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
             target_value = initial_investment_display * target_multiplier
-            target_price = target_value / btc_balance if btc_balance > Decimal('0') else Decimal('0.0')
+            target_price = target_value / asset_balance if asset_balance > Decimal('0') else Decimal('0.0')
             
             value_change_percentage = ((current_value_in_usdc - initial_investment_display) / initial_investment_display) * Decimal('100') if initial_investment_display > Decimal('0') else Decimal('0.0')
 
@@ -1809,33 +1774,23 @@ try:
             print(f"Current USDC Value: {current_value_in_usdc:.2f} | Target USDC Value: {target_value:.2f}")
 
             # CHECK EXIT CONDITION
-            is_profit_exit = check_exit_condition(initial_investment_display, btc_balance, entry_price)
+            is_profit_exit = check_exit_condition(initial_investment_display, asset_balance, entry_price)
             
             if is_profit_exit:
                 print(f"\n*** PROFIT TARGET REACHED. SELLING POSITION ***")
                 print(f"Current Price {current_price:.2f} >= Target Price {target_price:.2f}")
-                if sell_asset(btc_balance):
-                    
-                    # UPDATED: Convert any remaining BTC dust to USDC
-                    print("Converting remaining BTC dust to USDC...")
-                    btc_dust = convert_remaining_balance(BASE_ASSET, QUOTE_ASSET, TRADE_SYMBOL)
-                    
-                    # Refresh Balances for logging
-                    usdc_balance = get_balance(QUOTE_ASSET)
-                    btc_balance = get_balance(BASE_ASSET)
-                    
-                    profit = usdc_balance - initial_investment_display
+                if sell_asset(float(asset_balance)):
+                    exit_usdc_balance = get_balance('USDC')
+                    profit = exit_usdc_balance - initial_investment_display
                     profit_percentage = (profit / initial_investment_display) * Decimal('100') if initial_investment_display > Decimal('0.0') else Decimal('0.0')
                     print(f"Position closed successfully.")
-                    print(f"Exit Balance: {usdc_balance:.25f} USDC (Clean Balance)")
-                    print(f"Remaining BTC Balance: {btc_balance:.6f} (Dust)")
+                    print(f"Exit Balance: {exit_usdc_balance:.25f} USDC (Clean Balance)")
                     print(f"Realized Profit: {profit:.25f} USDC ({profit_percentage:.2f}%)")
                     
-                    # LOG EXIT SIGNAL (With final balances)
+                    # LOG EXIT SIGNAL
                     save_signal_to_file(
                         "EXIT",
-                        usdc_balance, # Final USDC
-                        btc_balance, # Final BTC
+                        exit_usdc_balance, # Balance after exit
                         exit_price=float(current_price),
                         profit=float(profit),
                         profit_pct=float(profit_percentage),
@@ -1853,6 +1808,8 @@ try:
             else:
                 print("Target not yet reached. Holding...")
                 
+                # --- REMOVED STRICT CONDITIONS FAILED PRINT ---
+        
         # ==========================================
         # SCENARIO B: MARKET SCANNING (LOGGING ONLY)
         # ==========================================
@@ -1968,90 +1925,100 @@ try:
         print(f"FINAL SIGNAL TRIGGERED: {'YES' if signal_triggered else 'NO'}")
         print("="*80)
 
-        # --- ENTRY LOGIC ---
+        # --- ENTRY LOGIC (DISABLED AS REQUESTED) ---
         if signal_triggered:
             # Prepare details for log
             conditions_summary = f"{true_conditions_count}/{len(active_conditions_results)} (Strict: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m)"
             
+            # Calculate Target Price for Standard Entry
+            # Investment = Asset * Price (assuming 0 fees for simplicity, or just using Price * multiplier)
+            total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
+            multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
+            # We use usdc_balance to approximate investment cost before buying
+            approx_investment = usdc_balance * current_price
+            target_price = approx_investment * multiplier
+            
+            print(f"\n!!! SIGNAL TRIGGERED !!!")
+            print(f"Strict Conditions Check: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m")
+            print(f"Would buy with entire USDC balance: {usdc_balance:.25f} at price {current_price:.25f}")
+            print(f"Target Price would be: {target_price:.25f}")
+            
             if position_open:
-                print(f"\n!!! SIGNAL TRIGGERED !!!")
                 print(f"!!! NOTE: Currently holding position. Signal ignored. !!!")
             else:
-                # ---------------------------------------------------------
-                # ENTRY LOGIC ENABLED
-                # ---------------------------------------------------------
-                print(f"\n!!! SIGNAL TRIGGERED. EXECUTING BUY ORDER !!!")
-                print(f"Strict Conditions Check: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m")
-                
-                # 1. Execute Market Buy
-                entry_price, bought_qty, entry_datetime, estimated_cost = buy_asset()
-                
-                if entry_price and bought_qty:
-                    # 2. Update Global Variables for Tracking
-                    # Use exact entry price from API fill for accurate investment calc
-                    initial_investment = entry_price * bought_qty 
-                    asset_balance = bought_qty
-                    
-                    # 3. Convert Remaining USDC Dust to BTC
-                    # This ensures USDC balance is effectively 0
-                    print("Converting remaining USDC dust to BTC...")
-                    convert_remaining_balance(QUOTE_ASSET, BASE_ASSET, TRADE_SYMBOL)
-                    
-                    # 4. Refresh Balances for Logging
-                    usdc_balance = get_balance(QUOTE_ASSET)
-                    btc_balance = get_balance(BASE_ASSET)
-                    
-                    # 5. Calculate Target Price (Sell Price)
-                    # Logic: Entry Price * (1 + NetProfit% + Fees%)
-                    total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
-                    multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
-                    target_price = entry_price * multiplier
-                    
-                    print(f"Entry Executed Successfully.")
-                    print(f"Bought Qty: {bought_qty:.6f} @ {entry_price:.2f}")
-                    print(f"Target Sell Price: {target_price:.2f}")
-                    
-                    # 6. Log Entry Signal
-                    details_str = f"EXIT PRICE: {target_price:.2f}"
-                    save_signal_to_file(
-                        "ENTRY",
-                        usdc_balance, # Should be ~0
-                        btc_balance, # Should be full balance
-                        timestamp_override=entry_datetime.strftime("%Y-%m-%d %H:%M:%S") if entry_datetime else None,
-                        entry_price=float(entry_price),
-                        target_price=float(target_price),
-                        details=details_str
-                    )
-                else:
-                    print("Buy order failed or returned None. Check balances and logs.")
+                print(f"!!! NOTE: Entry Logic Disabled. No trade executed. No signal written to file. !!!")
                 
         else:
             print(f"\nINSUFFICIENT CONDITIONS MET - NO TRADE EXECUTED")
             print(f"Only {true_conditions_count}/{min_required} conditions met (Required: {min_required}).")
             
+            # --- REMOVED STRICT CONDITIONS FAILED PRINT HERE ---
+            
             print("Waiting for next iteration...")
 
         # ==========================================
-        # END OF ITERATION: REPRINT IN TRADE STATUS
+        # SCENARIO C: ENTRY LOGIC (ENABLED)
+        # ==========================================
+        if signal_triggered and not position_open:
+            print("\n>>> ATTEMPTING TO OPEN TRADE <<<")
+            
+            # Calculate precise target price based on expected execution
+            total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
+            multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
+            approx_investment = usdc_balance * current_price
+            target_price = approx_investment * multiplier
+            
+            # Execute Buy
+            ep, aq, edt, cost = buy_asset()
+            
+            if ep is not None and edt is not None:
+                entry_price = ep
+                entry_datetime = edt
+                initial_investment = cost # The actual cost incurred
+                
+                # Re-fetch balance to confirm what we actually got
+                asset_balance = get_balance(TRADE_SYMBOL.split('USDC')[0])
+                
+                details_str = f"EXIT PRICE: {target_price:.2f}"
+                save_signal_to_file(
+                    "ENTRY",
+                    usdc_balance, # Balance before trade
+                    entry_price=float(entry_price),
+                    target_price=float(target_price),
+                    details=details_str
+                )
+                print("Trade entry successful.")
+            else:
+                print("Trade entry failed.")
+
+        # ==========================================
+        # END OF ITERATION: FRESH BALANCE UPDATE
         # ==========================================
         
-        # =========================================================
-        # BALANCE CHECKS (END OF LOOP)
-        # =========================================================
-        usdc_balance = get_balance('USDC')
-        btc_balance = get_balance(BASE_ASSET)
-        print(f"\nEND OF LOOP - USDC Balance: {usdc_balance:.2f}")
-        print(f"END OF LOOP - BTC Balance: {btc_balance:.6f}")
+        # Fetch fresh data from exchange to account for fees, trades, and price changes
+        final_usdc = get_balance('USDC')
+        final_btc = get_balance(TRADE_SYMBOL.split('USDC')[0])
+        final_price = get_current_price()
         
-        if position_open:
-            print(f"\n=== SCENARIO: IN TRADE ===")
-            print(f"BTC Value: {btc_value_in_usdc:.2f} | USDC Balance: {usdc_balance:.2f}")
-            print(f"Entry Price: {entry_price:.2f} | Current Price: {current_price:.2f}")
-            print(f"Net PnL: {value_change_percentage:.2f}%")
-            print(f"Target Price ({PROFIT_TARGET_PERCENT}% Net + {TOTAL_FEE_PERCENT}% Fees): {target_price:.2f}")
-            print(f"Current USDC Value: {current_value_in_usdc:.2f} | Target USDC Value: {target_value:.2f}")
+        # Calculate total portfolio value for clarity
+        portfolio_value_usdc = final_usdc + (final_btc * final_price)
 
-        print(f"\nLoop Complete. Sleeping for 5 seconds...")
+        print(f"\n{'='*60}")
+        print(f"   END OF ITERATION BALANCE UPDATE (FRESH DATA)")
+        print(f"{'='*60}")
+        print(f"Updated USDC Balance : {final_usdc:.4f}")
+        print(f"Updated BTC Balance  : {final_btc:.8f}")
+        print(f"Current BTC Price    : {final_price:.2f}")
+        print(f"Total Portfolio Value: {portfolio_value_usdc:.2f} USDC")
+        
+        # Debug for "Dust" logic
+        if final_btc > Decimal('0') and final_btc < Decimal('0.001'):
+             btc_val_usdc = final_btc * final_price
+             print(f"NOTE: BTC Dust detected. Value: {btc_val_usdc:.4f} USDC")
+        
+        print(f"{'='*60}\n")
+
+        print(f"Loop Complete. Sleeping for 5 seconds...")
         
         # FIX: Only delete candle_map if it exists
         if candle_map is not None:
