@@ -1712,7 +1712,6 @@ try:
         ]
         
         all_strict_conditions_met = all(passed for _, passed in strict_checks_list)
-        # failed_strict = [name for name, passed in strict_checks_list if not passed] # Removed unused var
 
         active_conditions_results = [
             conditions_status[condition_name]
@@ -1854,8 +1853,6 @@ try:
             else:
                 print("Target not yet reached. Holding...")
                 
-                # --- REMOVED STRICT CONDITIONS FAILED PRINT ---
-        
         # ==========================================
         # SCENARIO B: MARKET SCANNING (LOGGING ONLY)
         # ==========================================
@@ -1971,57 +1968,66 @@ try:
         print(f"FINAL SIGNAL TRIGGERED: {'YES' if signal_triggered else 'NO'}")
         print("="*80)
 
-        # --- ENTRY LOGIC (DISABLED AS REQUESTED) ---
+        # --- ENTRY LOGIC ---
         if signal_triggered:
             # Prepare details for log
             conditions_summary = f"{true_conditions_count}/{len(active_conditions_results)} (Strict: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m)"
             
-            # Calculate Target Price for Standard Entry
-            # Investment = Asset * Price (assuming 0 fees for simplicity, or just using Price * multiplier)
-            total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
-            multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
-            # We use usdc_balance to approximate investment cost before buying
-            approx_investment = usdc_balance * current_price
-            target_price = approx_investment * multiplier
-            
-            print(f"\n!!! SIGNAL TRIGGERED !!!")
-            print(f"Strict Conditions Check: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m")
-            print(f"Would buy with entire USDC balance: {usdc_balance:.25f} at price {current_price:.25f}")
-            print(f"Target Price would be: {target_price:.25f}")
-            
             if position_open:
+                print(f"\n!!! SIGNAL TRIGGERED !!!")
                 print(f"!!! NOTE: Currently holding position. Signal ignored. !!!")
             else:
                 # ---------------------------------------------------------
-                # IF ENTRY LOGIC WERE ENABLED, THIS IS THE UPDATED FLOW:
+                # ENTRY LOGIC ENABLED
                 # ---------------------------------------------------------
-                print(f"!!! NOTE: Entry Logic Disabled. !!!")
-                # 
-                # if buy_asset():
-                #     # UPDATED: Convert any remaining USDC dust to BTC
-                #     print("Converting remaining USDC dust to BTC...")
-                #     convert_remaining_balance(QUOTE_ASSET, BASE_ASSET, TRADE_SYMBOL)
-                #     
-                #     # Refresh Balances
-                #     usdc_balance = get_balance(QUOTE_ASSET)
-                #     btc_balance = get_balance(BASE_ASSET)
-                #     
-                #     # LOG ENTRY SIGNAL (With final balances)
-                #     save_signal_to_file(
-                #         "ENTRY",
-                #         usdc_balance,
-                #         btc_balance,
-                #         entry_price=float(current_price),
-                #         target_price=float(target_price),
-                #         details=""
-                #     )
-                # ---------------------------------------------------------
+                print(f"\n!!! SIGNAL TRIGGERED. EXECUTING BUY ORDER !!!")
+                print(f"Strict Conditions Check: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m")
+                
+                # 1. Execute Market Buy
+                entry_price, bought_qty, entry_datetime, estimated_cost = buy_asset()
+                
+                if entry_price and bought_qty:
+                    # 2. Update Global Variables for Tracking
+                    # Use exact entry price from API fill for accurate investment calc
+                    initial_investment = entry_price * bought_qty 
+                    asset_balance = bought_qty
+                    
+                    # 3. Convert Remaining USDC Dust to BTC
+                    # This ensures USDC balance is effectively 0
+                    print("Converting remaining USDC dust to BTC...")
+                    convert_remaining_balance(QUOTE_ASSET, BASE_ASSET, TRADE_SYMBOL)
+                    
+                    # 4. Refresh Balances for Logging
+                    usdc_balance = get_balance(QUOTE_ASSET)
+                    btc_balance = get_balance(BASE_ASSET)
+                    
+                    # 5. Calculate Target Price (Sell Price)
+                    # Logic: Entry Price * (1 + NetProfit% + Fees%)
+                    total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
+                    multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
+                    target_price = entry_price * multiplier
+                    
+                    print(f"Entry Executed Successfully.")
+                    print(f"Bought Qty: {bought_qty:.6f} @ {entry_price:.2f}")
+                    print(f"Target Sell Price: {target_price:.2f}")
+                    
+                    # 6. Log Entry Signal
+                    details_str = f"EXIT PRICE: {target_price:.2f}"
+                    save_signal_to_file(
+                        "ENTRY",
+                        usdc_balance, # Should be ~0
+                        btc_balance, # Should be full balance
+                        timestamp_override=entry_datetime.strftime("%Y-%m-%d %H:%M:%S") if entry_datetime else None,
+                        entry_price=float(entry_price),
+                        target_price=float(target_price),
+                        details=details_str
+                    )
+                else:
+                    print("Buy order failed or returned None. Check balances and logs.")
                 
         else:
             print(f"\nINSUFFICIENT CONDITIONS MET - NO TRADE EXECUTED")
             print(f"Only {true_conditions_count}/{min_required} conditions met (Required: {min_required}).")
-            
-            # --- REMOVED STRICT CONDITIONS FAILED PRINT HERE ---
             
             print("Waiting for next iteration...")
 
