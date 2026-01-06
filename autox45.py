@@ -50,7 +50,10 @@ CONFIG = {
     "conditions": {
         "momentum_positive_1m": True,
         "momentum_positive_15sec": True,
-        "linear_regression_channel_break": True,
+        "linear_regression_channel_break_15s": True,
+        "linear_regression_channel_break_1m": True,
+        "linear_regression_channel_break_3m": True,
+        "linear_regression_channel_break_5m": True,
         "aroon_only_signal": True,
         "thresholds_15sec": True,
         "volume_bullish_1min": True,
@@ -61,7 +64,7 @@ CONFIG = {
         "stoch_oversold_vs_overbought_1min": True,
         "rsi_oversold_vs_overbought_15sec": True,
     },
-    "min_conditions_met": 7  # Trigger trade if 7 out of 12 conditions are True
+    "min_conditions_met": 7  # Trigger trade if 7 out of 15 conditions are True
 }
 
 # Global variables for market state tracking
@@ -707,7 +710,11 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
     
     return current_price >= target_price
 
-def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kwargs):
+def save_signal_to_file(signal_type, balance_amount, timestamp_override=None, **kwargs):
+    """
+    signal_type: "ENTRY" or "EXIT"
+    balance_amount: For ENTRY, this is the exact USDC cost. For EXIT, this is final USDC balance.
+    """
     try:
         if timestamp_override:
             timestamp = timestamp_override
@@ -741,7 +748,8 @@ def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kw
                 target_price = kwargs.get('target_price', 0.0)
                 
                 f.write(f"ENTRY PRICE: {entry_price:.25f}\n")
-                f.write(f"USDC BALANCE (BEFORE ENTRY): {usdc_balance:.25f}\n")
+                # UPDATED LOGIC: Use actual USDC spent, not wallet balance
+                f.write(f"USDC BALANCE (BEFORE ENTRY): {balance_amount:.25f}\n")
                 f.write(f"BTC VALUE (AFTER ENTRY) IN USDC: {btc_value_usdc:.25f}\n")
                 f.write(f"TARGET PRICE: {target_price:.25f}\n")
                 
@@ -758,7 +766,7 @@ def save_signal_to_file(signal_type, usdc_balance, timestamp_override=None, **kw
                 f.write(f"PROFIT (USDC): {profit:.25f}\n")
                 f.write(f"PROFIT (%): {profit_pct:.25f}\n")
                 f.write(f"TIME HELD: {time_held}\n")
-                f.write(f"USDC BALANCE (AFTER EXIT): {usdc_balance:.25f}\n")
+                f.write(f"USDC BALANCE (AFTER EXIT): {balance_amount:.25f}\n")
             
             f.write("-" * 40 + "\n\n")
                 
@@ -1581,14 +1589,18 @@ try:
         # FETCHING AND ANALYZING MARKET CONDITIONS (RUNS ALWAYS)
         # =========================================================
         
-        candle_map = fetch_candles_in_parallel(['1m', '3m'])
+        candle_map = fetch_candles_in_parallel(['1m', '3m', '5m'])
         candles_1m = candle_map.get('1m', [])
         candles_3m = candle_map.get('3m', [])
+        candles_5m = candle_map.get('5m', [])
         
         conditions_status = {
             "momentum_positive_1m": False,
             "momentum_positive_15sec": False,
-            "linear_regression_channel_break": False,
+            "linear_regression_channel_break_15s": False,
+            "linear_regression_channel_break_1m": False,
+            "linear_regression_channel_break_3m": False,
+            "linear_regression_channel_break_5m": False,
             "aroon_only_signal": False,
             "thresholds_15sec": False,
             "volume_bullish_1min": False,
@@ -1613,9 +1625,16 @@ try:
             if 'error' not in momentum_15s_result:
                 conditions_status["momentum_positive_15sec"] = momentum_15s_result['momentum_positive']
                 
-            lrc_break_result = analyze_linear_regression_channel_break(candles_15s) 
-            if 'error' not in lrc_break_result:
-                conditions_status["linear_regression_channel_break"] = lrc_break_result['condition_met']
+            # --- LRC BREAK LOGIC (UPDATED FOR 4 TIMEFRAMES) ---
+            lrc_break_15s_res = analyze_linear_regression_channel_break(candles_15s)
+            lrc_break_1m_res = analyze_linear_regression_channel_break(candles_1m)
+            lrc_break_3m_res = analyze_linear_regression_channel_break(candles_3m)
+            lrc_break_5m_res = analyze_linear_regression_channel_break(candles_5m)
+            
+            conditions_status["linear_regression_channel_break_15s"] = lrc_break_15s_res.get('condition_met', False) if 'error' not in lrc_break_15s_res else False
+            conditions_status["linear_regression_channel_break_1m"] = lrc_break_1m_res.get('condition_met', False) if 'error' not in lrc_break_1m_res else False
+            conditions_status["linear_regression_channel_break_3m"] = lrc_break_3m_res.get('condition_met', False) if 'error' not in lrc_break_3m_res else False
+            conditions_status["linear_regression_channel_break_5m"] = lrc_break_5m_res.get('condition_met', False) if 'error' not in lrc_break_5m_res else False
             
             aroon_signal_result = analyze_aroon_only_signal(candles_1m, aroon_period=14)
             if 'error' not in aroon_signal_result:
@@ -1660,7 +1679,10 @@ try:
             ("RSI OS/OB (15s)", conditions_status["rsi_oversold_vs_overbought_15sec"]),
             ("Momentum Positive (1m)", conditions_status["momentum_positive_1m"]),
             ("Momentum Positive (15s)", conditions_status["momentum_positive_15sec"]),
-            ("Linear Reg Channel Break", conditions_status["linear_regression_channel_break"]),
+            ("Linear Reg Channel Break (15s)", conditions_status["linear_regression_channel_break_15s"]),
+            ("Linear Reg Channel Break (1m)", conditions_status["linear_regression_channel_break_1m"]),
+            ("Linear Reg Channel Break (3m)", conditions_status["linear_regression_channel_break_3m"]),
+            ("Linear Reg Channel Break (5m)", conditions_status["linear_regression_channel_break_5m"]),
             ("Aroon Only Signal", conditions_status["aroon_only_signal"]),
             ("Thresholds (15s)", conditions_status["thresholds_15sec"]),
             ("Volume Bullish (1m)", conditions_status["volume_bullish_1min"]),
@@ -1705,9 +1727,10 @@ try:
                     target_price = target_value / asset_balance if asset_balance > Decimal('0') else Decimal('0.0')
 
                     details_str = f"EXIT PRICE: {target_price:.25f}"
+                    # Note: Recovery cannot know exact spent USDC, so we use wallet balance estimation
                     save_signal_to_file(
                         "ENTRY",
-                        usdc_balance,
+                        initial_investment, 
                         timestamp_override=formatted_entry_dt,
                         entry_price=float(entry_price), 
                         target_price=float(target_price),
@@ -1813,25 +1836,31 @@ try:
             print(f"Momentum Positive (>0): {conditions_status['momentum_positive_15sec']}")
         
         # --- Condition 3: Linear Regression Channel Break (15s) ---
-        print("\n--- Condition 3: Linear Regression Channel Break (15s) ---")
-        if 'error' not in lrc_break_result:
-            print(f"Description: {lrc_break_result['description']}")
-            print(f"Current Price:        {lrc_break_result['current_price']:.25f}")
-            print(f"Upper Channel Limit:  {lrc_break_result['upper_channel']:.25f}")
-            print(f"Lower Channel Limit:  {lrc_break_result['lower_channel']:.25f}")
-            if lrc_break_result['price_at_high_breach'] != 0.0:
-                print(f"Most Recent High Breach Price: {lrc_break_result['price_at_high_breach']:.25f} (at idx {lrc_break_result['most_recent_above_upper_index']})")
-            else:
-                print(f"Most Recent High Breach Price: None")
-            
-            if lrc_break_result['price_at_low_breach'] != 0.0:
-                print(f"Most Recent Low Breach Price:  {lrc_break_result['price_at_low_breach']:.25f} (at idx {lrc_break_result['most_recent_below_lower_index']})")
-            else:
-                print(f"Most Recent Low Breach Price: None")
-            print(f"Condition Met: {conditions_status['linear_regression_channel_break']}")
-            
-        # --- Condition 4: Aroon-Only Signal ---
-        print("\n--- Condition 4: Aroon-Only Signal ---")
+        print("\n--- Strict: Linear Reg Channel Break (15sec tf) ---")
+        if 'error' not in lrc_break_15s_res:
+            print(f"Description: {lrc_break_15s_res['description']}")
+            print(f"Condition Met: {conditions_status['linear_regression_channel_break_15s']}")
+        
+        # --- Condition 4: Linear Regression Channel Break (1m) ---
+        print("\n--- Strict: Linear Reg Channel Break (1min tf) ---")
+        if 'error' not in lrc_break_1m_res:
+            print(f"Description: {lrc_break_1m_res['description']}")
+            print(f"Condition Met: {conditions_status['linear_regression_channel_break_1m']}")
+
+        # --- Condition 5: Linear Regression Channel Break (3m) ---
+        print("\n--- Strict: Linear Reg Channel Break (3min tf) ---")
+        if 'error' not in lrc_break_3m_res:
+            print(f"Description: {lrc_break_3m_res['description']}")
+            print(f"Condition Met: {conditions_status['linear_regression_channel_break_3m']}")
+
+        # --- Condition 6: Linear Regression Channel Break (5m) ---
+        print("\n--- Strict: Linear Reg Channel Break (5min tf) ---")
+        if 'error' not in lrc_break_5m_res:
+            print(f"Description: {lrc_break_5m_res['description']}")
+            print(f"Condition Met: {conditions_status['linear_regression_channel_break_5m']}")
+
+        # --- Condition 7: Aroon-Only Signal ---
+        print("\n--- Strict: Aroon-Only Signal ---")
         if 'error' not in aroon_signal_result:
             print(f"Signal: {aroon_signal_result['signal']}")
             print(f"Aroon Up:   {aroon_signal_result['aroon_up']:.25f}")
@@ -1840,8 +1869,8 @@ try:
             print(f"Recent Low (14p):  {aroon_signal_result['recent_low']:.25f}")
             print(f"Condition Met: {conditions_status['aroon_only_signal']}")
 
-        # --- Condition 5: Thresholds 15sec ---
-        print("\n--- Condition 5: Thresholds Analysis (15s) ---")
+        # --- Condition 8: Thresholds 15sec ---
+        print("\n--- Strict: Thresholds Analysis (15s) ---")
         if 'error' not in thresholds_15s_result:
             print(f"Description: {thresholds_15s_result['description']}")
             print(f"Current Price: {thresholds_15s_result['current_price']:.25f}")
@@ -1850,35 +1879,35 @@ try:
             print(f"Midpoint:     {thresholds_15s_result['midpoint']:.25f}")
             print(f"Condition Met (Price < Midpoint): {conditions_status['thresholds_15sec']}")
 
-        # --- Condition 6: Volume 1m Sentiment ---
-        print("\n--- Condition 6: Volume Sentiment (1m) ---")
+        # --- Condition 9: Volume 1m Sentiment ---
+        print("\n--- Strict: Volume Sentiment (1m) ---")
         if not err_1m:
             print(f"Bullish Volume %: {bull_pct:.25f}%")
             print(f"Bearish Volume %: {bear_pct:.25f}%")
             print(f"Condition Met (Bull > Bear): {conditions_status['volume_bullish_1min']}")
 
-        # --- Condition 7: Stoch RSI Precise (15sec) ---
+        # --- Condition 10: Stoch RSI Precise (15sec) ---
         # (Already printed inside function)
             
-        # --- Condition 8: Stoch RSI Precise (1min) ---
+        # --- Condition 11: Stoch RSI Precise (1min) ---
         # (Already printed inside function)
             
-        # --- Condition 9: Dip Confirmation (15s) ---
-        print("\n--- Condition 9: Dip Confirmation (15s) ---")
+        # --- Condition 12: Dip Confirmation (15s) ---
+        print("\n--- Dip Confirmation (15s) ---")
         print(f"Distance to Min: {dist_min_15s:.25f} (Value: {val_min_15s:.25f})")
         print(f"Distance to Max: {dist_max_15s:.25f} (Value: {val_max_15s:.25f})")
         print(f"Dist to Min < Dist to Max: {'YES' if is_dip_15s else 'NO'}")
         print(f"Condition Met: {conditions_status['dip_confirmation_15sec']}")
 
-        # --- Condition 10: Dip Confirmation (1m) ---
-        print("\n--- Condition 10: Dip Confirmation (1m) ---")
+        # --- Condition 13: Dip Confirmation (1m) ---
+        print("\n--- Dip Confirmation (1m) ---")
         print(f"Distance to Min: {dist_min_1m:.25f} (Value: {val_min_1m:.25f})")
         print(f"Distance to Max: {dist_max_1m:.25f} (Value: {val_max_1m:.25f})")
         print(f"Dist to Min < Dist to Max: {'YES' if is_dip_1m else 'NO'}")
         print(f"Condition Met: {conditions_status['dip_confirmation_1min']}")
 
-        # --- Condition 11: Stoch Oversold vs Overbought (1m) ---
-        print("\n--- Condition 11: Stoch Oversold vs Overbought (1m) ---")
+        # --- Condition 14: Stoch Oversold vs Overbought (1m) ---
+        print("\n--- Stoch Oversold vs Overbought (1m) ---")
         print(f"Description: {stoch_1m_os_result[1]}")
         print(f"Current Stoch %K: {stoch_1m_os_result[4]:.25f}")
         if stoch_1m_os_result[5] != 0.0:
@@ -1891,8 +1920,8 @@ try:
             print(f"Value at Last Overbought Event (>80): None")
         print(f"Condition Met: {stoch_1m_os_result[0]}")
 
-        # --- Condition 12: RSI Oversold vs Overbought (15s) ---
-        print("\n--- Condition 12: RSI Oversold vs Overbought (15s) ---")
+        # --- Condition 15: RSI Oversold vs Overbought (15s) ---
+        print("\n--- RSI Oversold vs Overbought (15s) ---")
         print(f"Description: {rsi_15s_os_result[1]}")
         print(f"Current RSI (14): {rsi_15s_os_result[4]:.25f}")
         if rsi_15s_os_result[5] != 0.0:
@@ -1944,7 +1973,7 @@ try:
 
         # --- ENTRY LOGIC (DISABLED AS REQUESTED) ---
         if signal_triggered:
-            conditions_summary = f"{true_conditions_count}/{len(active_conditions_results)} (Strict: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m)"
+            conditions_summary = f"{true_conditions_count}/{len(active_conditions_results)} (Strict: RSI OS/OB 15s, Mom 1m, Mom 15s, LRCs, Aroon, Thresh 15s, Vol 1m)"
             
             total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
             multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
@@ -1952,7 +1981,7 @@ try:
             target_price = approx_investment * multiplier
             
             print(f"\n!!! SIGNAL TRIGGERED !!!")
-            print(f"Strict Conditions Check: RSI OS/OB 15s, Mom 1m, Mom 15s, LRC, Aroon, Thresh 15s, Vol 1m")
+            print(f"Strict Conditions Check: RSI OS/OB 15s, Mom 1m, Mom 15s, LRCs (15s/1m/3m/5m), Aroon, Thresh 15s, Vol 1m")
             print(f"Would buy with entire USDC balance: {usdc_balance:.25f} at price {current_price:.25f}")
             print(f"Target Price would be: {target_price:.25f}")
             
@@ -1993,10 +2022,10 @@ try:
                 
                 save_signal_to_file(
                     "ENTRY",
-                    usdc_balance, # Logging pre-entry balance
+                    cost, # Pass actual USDC spent
                     entry_price=float(entry_price),
                     target_price=float(target_price),
-                    btc_value_usdc=float(btc_val) # Logging BTC value in USDC
+                    btc_value_usdc=float(btc_val)
                 )
                 print("Trade entry successful.")
             else:
