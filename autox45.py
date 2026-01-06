@@ -41,7 +41,8 @@ except FileNotFoundError:
 client = BinanceClient(api_key, api_secret, requests_params={"timeout": 30})
 
 # Trading Configuration
-PROFIT_TARGET_PERCENT = 0.35   # 0.35% net profit goal
+# UPDATED: Net profit target changed to 0.55%
+PROFIT_TARGET_PERCENT = 0.55   # 0.55% net profit goal
 TOTAL_FEE_PERCENT = 0.20       # 0.20% total fee percentage
 MIN_TRADE_AMOUNT = 10
 
@@ -700,7 +701,7 @@ def check_exit_condition(initial_investment, asset_balance, entry_price):
     if current_price <= Decimal('0.0'):
         return False
     
-    # Target: 0.35% Net Profit + 0.20% Fees = 0.55% Gross Return
+    # UPDATED Target: 0.55% Net Profit + 0.20% Fees = 0.75% Gross Return
     total_required_gross_percent = PROFIT_TARGET_PERCENT + TOTAL_FEE_PERCENT
     multiplier = Decimal(str(1.0 + total_required_gross_percent / 100))
     
