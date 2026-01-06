@@ -64,7 +64,7 @@ CONFIG = {
         "stoch_oversold_vs_overbought_1min": True,
         "rsi_oversold_vs_overbought_15sec": True,
     },
-    "min_conditions_met": 7  # Trigger trade if 7 out of 15 conditions are True
+    "min_conditions_met": 10  # Trigger trade if 10 out of 15 conditions are True
 }
 
 # Global variables for market state tracking
@@ -2003,7 +2003,7 @@ try:
             print("\n>>> ATTEMPTING TO OPEN TRADE <<<")
             
             # Execute Buy
-            # Returns: entry_price, btc_qty, entry_datetime, usdc_spent, btc_value_usdc
+            # Returns: entry_price, btc_qty, entry_datetime, usdc_spent, btc_value_in_usdc
             ep, aq, edt, cost, btc_val = buy_asset()
             
             if ep is not None and edt is not None:
