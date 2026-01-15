@@ -9,7 +9,7 @@ import sys
 import time
 from datetime import datetime
 
-# --- Global Stats Variables (Kept for dashboard compatibility) ---
+# --- Global Stats Variables ---
 TRADE_HISTORY = []
 TOTAL_NET_PNL = 0.0
 TOTAL_TRADES = 0
@@ -47,7 +47,6 @@ class Trader:
         ]
         return trading_pairs
 
-    # Trading methods kept but unused in main loop for manual entry mode
     def get_account_balance(self):
         account = self.client.get_account()
         for balance in account['balances']:
@@ -60,18 +59,15 @@ class Trader:
         return float(ticker['price'])
 
     def execute_buy(self, symbol, usdc_amount):
-        # NOT USED IN SIGNAL MODE
         pass
 
     def execute_sell(self, symbol):
-        # NOT USED IN SIGNAL MODE
         pass
 
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
 def update_trade_stats(symbol, profit, profit_pct):
-    # NOT USED IN SIGNAL MODE
     pass
 
 def print_stats_dashboard():
@@ -98,13 +94,10 @@ def format_float(val):
         return "-"
 
 def print_dynamic_table(full_records):
-    """
-    Prints the dynamic table sorted by MTF Score.
-    """
     clear_screen()
     print_stats_dashboard()
     
-    print(f"\nDisplaying All Assets (Sorted by MTF Strength: Most Conditions First)")
+    print(f"\nDisplaying All Assets (Sorted by MTF Strength)")
 
     # Sort Logic
     def get_score(item):
@@ -136,8 +129,8 @@ def print_dynamic_table(full_records):
             data.get('5m_trend', '-'),
             data.get('5m_mid', '-'),
             data.get('1m_rsi', '-'),
-            format_float(data.get('argmin_price')),
-            format_float(data.get('argmax_price')),
+            "YES" if data.get('1m_rsi_valid') == 'YES' else "NO",
+            "YES" if data.get('1m_struct_valid') == 'YES' else "NO",
             format_float(data.get('bull_vol')),
             format_float(data.get('bear_vol'))
         ]
@@ -145,19 +138,14 @@ def print_dynamic_table(full_records):
 
     headers = [
         "Symbol", "2H Trend", "15M Trend", "5M Trend", "5M Mid", "1M RSI",
-        "ArgMin Price", "ArgMax Price", "Bull Vol %", "Bear Vol %"
+        "RSI OK (<50)", "Struct OK", "Bull Vol %", "Bear Vol %"
     ]
     
-    print(tabulate(table_data, headers=headers, tablefmt="grid", floatfmt=f".{PRECISION}f"))
+    print(tabulate(table_data, headers=headers, tablefmt="grid", floatfmt=".4f"))
 
 # --- Analysis Logic ---
 
 def get_regression_breakout_status(close_array):
-    """
-    Logic: Price < Regression Line AND 
-    Most recent Lowest price below line is more recent than Most recent Highest price above line.
-    Returns: 'PASS' or 'FAIL'
-    """
     try:
         if len(close_array) < 50: return "FAIL"
         
@@ -175,6 +163,7 @@ def get_regression_breakout_status(close_array):
         if not np.any(below_mask): return "FAIL"
         if not np.any(above_mask): return "FAIL"
         
+        # Get Most Recent index of values below line vs above line
         values_below = close_array[below_mask]
         min_val_below = np.min(values_below)
         idx_min_below = np.where(close_array == min_val_below)[0][-1]
@@ -191,10 +180,6 @@ def get_regression_breakout_status(close_array):
     return "FAIL"
 
 def analyze_single_asset(client, symbol):
-    """
-    Fetches all data for a symbol and calculates all conditions.
-    Returns a dict of results.
-    """
     results = {
         '2h_trend': 'FAIL', '15m_trend': 'FAIL', '5m_trend': 'FAIL', '5m_mid': 'FAIL',
         '1m_rsi': '-', '1m_rsi_valid': 'NO', 
@@ -226,9 +211,7 @@ def analyze_single_asset(client, symbol):
                 c_5m = np.array([float(k[4]) for k in k_5m])
                 results['5m_trend'] = get_regression_breakout_status(c_5m)
                 
-                y = range(len(c_5m))
                 try:
-                    best_fit_line = np.poly1d(np.polyfit(y, c_5m, 1))(y)
                     idx_min = np.argmin(c_5m)
                     idx_max = np.argmax(c_5m)
                     val_max = c_5m[idx_max]
@@ -242,47 +225,88 @@ def analyze_single_asset(client, symbol):
         # --- 1M Analysis (Structure + RSI + Volume) ---
         try:
             k_1m = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=1200)
-            if k_1m:
-                c_1m = np.array([float(k[4]) for k in k_1m])
+            if not k_1m: raise ValueError("No 1m data")
+            
+            c_1m = np.array([float(k[4]) for k in k_1m])
+            
+            # --- 1. Structure Logic (Lowest Low vs Highest High) ---
+            # User Requirement: Compare Lowest Low of 1200 values vs Highest High of 1200 values.
+            # Check if Lowest Low is more recent than Highest High.
+            
+            val_min = np.min(c_1m) # Absolute Lowest Low value
+            val_max = np.max(c_1m) # Absolute Highest High value
+            
+            # Find indices. Use [-1] to get the most recent occurrence of these values
+            indices_min = np.where(c_1m == val_min)[0]
+            indices_max = np.where(c_1m == val_max)[0]
+            
+            if len(indices_min) > 0 and len(indices_max) > 0:
+                idx_min = indices_min[-1] # Most recent time Lowest Low occurred
+                idx_max = indices_max[-1] # Most recent time Highest High occurred
                 
-                idx_min = np.argmin(c_1m)
-                idx_max = np.argmax(c_1m)
-                val_min = c_1m[idx_min]
-                val_max = c_1m[idx_max]
-                is_struct = idx_min > idx_max
                 results['argmin_price'] = val_min
                 results['argmax_price'] = val_max
-                results['1m_struct_valid'] = "YES" if is_struct else "NO"
                 
-                rsi = ta.RSI(c_1m, timeperiod=14)
-                valid_rsi = rsi[np.logical_not(np.isnan(rsi))]
-                if len(valid_rsi) > 0:
-                    idx_oversold = -1
-                    idx_overbought = -1
-                    for i in range(len(valid_rsi) - 1, -1, -1):
-                        if valid_rsi[i] < 30 and idx_oversold == -1: idx_oversold = i
-                        if valid_rsi[i] > 70 and idx_overbought == -1: idx_overbought = i
-                        if idx_oversold != -1 and idx_overbought != -1: break
+                # Condition: Lowest Low (idx_min) occurred AFTER Highest High (idx_max)
+                if idx_min > idx_max:
+                    results['1m_struct_valid'] = "YES"
+                else:
+                    results['1m_struct_valid'] = "NO"
+            
+            # --- 2. RSI Logic ---
+            rsi = ta.RSI(c_1m, timeperiod=14)
+            valid_rsi = rsi[np.logical_not(np.isnan(rsi))]
+            
+            if len(valid_rsi) > 0:
+                curr_rsi = valid_rsi[-1]
+                results['1m_rsi'] = f"{curr_rsi:.2f}"
+                
+                idx_oversold = -1
+                idx_overbought = -1
+                
+                # Iterate backwards to find most recent occurrences
+                for i in range(len(valid_rsi) - 1, -1, -1):
+                    if valid_rsi[i] < 30 and idx_oversold == -1: 
+                        idx_oversold = i
+                    if valid_rsi[i] > 70 and idx_overbought == -1: 
+                        idx_overbought = i
                     
-                    results['1m_rsi'] = f"{valid_rsi[-1]:.2f}"
-                    results['1m_rsi_valid'] = "YES" if idx_oversold > idx_overbought else "NO"
+                    if idx_oversold != -1 and idx_overbought != -1:
+                        break
                 
-                bull = 0.0
-                bear = 0.0
-                for k in k_1m:
-                    o, c, v = float(k[1]), float(k[4]), float(k[5])
-                    if c > o: bull += v
-                    elif c < o: bear += v
+                cond_recency = (idx_oversold > idx_overbought) if (idx_oversold != -1 and idx_overbought != -1) else False
+                cond_middle = curr_rsi < 50.0
                 
-                total = bull + bear
-                if total > 0:
-                    b_pct = (bull / total) * 100
-                    be_pct = (bear / total) * 100
-                    results['bull_vol'] = b_pct
-                    results['bear_vol'] = be_pct
-                    results['vol_signal'] = "BULL" if b_pct > be_pct else "BEAR"
+                if cond_recency and cond_middle:
+                    results['1m_rsi_valid'] = "YES"
+                else:
+                    results['1m_rsi_valid'] = "NO"
+            
+            # --- 3. Volume Logic ---
+            bull = 0.0
+            bear = 0.0
+            for k in k_1m:
+                try:
+                    o = float(k[1])
+                    c = float(k[4])
+                    v = float(k[5]) 
+                    if c > o: 
+                        bull += v
+                    elif c < o: 
+                        bear += v
+                except:
+                    continue
+            
+            total = bull + bear
+            if total > 0:
+                b_pct = (bull / total) * 100
+                be_pct = (bear / total) * 100
+                results['bull_vol'] = b_pct
+                results['bear_vol'] = be_pct
+                results['vol_signal'] = "BULL" if b_pct > be_pct else "BEAR"
                     
-        except: pass
+        except Exception as e:
+            pass
 
     except Exception:
         pass
@@ -304,13 +328,11 @@ try:
         try:
             cycle_start = time.time()
             
-            # 1. Initialization
             list_all_pairs = trader.get_usdc_pairs()
             full_records = {}
             
             print(f"Scanning {len(list_all_pairs)} assets for full MTF data...")
 
-            # FULL SCAN
             results_list = []
             MAX_WORKERS = 5
             with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -323,7 +345,6 @@ try:
                     except Exception:
                         full_records[sym] = {} 
 
-            # PRINT TABLE
             print_dynamic_table(full_records)
             
             cycle_duration = time.time() - cycle_start
@@ -333,31 +354,27 @@ try:
             winners = []
             for s in list_all_pairs:
                 r = full_records[s]
-                # Check strict criteria
                 if (r.get('2h_trend') == 'PASS' and 
                     r.get('15m_trend') == 'PASS' and 
                     r.get('5m_trend') == 'PASS' and
                     r.get('5m_mid') == 'PASS' and
                     r.get('1m_struct_valid') == 'YES' and
+                    r.get('1m_rsi_valid') == 'YES' and 
                     r.get('vol_signal') == 'BULL'):
                     
                     winners.append(s)
             
             if winners:
-                # Pick lowest RSI among winners
                 valid_winners = []
                 for s in winners:
                     try:
-                        rsi_val = float(full_records[s]['1m_rsi'])
+                        rsi_str = r.get('1m_rsi', '100')
+                        rsi_val = float(rsi_str)
                         valid_winners.append((s, rsi_val))
                     except: pass
                 
                 valid_winners.sort(key=lambda x: x[1])
                 best_symbol = valid_winners[0][0]
-                
-                # ============================================
-                # CHANGE: EXIT INSTEAD OF TRADING
-                # ============================================
                 
                 print("\n" + "!"*60)
                 print(f" [!!!] BEST MTF DIP FOUND: {best_symbol} [!!!]")
@@ -365,15 +382,15 @@ try:
                 print("Criteria Met:")
                 print(f" - 2H/15M/5M Trend: PASS")
                 print(f" - 5M Midpoint: PASS")
-                print(f" - Structure: Valid")
+                # Updated description for clarity
+                print(f" - 1m Structure: Valid (Lowest Low occurred AFTER Highest High)")
+                print(f" - 1m RSI: {full_records[best_symbol]['1m_rsi']} (<50 & OS > OB)")
                 print(f" - Volume: Bullish")
-                print(f" - RSI: {full_records[best_symbol]['1m_rsi']}")
                 print("\n>>> SCRIPT EXITING. PLEASE ENTER TRADE MANUALLY. <<<")
                 
-                sys.exit(0) # Stop the script completely
+                sys.exit(0) 
                 
             else:
-                # No winner found, loop again after delay
                 print("No perfect setup found. Waiting 5s...")
                 time.sleep(5)
                 continue
