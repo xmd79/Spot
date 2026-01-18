@@ -213,17 +213,17 @@ def get_regression_breakout_status(close_array):
             return "PASS"
             
     except Exception as e:
-        # print(f"Regression Logic Error: {e}")
         pass
         
     return "FAIL"
 
 def analyze_single_asset(client, symbol):
+    # Initialize all keys with explicit defaults to ensure table is always populated
     results = {
         '2h_trend': 'FAIL', '15m_trend': 'FAIL', '5m_trend': 'FAIL', '5m_mid': 'FAIL',
         '1m_rsi': '-', '1m_rsi_valid': 'NO', 
         'argmin_price': None, 'argmax_price': None, '1m_struct_valid': 'NO',
-        'bull_vol': None, 'bear_vol': None, 'vol_signal': 'BEAR'
+        'bull_vol': 0.0, 'bear_vol': 0.0, 'vol_signal': 'N/A'
     }
     
     try:
@@ -233,7 +233,8 @@ def analyze_single_asset(client, symbol):
             if k_2h:
                 c_2h = np.array([float(k[4]) for k in k_2h])
                 results['2h_trend'] = get_regression_breakout_status(c_2h)
-        except: pass
+        except: 
+            results['2h_trend'] = "ERR"
 
         # --- 15M Analysis ---
         try:
@@ -241,7 +242,8 @@ def analyze_single_asset(client, symbol):
             if k_15m:
                 c_15m = np.array([float(k[4]) for k in k_15m])
                 results['15m_trend'] = get_regression_breakout_status(c_15m)
-        except: pass
+        except: 
+            results['15m_trend'] = "ERR"
 
         # --- 5M Analysis (Trend + Midpoint) ---
         try:
@@ -258,8 +260,11 @@ def analyze_single_asset(client, symbol):
                     middle_threshold = (val_max + val_min) / 2
                     is_mid = c_5m[-1] < middle_threshold and idx_min > idx_max
                     results['5m_mid'] = "PASS" if is_mid else "FAIL"
-                except: results['5m_mid'] = "FAIL"
-        except: pass
+                except: 
+                    results['5m_mid'] = "ERR"
+        except: 
+            results['5m_trend'] = "ERR"
+            results['5m_mid'] = "ERR"
 
         # --- 1M Analysis (Structure + RSI + Volume) ---
         try:
@@ -269,82 +274,92 @@ def analyze_single_asset(client, symbol):
             c_1m = np.array([float(k[4]) for k in k_1m])
             
             # --- 1. Structure Logic (Lowest Low vs Highest High) ---
-            # User Requirement: Compare Lowest Low of 1200 values vs Highest High of 1200 values.
-            # Check if Lowest Low is more recent than Highest High.
-            
-            val_min = np.min(c_1m) # Absolute Lowest Low value
-            val_max = np.max(c_1m) # Absolute Highest High value
-            
-            # Find indices. Use [-1] to get the most recent occurrence of these values
-            indices_min = np.where(c_1m == val_min)[0]
-            indices_max = np.where(c_1m == val_max)[0]
-            
-            if len(indices_min) > 0 and len(indices_max) > 0:
-                idx_min = indices_min[-1] # Most recent time Lowest Low occurred
-                idx_max = indices_max[-1] # Most recent time Highest High occurred
+            try:
+                val_min = np.min(c_1m) 
+                val_max = np.max(c_1m) 
                 
-                results['argmin_price'] = val_min
-                results['argmax_price'] = val_max
+                indices_min = np.where(c_1m == val_min)[0]
+                indices_max = np.where(c_1m == val_max)[0]
                 
-                # Condition: Lowest Low (idx_min) occurred AFTER Highest High (idx_max)
-                if idx_min > idx_max:
-                    results['1m_struct_valid'] = "YES"
-                else:
-                    results['1m_struct_valid'] = "NO"
+                if len(indices_min) > 0 and len(indices_max) > 0:
+                    idx_min = indices_min[-1] 
+                    idx_max = indices_max[-1] 
+                    
+                    results['argmin_price'] = val_min
+                    results['argmax_price'] = val_max
+                    
+                    if idx_min > idx_max:
+                        results['1m_struct_valid'] = "YES"
+                    else:
+                        results['1m_struct_valid'] = "NO"
+            except:
+                results['1m_struct_valid'] = "ERR"
             
             # --- 2. RSI Logic ---
-            rsi = ta.RSI(c_1m, timeperiod=14)
-            valid_rsi = rsi[np.logical_not(np.isnan(rsi))]
-            
-            if len(valid_rsi) > 0:
-                curr_rsi = valid_rsi[-1]
-                results['1m_rsi'] = f"{curr_rsi:.2f}"
+            try:
+                rsi = ta.RSI(c_1m, timeperiod=14)
+                valid_rsi = rsi[np.logical_not(np.isnan(rsi))]
                 
-                idx_oversold = -1
-                idx_overbought = -1
-                
-                # Iterate backwards to find most recent occurrences
-                for i in range(len(valid_rsi) - 1, -1, -1):
-                    if valid_rsi[i] < 30 and idx_oversold == -1: 
-                        idx_oversold = i
-                    if valid_rsi[i] > 70 and idx_overbought == -1: 
-                        idx_overbought = i
+                if len(valid_rsi) > 0:
+                    curr_rsi = valid_rsi[-1]
+                    results['1m_rsi'] = f"{curr_rsi:.2f}"
                     
-                    if idx_oversold != -1 and idx_overbought != -1:
-                        break
-                
-                cond_recency = (idx_oversold > idx_overbought) if (idx_oversold != -1 and idx_overbought != -1) else False
-                cond_middle = curr_rsi < 50.0
-                
-                if cond_recency and cond_middle:
-                    results['1m_rsi_valid'] = "YES"
+                    idx_oversold = -1
+                    idx_overbought = -1
+                    
+                    # Iterate backwards to find most recent occurrences
+                    for i in range(len(valid_rsi) - 1, -1, -1):
+                        if valid_rsi[i] < 30 and idx_oversold == -1: 
+                            idx_oversold = i
+                        if valid_rsi[i] > 70 and idx_overbought == -1: 
+                            idx_overbought = i
+                        
+                        if idx_oversold != -1 and idx_overbought != -1:
+                            break
+                    
+                    cond_recency = (idx_oversold > idx_overbought) if (idx_oversold != -1 and idx_overbought != -1) else False
+                    cond_middle = curr_rsi < 50.0
+                    
+                    if cond_recency and cond_middle:
+                        results['1m_rsi_valid'] = "YES"
+                    else:
+                        results['1m_rsi_valid'] = "NO"
                 else:
+                    results['1m_rsi'] = "-"
                     results['1m_rsi_valid'] = "NO"
+            except:
+                results['1m_rsi_valid'] = "ERR"
             
             # --- 3. Volume Logic ---
-            bull = 0.0
-            bear = 0.0
-            for k in k_1m:
-                try:
-                    o = float(k[1])
-                    c = float(k[4])
-                    v = float(k[5]) 
-                    if c > o: 
-                        bull += v
-                    elif c < o: 
-                        bear += v
-                except:
-                    continue
-            
-            total = bull + bear
-            if total > 0:
-                b_pct = (bull / total) * 100
-                be_pct = (bear / total) * 100
-                results['bull_vol'] = b_pct
-                results['bear_vol'] = be_pct
-                results['vol_signal'] = "BULL" if b_pct > be_pct else "BEAR"
+            try:
+                bull = 0.0
+                bear = 0.0
+                for k in k_1m:
+                    try:
+                        o = float(k[1])
+                        c = float(k[4])
+                        v = float(k[5]) 
+                        if c > o: 
+                            bull += v
+                        elif c < o: 
+                            bear += v
+                    except:
+                        continue
+                
+                total = bull + bear
+                if total > 0:
+                    b_pct = (bull / total) * 100
+                    be_pct = (bear / total) * 100
+                    results['bull_vol'] = b_pct
+                    results['bear_vol'] = be_pct
+                    results['vol_signal'] = "BULL" if b_pct > be_pct else "BEAR"
+                else:
+                    results['vol_signal'] = "FLAT"
+            except:
+                results['vol_signal'] = "ERR"
                     
-        except Exception as e:
+        except Exception:
+            # If 1m fetch fails, ensure structure and RSI remain defaults (NO/-)
             pass
 
     except Exception:
@@ -380,9 +395,27 @@ try:
                     sym = future_to_sym[future]
                     try:
                         data = future.result()
+                        # Ensure we always have a dict, even if the future raised an exception not caught inside
+                        if not isinstance(data, dict):
+                            data = {}
+                            data['2h_trend'] = 'CRASH'
+                            data['15m_trend'] = 'CRASH'
+                            data['5m_trend'] = 'CRASH'
+                            data['5m_mid'] = 'CRASH'
+                            data['1m_rsi'] = '-'
+                            data['1m_rsi_valid'] = 'NO'
+                            data['1m_struct_valid'] = 'NO'
+                            data['bull_vol'] = 0.0
+                            data['bear_vol'] = 0.0
+                            data['vol_signal'] = 'ERR'
                         full_records[sym] = data
                     except Exception:
-                        full_records[sym] = {} 
+                        # Fallback if result() itself fails
+                        full_records[sym] = {
+                            '2h_trend': 'ERR', '15m_trend': 'ERR', '5m_trend': 'ERR', '5m_mid': 'ERR',
+                            '1m_rsi': '-', '1m_rsi_valid': 'NO', '1m_struct_valid': 'NO',
+                            'bull_vol': 0.0, 'bear_vol': 0.0, 'vol_signal': 'ERR'
+                        }
 
             print_dynamic_table(full_records)
             
@@ -421,7 +454,6 @@ try:
                 print("Criteria Met:")
                 print(f" - 2H/15M/5M Trend: PASS (Reg Chan Logic)")
                 print(f" - 5M Midpoint: PASS")
-                # Updated description for clarity
                 print(f" - 1m Structure: Valid (Lowest Low occurred AFTER Highest High)")
                 print(f" - 1m RSI: {full_records[best_symbol]['1m_rsi']} (<50 & OS > OB)")
                 print(f" - Volume: Bullish")
