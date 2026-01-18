@@ -147,61 +147,63 @@ def print_dynamic_table(full_records):
 
 def get_regression_breakout_status(close_array):
     """
-    New Logic: 
-    Regression Channel with length 360 (SMA length equivalent lookback).
-    1. Calculate Linear Regression Line and Standard Deviation Channel (2 SD).
-    2. Find lowest low below Lower Channel.
-    3. Find highest high above Upper Channel.
-    4. Condition: Lowest Low is most recent (after Highest High).
-    5. Condition: Current Close is closer to Lowest Low than Highest High.
+    Updated Logic:
+    1. Takes input array (expected 1200 values).
+    2. Uses Length (Lookback) = 360 for the Regression Channel calculation.
+    3. Uses Method 1 (Standard Deviation) to define Upper/Lower channels.
     """
     try:
         lookback = 360
+        
+        # Ensure we have enough data (at least 360)
         if len(close_array) < lookback:
             return "FAIL"
         
-        # Analyze last 360 candles
+        # Analyze the last 360 candles of the 1200 values
         y = close_array[-lookback:]
         x = np.arange(len(y))
         
-        # 1. Linear Regression (Polyfit)
-        # y = mx + c
+        # --- Core Components: Linear Regression Line (Midline) ---
+        # Formula: y = a + bx
+        # Calculate slope (b) and intercept (a)
         slope, intercept = np.polyfit(x, y, 1)
         regression_line = slope * x + intercept
         
-        # 2. Calculate Channel (Standard Deviation)
-        # Calculate standard deviation of the distance from the regression line
+        # --- Core Components: Upper & Lower Channel Lines ---
+        # Method 1: Standard Deviation
+        # Calculate distance of price from regression line
         residuals = y - regression_line
+        
+        # Calculate Standard Deviation (Sigma)
         std_dev = np.std(residuals)
         
-        # Define Upper and Lower Channels
-        # Using 2 Standard Deviations for the channel width
+        # Define Channels: Line +/- 2 Standard Deviations
         lower_channel = regression_line - (2 * std_dev)
         upper_channel = regression_line + (2 * std_dev)
         
-        # 3. Identify Breaches
-        # Indices where price closed BELOW the lower channel (The Dips)
+        # --- Breach Detection (Support/Resistance Logic) ---
+        # Indices where price closed BELOW the lower channel (The Dips/Flush)
         indices_low_breach = np.where(y < lower_channel)[0]
         
-        # Indices where price closed ABOVE the upper channel (The Spikes)
+        # Indices where price closed ABOVE the upper channel (The Spikes/Overextension)
         indices_high_breach = np.where(y > upper_channel)[0]
         
-        # If we haven't hit both boundaries, we can't determine the specific structure requested
+        # If we haven't hit both boundaries, the setup isn't valid
         if len(indices_low_breach) == 0 or len(indices_high_breach) == 0:
             return "FAIL"
             
-        # 4. Get Most Recent Occurrences
-        # The most recent dip
+        # --- Reversal Signal Logic ---
+        # Condition 1: Recency
+        # The most recent dip (last_low_idx) must be more recent than the last spike (last_high_idx)
         last_low_idx = indices_low_breach[-1]
-        # The most recent spike
         last_high_idx = indices_high_breach[-1]
         
-        # 5. Check Recency: "lowest low below regression channel lowest line is most recent"
-        # The dip must have happened AFTER the spike
         if last_low_idx <= last_high_idx:
             return "FAIL"
         
-        # 6. Check Distance: "current close distance to lowest low ... < dist to highest high"
+        # Condition 2: Overbought/Oversold Confirmation (Distance)
+        # Current Close distance to the Low Breach < Distance to High Breach
+        # This confirms we are currently sitting at the "dip" level, not recovering from it
         current_close = y[-1]
         price_at_low = y[last_low_idx]
         price_at_high = y[last_high_idx]
@@ -213,6 +215,7 @@ def get_regression_breakout_status(close_array):
             return "PASS"
             
     except Exception as e:
+        # print(f"Regression Logic Error: {e}")
         pass
         
     return "FAIL"
@@ -227,7 +230,7 @@ def analyze_single_asset(client, symbol):
     }
     
     try:
-        # --- 2H Analysis ---
+        # --- 2H Analysis (Fetch 1200, Use Last 360) ---
         try:
             k_2h = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_2HOUR, limit=1200)
             if k_2h:
@@ -236,7 +239,7 @@ def analyze_single_asset(client, symbol):
         except: 
             results['2h_trend'] = "ERR"
 
-        # --- 15M Analysis ---
+        # --- 15M Analysis (Fetch 1200, Use Last 360) ---
         try:
             k_15m = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_15MINUTE, limit=1200)
             if k_15m:
@@ -245,7 +248,7 @@ def analyze_single_asset(client, symbol):
         except: 
             results['15m_trend'] = "ERR"
 
-        # --- 5M Analysis (Trend + Midpoint) ---
+        # --- 5M Analysis (Fetch 1200, Use Last 360) ---
         try:
             k_5m = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_5MINUTE, limit=1200)
             if k_5m:
@@ -268,6 +271,7 @@ def analyze_single_asset(client, symbol):
 
         # --- 1M Analysis (Structure + RSI + Volume) ---
         try:
+            # 1M timeframe keeps limit 1200 as standard for high res data
             k_1m = client.get_klines(symbol=symbol, interval=Client.KLINE_INTERVAL_1MINUTE, limit=1200)
             if not k_1m: raise ValueError("No 1m data")
             
