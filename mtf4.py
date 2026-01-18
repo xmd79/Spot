@@ -146,37 +146,76 @@ def print_dynamic_table(full_records):
 # --- Analysis Logic ---
 
 def get_regression_breakout_status(close_array):
+    """
+    New Logic: 
+    Regression Channel with length 360 (SMA length equivalent lookback).
+    1. Calculate Linear Regression Line and Standard Deviation Channel (2 SD).
+    2. Find lowest low below Lower Channel.
+    3. Find highest high above Upper Channel.
+    4. Condition: Lowest Low is most recent (after Highest High).
+    5. Condition: Current Close is closer to Lowest Low than Highest High.
+    """
     try:
-        if len(close_array) < 50: return "FAIL"
+        lookback = 360
+        if len(close_array) < lookback:
+            return "FAIL"
         
-        y = range(len(close_array))
-        try:
-            slope, intercept = np.polyfit(y, close_array, 1)
-        except:
+        # Analyze last 360 candles
+        y = close_array[-lookback:]
+        x = np.arange(len(y))
+        
+        # 1. Linear Regression (Polyfit)
+        # y = mx + c
+        slope, intercept = np.polyfit(x, y, 1)
+        regression_line = slope * x + intercept
+        
+        # 2. Calculate Channel (Standard Deviation)
+        # Calculate standard deviation of the distance from the regression line
+        residuals = y - regression_line
+        std_dev = np.std(residuals)
+        
+        # Define Upper and Lower Channels
+        # Using 2 Standard Deviations for the channel width
+        lower_channel = regression_line - (2 * std_dev)
+        upper_channel = regression_line + (2 * std_dev)
+        
+        # 3. Identify Breaches
+        # Indices where price closed BELOW the lower channel (The Dips)
+        indices_low_breach = np.where(y < lower_channel)[0]
+        
+        # Indices where price closed ABOVE the upper channel (The Spikes)
+        indices_high_breach = np.where(y > upper_channel)[0]
+        
+        # If we haven't hit both boundaries, we can't determine the specific structure requested
+        if len(indices_low_breach) == 0 or len(indices_high_breach) == 0:
             return "FAIL"
             
-        line_values = slope * y + intercept
+        # 4. Get Most Recent Occurrences
+        # The most recent dip
+        last_low_idx = indices_low_breach[-1]
+        # The most recent spike
+        last_high_idx = indices_high_breach[-1]
         
-        below_mask = close_array < line_values
-        above_mask = close_array > line_values
+        # 5. Check Recency: "lowest low below regression channel lowest line is most recent"
+        # The dip must have happened AFTER the spike
+        if last_low_idx <= last_high_idx:
+            return "FAIL"
         
-        if not np.any(below_mask): return "FAIL"
-        if not np.any(above_mask): return "FAIL"
+        # 6. Check Distance: "current close distance to lowest low ... < dist to highest high"
+        current_close = y[-1]
+        price_at_low = y[last_low_idx]
+        price_at_high = y[last_high_idx]
         
-        # Get Most Recent index of values below line vs above line
-        values_below = close_array[below_mask]
-        min_val_below = np.min(values_below)
-        idx_min_below = np.where(close_array == min_val_below)[0][-1]
+        dist_to_low = abs(current_close - price_at_low)
+        dist_to_high = abs(current_close - price_at_high)
         
-        values_above = close_array[above_mask]
-        max_val_above = np.max(values_above)
-        idx_max_above = np.where(close_array == max_val_above)[0][-1]
-        
-        if idx_min_below > idx_max_above:
+        if dist_to_low < dist_to_high:
             return "PASS"
             
-    except Exception:
+    except Exception as e:
+        # print(f"Regression Logic Error: {e}")
         pass
+        
     return "FAIL"
 
 def analyze_single_asset(client, symbol):
@@ -380,7 +419,7 @@ try:
                 print(f" [!!!] BEST MTF DIP FOUND: {best_symbol} [!!!]")
                 print("!"*60)
                 print("Criteria Met:")
-                print(f" - 2H/15M/5M Trend: PASS")
+                print(f" - 2H/15M/5M Trend: PASS (Reg Chan Logic)")
                 print(f" - 5M Midpoint: PASS")
                 # Updated description for clarity
                 print(f" - 1m Structure: Valid (Lowest Low occurred AFTER Highest High)")
