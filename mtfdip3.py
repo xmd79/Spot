@@ -13,8 +13,8 @@ import time
 
 # --- CONFIGURATION ---
 LOOKBACK_LENGTH = 100  # Last 100 values to check
-MIN_REQUIRED_SAMPLES = 20 # Minimum to attempt calculation
-STD_DEV_MULTIPLIER = 2.0 # Multiplier 2.0 as requested
+MIN_REQUIRED_SAMPLES = 20 # Minimum candles to perform regression calculation
+STD_DEV_MULTIPLIER = 1.0 # Multiplier 1.0 (1 Deviation) as requested
 SLEEP_TIME = 5 
 # ---------------------
 
@@ -123,116 +123,7 @@ class Trader:
         except:
             return 0.0
 
-# --- CORE STRUCTURE LOGIC (STRICT BREACHES) ---
-
-def check_trend_structure(prices):
-    """
-    Calculates Global ArgMin and ArgMax based on last 100 candles (or max available).
-    STRICT LOGIC:
-    1. ArgMin MUST be below Lower Band.
-    2. ArgMax MUST be above Upper Band.
-    3. ArgMin (Dip) must be more recent than ArgMax (Peak).
-    4. Current Close MUST be below Middle Line.
-    """
-    default_resp = {
-        'pass': False, 
-        'reason': 'NO_DATA', 
-        'current': 0, 'middle': 0, 'lower': 0, 'upper': 0, 
-        'position': 'N/A', 'argmin': 0, 'argmax': 0, 'last_event': 'N/A'
-    }
-
-    if not prices or len(prices) < MIN_REQUIRED_SAMPLES:
-        return {**default_resp, 'reason': 'INSUFFICIENT_DATA'}
-    
-    try:
-        # Dynamic Lookback: Use LOOKBACK_LENGTH or available data (up to LOOKBACK_LENGTH)
-        # If we have less than LOOKBACK_LENGTH (e.g. new token), we use all available.
-        prices_recent = np.asarray(prices[-LOOKBACK_LENGTH:])
-        x = np.arange(len(prices_recent))
-        y = prices_recent
-        
-        # 1. Calculate Linear Regression
-        m, b = np.polyfit(x, y, 1)
-        middle_line = m * x + b
-        
-        # 2. Calculate Standard Deviation
-        residuals = y - middle_line
-        std_dev = np.std(residuals, ddof=1) 
-        
-        if std_dev == 0:
-            return {**default_resp, 'reason': 'FLAT_LINE'}
-
-        # 3. Define Bands (Multiplier 2.0)
-        lower_band = middle_line - (STD_DEV_MULTIPLIER * std_dev)
-        upper_band = middle_line + (STD_DEV_MULTIPLIER * std_dev)
-        
-        # 4. Current Values
-        current_price = y[-1]
-        current_middle = middle_line[-1]
-        current_lower = lower_band[-1]
-        current_upper = upper_band[-1]
-        
-        # 5. Position Status
-        position_status = "ABOVE" if current_price >= current_middle else "BELOW"
-        
-        # 6. FIND GLOBAL EXTREMAS (ARGMIN / ARGMAX)
-        global_min_idx = np.argmin(y)
-        global_max_idx = np.argmax(y)
-        
-        argmin_val = y[global_min_idx]
-        argmax_val = y[global_max_idx]
-        
-        # 7. STRICT BREACH CHECKS
-        # Check A: Is ArgMin STRICTLY below the Lower Band at that time?
-        is_argmin_dip = argmin_val < lower_band[global_min_idx]
-        # Check B: Is ArgMax STRICTLY above the Upper Band at that time?
-        is_argmax_peak = argmax_val > upper_band[global_max_idx]
-        
-        if not is_argmin_dip:
-            return {
-                'pass': False, 'reason': 'MIN_NOT_BELOW',
-                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
-                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'N/A'
-            }
-            
-        if not is_argmax_peak:
-            return {
-                'pass': False, 'reason': 'MAX_NOT_ABOVE',
-                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
-                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'N/A'
-            }
-
-        # 8. RECENCY CHECK (CIRCUIT)
-        # We want ArgMin (Dip) to be more recent than ArgMax (Peak)
-        if global_min_idx <= global_max_idx:
-            # Peak is recent or equal -> Fail
-            return {
-                'pass': False, 'reason': 'RECENT_PEAK',
-                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
-                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'ARGMAX'
-            }
-        
-        # 9. CURRENT POSITION CHECK
-        # Current Price must be below Middle Line
-        if position_status == "ABOVE":
-            return {
-                'pass': False, 'reason': 'CURRENT_ABOVE_MIDDLE',
-                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
-                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'ARGMIN'
-            }
-        
-        # ALL CHECKS PASSED
-        return {
-            'pass': True, 
-            'reason': 'PASS',
-            'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
-            'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'ARGMIN'
-        }
-        
-    except Exception as e:
-        return {**default_resp, 'reason': f"ERROR: {str(e)[:20]}"}
-
-# --- FFT FORECAST LOGIC ---
+# --- FFT FORECAST LOGIC (ADDED FUNCTION) ---
 
 def calculate_fft_forecast(prices):
     """
@@ -259,15 +150,15 @@ def calculate_fft_forecast(prices):
         # The last real value of the smoothed signal is our "current trend" value
         current_trend_val = smoothed_signal[-1].real
         
-        # Simple projection: use the momentum of the smoothed signal
-        # If the last value of smoothed signal is higher than the previous, it's bullish
+        # Simple projection: use momentum of the smoothed signal
+        # If the last value of smoothed signal is higher than previous, it's bullish
         momentum = current_trend_val - smoothed_signal[-2].real
         
-        # Forecasted next price (Linear projection based on smoothed momentum)
+        # Forecast next price (Linear projection based on smoothed momentum)
         forecast = current_trend_val + momentum
         
         # Check for "Imminent Spike"
-        # If the forecast is significantly higher than current actual price
+        # If the forecast is significantly higher than the current actual price
         current_actual = recent_prices[-1]
         spike_confirmed = (forecast > current_actual * 1.005) # 0.5% projected rise threshold
         
@@ -275,6 +166,120 @@ def calculate_fft_forecast(prices):
         
     except:
         return 0.0, False
+
+# --- CORE STRUCTURE LOGIC (STRICT BREACHES) ---
+
+def check_trend_structure(prices):
+    """
+    Calculates Global ArgMin and ArgMax based on last 100 candles (or max available).
+    STRICT LOGIC with STD_DEV_MULTIPLIER = 1.0:
+    1. ArgMin MUST be below Lower Band (1.0 * StdDev).
+    2. ArgMax MUST be above Upper Band (1.0 * StdDev).
+    3. ArgMin (Dip) must be more recent than ArgMax (Peak).
+    4. Current Close MUST be below Middle Line.
+    """
+    default_resp = {
+        'pass': False, 
+        'reason': 'NO_DATA', 
+        'current': 0, 'middle': 0, 'lower': 0, 'upper': 0, 
+        'position': 'N/A', 'argmin': 0, 'argmax': 0, 'last_event': 'N/A'
+    }
+
+    if not prices or len(prices) < MIN_REQUIRED_SAMPLES:
+        return {**default_resp, 'reason': 'INSUFFICIENT_DATA'}
+    
+    try:
+        # Dynamic Lookback: Use LOOKBACK_LENGTH or available data
+        prices_recent = np.asarray(prices[-LOOKBACK_LENGTH:])
+        x = np.arange(len(prices_recent))
+        y = prices_recent
+        
+        # 1. Calculate Linear Regression
+        m, b = np.polyfit(x, y, 1)
+        middle_line = m * x + b
+        
+        # 2. Calculate Standard Deviation
+        residuals = y - middle_line
+        std_dev = np.std(residuals, ddof=1) 
+        
+        if std_dev == 0:
+            return {**default_resp, 'reason': 'FLAT_LINE'}
+
+        # 3. Define Bands (Using 1.0 Multiplier)
+        lower_band = middle_line - (STD_DEV_MULTIPLIER * std_dev)
+        upper_band = middle_line + (STD_DEV_MULTIPLIER * std_dev)
+        
+        # 4. Current Values
+        current_price = y[-1]
+        current_middle = middle_line[-1]
+        current_lower = lower_band[-1]
+        current_upper = upper_band[-1]
+        
+        # 5. Position Status
+        position_status = "ABOVE" if current_price >= current_middle else "BELOW"
+        
+        # 6. FIND GLOBAL EXTREMAS (ARGMIN / ARGMAX)
+        global_min_idx = np.argmin(y)
+        global_max_idx = np.argmax(y)
+        
+        argmin_val = y[global_min_idx]
+        argmax_val = y[global_max_idx]
+        
+        # 7. STRICT BREACH CHECKS
+        # Check A: Is ArgMin STRICTLY below Lower Band at that time?
+        is_argmin_dip = argmin_val < lower_band[global_min_idx]
+        # Check B: Is ArgMax STRICTLY above Upper Band at that time?
+        is_argmax_peak = argmax_val > upper_band[global_max_idx]
+        
+        if not is_argmin_dip:
+            return {
+                'pass': False, 'reason': 'MIN_NOT_BELOW',
+                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
+                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'N/A'
+            }
+            
+        if not is_argmax_peak:
+            return {
+                'pass': False, 'reason': 'MAX_NOT_ABOVE',
+                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
+                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'N/A'
+            }
+
+        # 8. RECENCY CHECK (CIRCUIT)
+        # We want ArgMin (Dip) to be most recent event.
+        if global_min_idx <= global_max_idx:
+            # Peak is recent or equal -> Fail
+            return {
+                'pass': False, 'reason': 'RECENT_PEAK',
+                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
+                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'ARGMAX'
+            }
+        
+        # 9. CURRENT POSITION CHECK
+        # Current Price must be below Middle Line
+        if position_status == "ABOVE":
+            return {
+                'pass': False, 'reason': 'CURRENT_ABOVE_MIDDLE',
+                'current': current_price, 'middle': current_middle, 'lower': current_lower, 'upper': current_upper,
+                'position': position_status, 'argmin': argmin_val, 'argmax': argmax_val, 'last_event': 'ARGMIN'
+            }
+        
+        # ALL CHECKS PASSED
+        return {
+            'pass': True, 
+            'reason': 'PASS',
+            'current': current_price,
+            'middle': current_middle,
+            'lower': current_lower,
+            'upper': current_upper,
+            'position': position_status,
+            'argmin': argmin_val,
+            'argmax': argmax_val,
+            'last_event': 'ARGMIN'
+        }
+        
+    except Exception as e:
+        return {**default_resp, 'reason': f"ERROR: {str(e)[:20]}"}
 
 # --- FILTER FUNCTIONS ---
 
@@ -377,19 +382,23 @@ def sine_sorter_1m(standardized_symbol):
         klines = trader.safe_get_klines(symbol=original_symbol, interval=interval)
         if klines:
             close = [float(entry[4]) for entry in klines]
+            close_array = np.asarray(close)
             
-            # HT_SINE Calculation
-            if len(close) >= 200:
-                close_array = np.asarray(close)
+            if len(close_array) >= 200:
                 sine, _ = ta.HT_SINE(close_array)
                 valid_mask = (~np.isnan(sine)) & (sine != 0)
                 clean_sine = sine[valid_mask]
                 current_sine = clean_sine[-1] if len(clean_sine) > 0 else 0
                 
+                # --- CALL FFT FORECAST HERE ---
+                fft_price, fft_spike = calculate_fft_forecast(close)
+                
                 with locks[3]:
                     filtered_pairs_final.append(standardized_symbol)
                     results_map[standardized_symbol]['sine'] = float(current_sine)
                     results_map[standardized_symbol]['1m_close_list'] = close # Store for FFT later
+                    results_map[standardized_symbol]['fft_forecast'] = fft_price
+                    results_map[standardized_symbol]['fft_spike'] = fft_spike
             else:
                 with locks[3]:
                     results_map[standardized_symbol]['sine'] = None
@@ -406,7 +415,9 @@ def initialize_results_map(symbol_list):
                 '5m_data': None,
                 '3m_data': None,
                 'sine': None,
-                '1m_close_list': None
+                '1m_close_list': None,
+                'fft_forecast': None,
+                'fft_spike': False
             }
 
 def print_consolidated_report(tf_name, scanned_list):
@@ -560,19 +571,20 @@ def main():
                 # --- FFT FORECAST FOR THE WINNER ---
                 best_std, best_sine = sorted_candidates[0]
                 best_orig = symbol_map[best_std]
-                close_list_1m = results_map[best_std].get('1m_close_list', [])
                 
                 print(f"\n🏆 TOP SELECTION: {best_std} (Original: {best_orig})")
                 print(f"{'='*70}")
                 print("📡 FFT FORECAST ANALYSIS (Imminent Spike Detection)")
                 print(f"{'='*70}")
                 
-                forecast_price, spike_detected = calculate_fft_forecast(close_list_1m)
+                fft_price = results_map[best_std].get('fft_forecast', 0.0)
+                fft_spike = results_map[best_std].get('fft_spike', False)
+                current_best = results_map[best_std].get('1m_close_list', [0])[-1]
                 
-                print(f"Current Price:    {close_list_1m[-1]:.25f}")
-                print(f"FFT Projection:   {forecast_price:.25f}")
+                print(f"Current Price:    {current_best:.25f}")
+                print(f"FFT Projection:   {fft_price:.25f}")
                 
-                if spike_detected:
+                if fft_spike:
                     print(f"🚨 STATUS: 🚨 IMMINENT SPIKE DETECTED! 🚨")
                 else:
                     print(f"STATUS: 📊 Stabilization / No immediate spike projected.")
