@@ -46,7 +46,10 @@ EPSILON = math.radians(23.44)
 # ==========================================
 
 def to_geocentric(body):
-    """Manually converts Equatorial RA/Dec to Ecliptic Longitude."""
+    """
+    Manually converts Equatorial RA/Dec to Ecliptic Longitude.
+    Mathematically accurate conversion to Tropical Zodiac.
+    """
     try:
         ra = body.ra 
         dec = body.dec
@@ -78,6 +81,28 @@ def get_planetary_hour_ruler(dt):
     hour_num = int(dt.hour) 
     ruler_index = (start_index + hour_num) % 7
     return PLANETARY_HOUR_ORDER[ruler_index]
+
+def get_duration_str(tf, candles):
+    """Helper to convert TF + Candle count to human readable duration."""
+    tf_minutes = {
+        '1m': 1, '3m': 3, '5m': 5, '15m': 15, '30m': 30,
+        '1h': 60, '2h': 120, '4h': 240, '12h': 720,
+        '1d': 1440, '1w': 10080
+    }
+    
+    if tf not in tf_minutes: return "Unknown"
+    total_minutes = tf_minutes[tf] * candles
+    
+    days = total_minutes // 1440
+    hours = (total_minutes % 1440) // 60
+    minutes = total_minutes % 60
+    
+    parts = []
+    if days > 0: parts.append(f"{days}d")
+    if hours > 0: parts.append(f"{hours}h")
+    if minutes > 0: parts.append(f"{minutes}m")
+    
+    return "".join(parts) if parts else "0m"
 
 # ==========================================
 # 3. CLASS DEFINITIONS
@@ -137,9 +162,9 @@ class CelestialBody:
 class MarketEngine:
     def __init__(self):
         self.client = Client("", "")
-        # Storage structure: { '1h': { 'Fast': model, 'Medium': model ... }, '4h': ... }
         self.models = {}
-        self.scalers = {}
+        self.scalers_x = {} 
+        self.scalers_y = {}
 
     def fetch_data(self, symbol='BTCUSDC', interval='1h', limit=1000):
         try:
@@ -155,7 +180,6 @@ class MarketEngine:
             return pd.DataFrame()
 
     def calculate_technicals(self, df):
-        """Calculates technicals on provided dataframe."""
         if df.empty: return df
         delta = df['close'].diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -176,19 +200,20 @@ class MarketEngine:
         df['Lagged_Close'] = df['close'].shift(1)
         return df.dropna().reset_index(drop=True)
 
+    def get_gann_sr_levels(self, price):
+        """Calculates Gann Square Support and Resistance."""
+        sqrt_price = math.sqrt(price)
+        res_1 = (sqrt_price + 1)**2
+        sup_1 = (sqrt_price - 1)**2
+        res_2 = (sqrt_price + 2)**2
+        sup_2 = (sqrt_price - 2)**2
+        return res_1, res_2, sup_1, sup_2
+
     def train_and_predict_tf(self, df, tf_name):
-        """
-        Trains models specifically for the passed Timeframe (df).
-        Returns a dictionary of predictions for Fast, Med, Large.
-        """
         if df.empty or 'close' not in df.columns:
             return None
 
-        print(f"    [ML] Training model for {tf_name}...", end="\r")
-        
         df_train = df.copy()
-        # Define Targets (Fixed candle shifts regardless of TF)
-        # Fast = 4 candles, Med = 24 candles, Large = 168 candles
         df_train['Target_Fast'] = df_train['close'].shift(-4)
         df_train['Target_Med'] = df_train['close'].shift(-24)
         df_train['Target_Large'] = df_train['close'].shift(-168)
@@ -196,126 +221,117 @@ class MarketEngine:
         features = ['RSI', 'sine', 'Returns', 'Lagged_Close']
         
         tf_models = {}
-        tf_scalers = {}
+        tf_scalers_x = {}
+        tf_scalers_y = {}
         predictions = {}
 
         targets_map = {'Fast': df_train['Target_Fast'], 'Medium': df_train['Target_Med'], 'Large': df_train['Target_Large']}
         
-        # Train separate models for each horizon
         for name, y in targets_map.items():
             temp_df = pd.concat([df_train[features], y], axis=1).dropna()
             
-            # Ensure we have enough data
-            if len(temp_df) < 50: 
-                continue
+            if len(temp_df) < 100: continue
             
             X_train = temp_df[features].values
             y_train = temp_df[y.name].values
             
-            scaler = MinMaxScaler()
-            X_scaled = scaler.fit_transform(X_train)
+            scaler_x = MinMaxScaler()
+            X_scaled = scaler_x.fit_transform(X_train)
             
-            # Reduced max_iter to 500 for speed across multiple TFs
-            model = MLPRegressor(hidden_layer_sizes=(50, 25), max_iter=500, random_state=42)
-            model.fit(X_scaled, y_train)
+            scaler_y = MinMaxScaler()
+            y_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+            
+            model = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=1000, random_state=42, early_stopping=True)
+            model.fit(X_scaled, y_scaled)
             
             tf_models[name] = model
-            tf_scalers[name] = scaler
+            tf_scalers_x[name] = scaler_x
+            tf_scalers_y[name] = scaler_y
 
-        # Save for potential later use
-        self.models[tf_name] = tf_models
-        self.scalers[tf_name] = tf_scalers
+        self.scalers_x[tf_name] = tf_scalers_x
+        self.scalers_y[tf_name] = tf_scalers_y
 
-        # Generate Predictions using the most recent data point
-        # We use the 'Fast' scaler (shortest term) to normalize input features, as it's most sensitive to immediate changes
-        if 'Fast' in tf_scalers:
+        if 'Fast' in tf_scalers_x:
             last_row = df.iloc[-1:][features].values
-            X_input = tf_scalers['Fast'].transform(last_row)
+            X_input = tf_scalers_x['Fast'].transform(last_row)
             
             for name in ['Fast', 'Medium', 'Large']:
                 if name in tf_models:
-                    pred = tf_models[name].predict(X_input)[0]
-                    predictions[name] = pred
+                    pred_scaled = tf_models[name].predict(X_input)
+                    pred_real = tf_scalers_y[name].inverse_transform(pred_scaled.reshape(-1, 1))[0][0]
+                    predictions[name] = pred_real
         
-        print(f"    [ML] Training model for {tf_name}... DONE")
         return predictions
 
     def detect_gann_cycle(self, df):
-        """
-        Refines Gann Logic:
-        1. Distinguishes Accumulation (Buying at Dip) vs Distribution (Selling at Peak).
-        2. Returns Gann Level, Structural Status, and Argument.
-        """
-        if len(df) < 50: return "NEUTRAL", 0, 0, "No Data", "NEUTRAL"
+        if len(df) < 50: return "NEUTRAL", 0, 0, "No Data", "NEUTRAL", "N/A"
         
-        recent = df.tail(1000)
+        lookback = min(500, len(df))
+        recent = df.tail(lookback)
+        
         max_idx = recent['high'].idxmax()
         min_idx = recent['low'].idxmin()
         max_price = recent['high'].max()
         min_price = recent['low'].min()
-        current_price = df['close'].iloc[-1]
         
         is_low_recent = min_idx > max_idx
-        is_high_recent = max_idx > min_idx
         
         status = "NEUTRAL"
-        gann_level = 0
         arg_desc = ""
-        structural_status = "NEUTRAL" 
+        structural_status = "NEUTRAL"
+        extrema_status = "UNKNOWN"
         
         swing_size = max_price - min_price
         
         if is_low_recent:
-            gann_level_up = min_price + swing_size
-            if current_price > gann_level_up:
-                status = "UP CYCLE"
-                arg_desc = f"Breaking {gann_level_up:.0f}"
-                structural_status = "ACCUMULATION (Dip Zone)"
-            elif current_price < min_price:
-                status = "EXTENSION"
-                arg_desc = f"Below {min_price:.0f}"
-                structural_status = "EXTENSION (Bear Trap)"
+            extrema_status = "LOW RECENT (Dip)"
+            if df['close'].iloc[-1] > min_price + (swing_size * 0.5):
+                status = "RECOVERY"
+                structural_status = "ACCUMULATION (Rebound)"
             else:
-                status = "ACCUMULATION (Choppy)"
-                arg_desc = "Ranging at Bottom"
-                structural_status = "ACCUMULATION (Waiting)"
+                status = "BOTTOMING"
+                structural_status = "ACCUMULATION (Dip)"
         else:
-            gann_level_down = max_price - swing_size
-            if current_price < gann_level_down:
-                status = "DOWN CYCLE"
-                arg_desc = f"Breaking {gann_level_down:.0f}"
-                structural_status = "DISTRIBUTION (Peak Zone)"
-            elif current_price > max_price:
-                status = "EXTENSION"
-                arg_desc = f"Above {max_price:.0f}"
-                structural_status = "EXTENSION (Bull Trap)"
+            extrema_status = "HIGH RECENT (Peak)"
+            if df['close'].iloc[-1] < max_price - (swing_size * 0.5):
+                status = "DISTRIBUTION"
+                structural_status = "DISTRIBUTION (Falling)"
             else:
-                status = "DISTRIBUTION (Choppy)"
-                arg_desc = "Ranging at Top"
-                structural_status = "DISTRIBUTION (Waiting)"
-        
-        return status, gann_level, arg_desc, structural_status
+                status = "TOPPING"
+                structural_status = "DISTRIBUTION (High)"
+
+        return status, swing_size, max_price, min_price, structural_status, extrema_status
 
     def get_fear_greed(self, df):
         if df.empty: return 50, "NEUTRAL"
-        rsi = df['RSI'].iloc[-1]
-        volatility = df['Returns'].std()
-        score = 50
-        if rsi > 70: score += 30 
-        if rsi < 30: score -= 30 
-        if volatility > 0.015: score -= 10 
-        score = max(0, min(100, score)) 
-        sentiment = "EXTREME GREED" if score > 75 else "GREED" if score > 55 else "NEUTRAL" if score > 45 else "FEAR" if score > 25 else "EXTREME FEAR"
-        return score, sentiment
+        try:
+            rsi = df['RSI'].iloc[-1]
+            volatility = df['Returns'].std()
+            score = 50
+            if rsi > 70: score += 30 
+            if rsi < 30: score -= 30 
+            if volatility > 0.015: score -= 10 
+            score = max(0, min(100, score)) 
+            
+            if score > 75: sentiment = "EXTREME GREED"
+            elif score > 55: sentiment = "GREED"
+            elif score > 45: sentiment = "NEUTRAL"
+            elif score > 25: sentiment = "FEAR"
+            else: sentiment = "EXTREME FEAR"
+            return score, sentiment
+        except:
+            return 50, "ERROR"
 
 # ==========================================
 # 5. GEOLOCATION & TIME SYNC
 # ==========================================
 
 def get_utc_now():
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    # CHANGE: Return specific target date to match user request
+    # To return to real time, use: return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime(2026, 1, 30, 2, 27, 57, tzinfo=timezone.utc).replace(tzinfo=None)
 
-def get_observer_data():
+def get_observer_data(target_time):
     sources = ["https://ipapi.co/json/", "http://ip-api.com/json/", "https://ipwho.is/"]
     lat, lon, city, tz_str = None, None, None, None
     
@@ -345,7 +361,9 @@ def get_observer_data():
     observer.lat = str(lat)
     observer.lon = str(lon)
     observer.elevation = 0
-    live_time_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    
+    # IMPORTANT: Use the passed target_time, not 'now'
+    live_time_utc = target_time
     observer.date = live_time_utc
     
     try:
@@ -359,44 +377,55 @@ def get_observer_data():
     return observer, local_time, city, live_time_utc
 
 # ==========================================
-# 6. ASTRO & GANN LOGIC
+# 6. ASTRO & GANN LOGIC (FIXED)
 # ==========================================
 
 def calculate_aspects(bodies):
     major_aspects = {0: "Conj", 60: "Sextile", 90: "Square", 120: "Trine", 180: "Opp"}
-    orb_limit = 6 
-    for i, b1 in enumerate(bodies):
-        for j, b2 in enumerate(bodies):
-            if i >= j: continue
+    orb_limit = 8 
+    
+    for i in range(len(bodies)):
+        for j in range(i + 1, len(bodies)):
+            
+            b1 = bodies[i]
+            b2 = bodies[j]
+            
             diff = abs(b1.lon - b2.lon)
             if diff > 180: diff = 360 - diff
+            
             found_aspect = None
             for angle, name in major_aspects.items():
                 if abs(diff - angle) <= orb_limit:
                     found_aspect = name
                     orb_used = abs(diff - angle)
                     break
+            
             if found_aspect:
-                asp_str = f"{found_aspect} {b2.name} ({orb_used:.1f}°)"
-                b1.current_aspects.append(asp_str)
-                b2.current_aspects.append(asp_str)
+                asp_str_for_b1 = f"{found_aspect} {b2.name} ({orb_used:.1f}°)"
+                asp_str_for_b2 = f"{found_aspect} {b1.name} ({orb_used:.1f}°)"
+                
+                b1.current_aspects.append(asp_str_for_b1)
+                b2.current_aspects.append(asp_str_for_b2)
 
 # ==========================================
 # 7. MAIN EXECUTION
 # ==========================================
 
 def main():
-    print("\n" + "="*80)
-    print("  KABBALISTIC-QUANTUM ASTRO-MARKET ENGINE (BTC/USDC) - MULTI-TF")
-    print("="*80)
+    print("\n" + "="*110)
+    print("  KABBALISTIC-QUANTUM ASTRO-MARKET ENGINE (BTC/USDC) - FIXED DATE CORRECTION")
+    print("="*110)
 
     mkt = MarketEngine()
     
     # 1. Time & Observer
-    obs, local_dt, city, live_time_utc = get_observer_data()
-    print(f"Observer: {city} | Local Time: {local_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+    # CHANGE: Define target date explicitly for accuracy verification
+    target_time = get_utc_now() 
+    obs, local_dt, city, live_time_utc = get_observer_data(target_time)
     
-    # 2. Astro Calculations
+    print(f"Observer: {city} | Simulation Time (UTC): {live_time_utc.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # 2. Astro (Real Time Calculation)
     solar_system = [
         CelestialBody("Sun", "Sun"), CelestialBody("Moon", "Moon"),
         CelestialBody("Mercury", "Mercury"), CelestialBody("Venus", "Venus"),
@@ -404,196 +433,190 @@ def main():
         CelestialBody("Saturn", "Saturn"), CelestialBody("Uranus", "Uranus"),
         CelestialBody("Neptune", "Neptune"), CelestialBody("Pluto", "Pluto")
     ]
+    
     for b in solar_system: b.compute(obs)
     calculate_aspects(solar_system)
     
-    # 3. Print Astro Report
-    print("\n" + "="*80)
-    print("  GEOCENTRIC ASTRO-PHYSICS REPORT (REAL TIME)")
-    print("="*80)
+    print("\n" + "="*110)
+    print("  GEOCENTRIC ASTRO-PHYSICS REPORT (REAL TIME EPHEMERIS)")
+    print("="*110)
     print(f"{'BODY':<10} | {'SIGN':<12} | {'DEG':<6} | {'PLATONIC':<20} | {'FREQ(Hz)':<10} | {'MOMENTUM':<12} | {'ASPECTS'}")
-    print("-" * 100)
+    print("-" * 110)
+    
     for b in solar_system:
-        aspect_str = ", ".join(b.current_aspects[:2])
+        aspect_str = ", ".join(b.current_aspects[:2]) 
         if not aspect_str: aspect_str = "-"
         print(f"{b.name:<10} | {b.zodiac_sign:<12} | {b.deg_in_sign:<5.1f}° | {b.platonic:<20} | {b.frequency:<10} | {b.speed:.2f}°/d {'(Rx)' if b.is_retrograde else ''} | {aspect_str}")
 
-    # 4. Define Timeframes & Process All
+    # 3. Timeframes
     timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '12h', '1d', '1w']
-    tf_limits = {k: 1000 for k in timeframes}
+    tf_limits = {
+        '1m': 500, '3m': 500, '5m': 500, '15m': 500, '30m': 500,
+        '1h': 1000, '2h': 1000, '4h': 1000, '12h': 1000,
+        '1d': 1000, '1w': 1000 
+    }
     
-    # Storage for results
     analysis_results = {}
 
-    print("\n" + "="*80)
-    print("  PROCESSING ALL TIMEFRAMES (Fetching, Training, Forecasting)...")
-    print("="*80)
+    print("\n" + "="*110)
+    print("  PROCESSING ALL TIMEFRAMES...")
+    print("="*110)
     
     for tf in timeframes:
-        # Fetch
         tf_df_raw = mkt.fetch_data(symbol='BTCUSDC', interval=tf, limit=tf_limits[tf])
-        if tf_df_raw.empty:
-            continue
+        if tf_df_raw.empty: continue
         
-        # Techs
         tf_df = mkt.calculate_technicals(tf_df_raw)
-        
-        # Train & Predict AI
         preds = mkt.train_and_predict_tf(tf_df, tf)
+        status, swing, max_p, min_p, struct_status, extrema_status = mkt.detect_gann_cycle(tf_df)
+        fg_score, fg_sent = mkt.get_fear_greed(tf_df)
         
-        # Gann
-        status, lvl, args, struct_status = mkt.detect_gann_cycle(tf_df)
+        current_price = tf_df['close'].iloc[-1]
+        g_res1, g_res2, g_sup1, g_sup2 = mkt.get_gann_sr_levels(current_price)
         
-        # Store
         analysis_results[tf] = {
-            'df': tf_df,
-            'raw': tf_df_raw,
             'preds': preds,
-            'gann': {'status': status, 'level': lvl, 'args': args, 'struct': struct_status},
-            'price': tf_df['close'].iloc[-1]
+            'price': current_price,
+            'gann': {'status': status, 'struct': struct_status, 'extrema': extrema_status, 'swing': swing},
+            'fg': {'score': fg_score, 'sent': fg_sent},
+            'sr': {'res1': g_res1, 'res2': g_res2, 'sup1': g_sup1, 'sup2': g_sup2}
         }
 
-    # 5. Print Gann Table (Existing Logic)
-    print("\n" + "="*80)
-    print("  MULTI-TIMEFRAME GANN CYCLE ANALYSIS")
-    print("="*80)
-    print(f"{'TF':<8} | {'STATUS':<25} | {'STRUCT STATUS':<20} | {'GANN LVL':<15} | {'ARGUMENT':<25} | {'PLANETARY RULER'}")
-    print("-" * 120)
+    # 4. Structure Table
+    print("\n" + "="*110)
+    print("  MULTI-TF MARKET STRUCTURE (GANN SR, EXTREMA, SENTIMENT)")
+    print("="*110)
+    print(f"{'TF':<6} | {'PRICE':<10} | {'EXTREMA':<20} | {'STRUCT':<20} | {'GANN RES 1':<12} | {'GANN SUP 1':<12} | {'F&G':<15}")
+    print("-" * 110)
     
     for tf in timeframes:
         if tf not in analysis_results: continue
-        
         res = analysis_results[tf]
-        gann = res['gann']
-        raw_df = res['raw']
-        
-        # Calc Gann Target logic for display
-        last_high = res['df']['high'].max()
-        last_low = res['df']['low'].min()
-        swing_size = last_high - last_low
-        
-        if "ACCUMULATION" in gann['struct']:
-            gann_target = last_low + swing_size
-        elif "DISTRIBUTION" in gann['struct']:
-            gann_target = last_high - swing_size
-        else:
-            gann_target = 0
-            
-        last_time = pd.to_datetime(raw_df['time'].iloc[-1], unit='ms').to_pydatetime()
-        ruler = get_planetary_hour_ruler(last_time)
-        
-        print(f"{tf:<8} | {gann['status']:<25} | {gann['struct']:<20} | {gann_target:.0f}   | {gann['args']:<25} | {ruler}")
+        print(f"{tf:<6} | ${res['price']:<9.2f} | {res['gann']['extrema']:<20} | {res['gann']['struct']:<20} | ${res['sr']['res1']:<10.2f} | ${res['sr']['sup1']:<10.2f} | {res['fg']['score']:<3} {res['fg']['sent']:<10}")
 
-    # 6. NEW: Multi-TF AI Forecast Table
-    print("\n" + "="*80)
-    print("  MULTI-TIMEFRAME AI FORECAST (NEURAL NETWORK PREDICTIONS)")
-    print("="*80)
-    print(f"{'TF':<8} | {'PRICE':<10} | {'FAST (4c)':<15} | {'MED (24c)':<15} | {'LARGE (168c)':<15} | {'CONSENSUS'}")
-    print("-" * 100)
+    # 5. AI Forecast Table
+    print("\n" + "="*110)
+    print("  MULTI-TF AI FORECAST (SCALED TARGETS)")
+    print("="*110)
+    print(f"{'TF':<6} | {'FAST (4c)':<30} | {'MED (24c)':<30} | {'LARGE (168c)':<30} | {'CONSENSUS'}")
+    print("-" * 125)
     
     for tf in timeframes:
         if tf not in analysis_results: continue
         
         res = analysis_results[tf]
-        price = res['price']
         preds = res['preds']
         
         if not preds:
-            print(f"{tf:<8} | ${price:.2f} | {'N/A':<15} | {'N/A':<15} | {'N/A':<15} | NO DATA")
+            print(f"{tf:<6} | {'N/A':<30} | {'N/A':<30} | {'N/A':<30} | NO MODEL")
             continue
             
+        dur_fast = get_duration_str(tf, 4)
+        dur_med = get_duration_str(tf, 24)
+        dur_large = get_duration_str(tf, 168)
+        
         p_fast = preds['Fast']
         p_med = preds['Medium']
         p_large = preds['Large']
         
         def get_dir(curr, pred):
-            return "UP" if pred > curr else "DOWN"
+            return "▲UP" if pred > curr else "▼DOWN"
             
-        d_fast = get_dir(price, p_fast)
-        d_med = get_dir(price, p_med)
-        d_large = get_dir(price, p_large)
+        dir_fast = get_dir(res['price'], p_fast)
+        dir_med = get_dir(res['price'], p_med)
+        dir_large = get_dir(res['price'], p_large)
         
-        # Simple consensus
-        votes = [d_fast, d_med, d_large]
-        if votes.count("UP") >= 2: consensus = "BULLISH"
-        elif votes.count("DOWN") >= 2: consensus = "BEARISH"
-        else: consensus = "MIXED"
-        
-        print(f"{tf:<8} | ${price:<9.2f} | ${p_fast:<10.2f} {d_fast:<4} | ${p_med:<10.2f} {d_med:<4} | ${p_large:<10.2f} {d_large:<4} | {consensus}")
+        votes = [dir_fast, dir_med, dir_large]
+        bull_votes = sum(1 for x in votes if "UP" in x)
+        if bull_votes >= 2: consensus = "BULLISH"
+        elif bull_votes == 1: consensus = "SLIGHT BULL"
+        else: consensus = "BEARISH"
 
-    # 7. Detailed 1H Analysis (Primary Reference)
-    if '1h' in analysis_results:
-        print("\n" + "="*80)
-        print("  DETAILED 1H FORECAST & SYNTHESIS")
-        print("="*80)
+        print(f"{tf:<6} | ${p_fast:<8.2f} ({dur_fast:<6}) {dir_fast:<7} | ${p_med:<8.2f} ({dur_med:<6}) {dir_med:<7} | ${p_large:<8.2f} ({dur_large:<6}) {dir_large:<7} | {consensus}")
+
+    # 6. Global Overall Logic
+    print("\n" + "="*110)
+    print("  GLOBAL OVERALL SYNTHESIS (CYCLE PROJECTION)")
+    print("="*110)
+    
+    major_tfs = ['1h', '4h', '12h', '1d']
+    acc_votes = 0
+    dist_votes = 0
+    total_support = 0
+    total_resistance = 0
+    total_swing = 0
+    tf_count = 0
+    
+    ref_price = analysis_results.get('1h', {}).get('price', 0)
+    
+    for tf in major_tfs:
+        if tf not in analysis_results: continue
         
-        df_1h = analysis_results['1h']['df']
-        preds_1h = analysis_results['1h']['preds']
-        curr_price = analysis_results['1h']['price']
-        
-        last_high = df_1h['high'].iloc[-1]
-        last_low = df_1h['low'].iloc[-1]
-        
-        # Gann Calcs
-        gann_high_45 = last_high + (last_high * 0.125) 
-        gann_low_45 = last_low - (last_low * 0.125)
-        gann_sr = math.sqrt(curr_price)
-        
-        print(f"Current Price:    ${curr_price:.2f}")
-        print(f"Resistance 45 deg: ${gann_high_45:.2f}")
-        print(f"Support 45 deg:    ${gann_low_45:.2f}")
-        print(f"Gann SR:          {gann_sr:.2f}")
-        
-        # Fear Greed
-        fg_score, fg_sentiment = mkt.get_fear_greed(df_1h)
-        print(f"Fear & Greed:    {fg_score}/100 ({fg_sentiment})")
-        
-        # Dates
-        if preds_1h:
-            t_fast = local_dt + timedelta(hours=4)
-            t_med = local_dt + timedelta(hours=24)
-            t_large = local_dt + timedelta(days=7)
+        struct = analysis_results[tf]['gann']['struct']
+        if "ACCUMULATION" in struct:
+            acc_votes += 1
+        else:
+            dist_votes += 1
             
-            print(f"\n1H AI TARGETS (LOCAL TIME):")
-            print(f"Fast (4h):    ${preds_1h['Fast']:.2f} ({t_fast.strftime('%m-%d %H:%M')}) ({'UP' if preds_1h['Fast'] > curr_price else 'DOWN'})")
-            print(f"Med (24h):    ${preds_1h['Medium']:.2f} ({t_med.strftime('%m-%d %H:%M')}) ({'UP' if preds_1h['Medium'] > curr_price else 'DOWN'})")
-            print(f"Large (7d):   ${preds_1h['Large']:.2f} ({t_large.strftime('%m-%d %H:%M')}) ({'UP' if preds_1h['Large'] > curr_price else 'DOWN'})")
-
-    # 8. Final Aggregated Signal
-    print("\n" + "="*80)
-    print("  FINAL AGGREGATED SIGNAL")
-    print("="*80)
+        total_support += analysis_results[tf]['sr']['sup1']
+        total_resistance += analysis_results[tf]['sr']['res1']
+        total_swing += analysis_results[tf]['gann']['swing']
+        tf_count += 1
     
-    bull_votes = 0
-    bear_votes = 0
-    total_votes = 0
+    global_status = "NEUTRAL"
+    entry_name = ""
+    exit_name = ""
+    entry_target = 0.0
+    exit_target = 0.0
     
-    for tf, res in analysis_results.items():
-        if not res['preds']: continue
-        # Weight higher TFs more
-        weight = 1
-        if tf in ['4h', '12h', '1d', '1w']: weight = 2
-        elif tf == '1h': weight = 1.5
+    if tf_count > 0:
+        avg_support = total_support / tf_count
+        avg_resistance = total_resistance / tf_count
+        avg_swing = total_swing / tf_count
         
-        if res['preds']['Large'] > res['price']: 
-            bull_votes += weight
-        else: 
-            bear_votes += weight
-        total_votes += weight
-        
-    print(f"Weighted Bullish Strength: {bull_votes}")
-    print(f"Weighted Bearish Strength: {bear_votes}")
+        if acc_votes > dist_votes:
+            global_status = "BULLISH ACCUMULATION (DIP)"
+            entry_name = "DIP Reversal Entry Target"
+            exit_name = "TOP Reversal Exit Forecast"
+            entry_target = avg_support
+            exit_target = entry_target + avg_swing
+        elif dist_votes > acc_votes:
+            global_status = "BEARISH DISTRIBUTION (TOP)"
+            entry_name = "TOP Reversal Entry Target (Short)"
+            exit_name = "BOTTOM Reversal Exit Forecast (Cover)"
+            entry_target = avg_resistance
+            exit_target = entry_target - avg_swing
+        else:
+            global_status = "NEUTRAL / TRANSITION"
+            entry_name = "NEAREST REVERSAL TARGET"
+            exit_name = "EXTENSION TARGET"
+            dist_to_sup = abs(ref_price - avg_support)
+            dist_to_res = abs(ref_price - avg_resistance)
+            entry_target = avg_support if dist_to_sup < dist_to_res else avg_resistance
+            exit_target = entry_target + avg_swing 
+            
+    # Reversal Logic
+    total_fg = sum([res['fg']['score'] for res in analysis_results.values()])
+    count_fg = len(analysis_results)
+    avg_fg = total_fg / count_fg if count_fg > 0 else 50
     
-    if bull_votes > bear_votes * 1.2:
-        print(">>> GLOBAL SIGNAL: STRONG BUY (Majority of Timeframes Bullish)")
-    elif bear_votes > bull_votes * 1.2:
-        print(">>> GLOBAL SIGNAL: STRONG SELL (Majority of Timeframes Bearish)")
-    elif bull_votes > bear_votes:
-        print(">>> GLOBAL SIGNAL: BUY (Leaning Bullish)")
-    elif bear_votes > bull_votes:
-        print(">>> GLOBAL SIGNAL: SELL (Leaning Bearish)")
-    else:
-        print(">>> GLOBAL SIGNAL: NEUTRAL / CHOPPY (Indecision across Timeframes)")
+    reversal_status = "NO REVERSAL SIGNAL"
+    if avg_fg < 25 and "ACCUMULATION" in global_status:
+        reversal_status = "REVERSAL INCOMING: DIP BOUNCE LIKELY (Extreme Fear + Structure)"
+    elif avg_fg > 75 and "DISTRIBUTION" in global_status:
+        reversal_status = "REVERSAL INCOMING: DUMP IMMINENT (Extreme Greed + Structure)"
+    elif "ACCUMULATION" in global_status and avg_fg < 40:
+        reversal_status = "REVERSAL INCOMING: BULLISH DIVERGENCE"
+    
+    # Print Global Summary
+    print(f"Current Market State:   {global_status}")
+    print(f"Reference Price:        ${ref_price:.2f}")
+    print("-" * 110)
+    print(f"{entry_name}: ${entry_target:.2f}")
+    print(f"{exit_name}: ${exit_target:.2f}")
+    print("-" * 110)
+    print(f"Overall Sentiment:      {avg_fg:.1f}/100")
+    print(f"Reversal Status:        {reversal_status}")
 
 if __name__ == "__main__":
     main()
