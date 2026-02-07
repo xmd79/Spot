@@ -16,10 +16,11 @@ from binance.client import Client
 SYMBOL = "BTCUSDC"
 
 FAST_TF = ["1m", "3m", "5m"]
-INTER_TF = ["15m", "30m", "1h", "2h"]  # added 2h to mid-term group
-MAJOR_TF = ["4h", "8h", "12h", "1d"]    # only high TFs
+INTER_TF = ["15m", "30m", "1h", "2h"]
+MAJOR_TF = ["4h", "8h", "12h", "1d"]
 
-LOOKBACK = 1000
+# Updated to ensure we have at least 1200 values for the new rule
+LOOKBACK = 1200 
 SCAN_INTERVAL = 5
 
 client = Client()
@@ -54,6 +55,14 @@ class CycleEngineState:
         self.resonance_score = {}
         self.vol_comp = {}
         self.bull_bear_vol = {}
+        
+        # Liquidity & Exhaustion States
+        self.liquidity_sweeps = {}
+        self.stop_hunt_prob = {}
+        self.magnet_zones = {}
+        self.exhaustion_levels = {}
+        self.vol_regimes = {}
+        self.divergence_pressure = 0
 
 state = CycleEngineState()
 
@@ -67,7 +76,7 @@ def get_data(symbol, tf):
         "time","open","high","low","close","vol",
         "ct","qv","nt","tb","tq","ig"
     ])
-    for col in ["open", "high", "low", "close", "vol"]:
+    for col in ["open", "high", "low", "close", "vol", "tb"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=["close", "high", "low", "vol"], inplace=True)
     return df
@@ -95,16 +104,111 @@ def vol_compression(close):
     return float(vol / base)
 
 def bullish_bearish_vol(df):
-    bullish = df[df.close >= df.open]["vol"].sum()
-    bearish = df[df.close < df.open]["vol"].sum()
-    total = bullish + bearish
-    return float(bullish / total) if total > 0 else 0.5, float(bearish / total) if total > 0 else 0.5
+    buy_vol = df["tb"].sum() if "tb" in df.columns else df[df.close >= df.open]["vol"].sum()
+    total_vol = df["vol"].sum()
+    
+    if total_vol == 0:
+        return 0.5, 0.5
+    
+    bull_ratio = buy_vol / total_vol
+    return float(bull_ratio), float(1.0 - bull_ratio)
 
 def support_resistance(close):
+    # Kept for legacy/target calculations, but overwritten by ArgMin/Max rule in main loop
     mins, maxs = extrema(close)
     support = np.mean(close[mins]) if len(mins) > 0 else np.min(close)
     resistance = np.mean(close[maxs]) if len(maxs) > 0 else np.max(close)
     return support, resistance
+
+# ==========================
+# LIQUIDITY & SWEEP LOGIC
+# ==========================
+
+def detect_sweep_and_stop_hunt(df, cycle):
+    if len(df) < 10:
+        return "NONE", 0.0
+
+    last = df.iloc[-1]
+    taker_buy = last['tb']
+    taker_sell = last['vol'] - last['tb']
+    delta = taker_buy - taker_sell
+    delta_strength = abs(delta) / last['vol'] if last['vol'] > 0 else 0
+    
+    body_size = abs(last['close'] - last['open'])
+    candle_range = last['high'] - last['low']
+    
+    if candle_range == 0:
+        return "NONE", 0.0
+
+    upper_wick = last['high'] - max(last['open'], last['close'])
+    lower_wick = min(last['open'], last['close']) - last['low']
+    
+    wick_ratio_up = upper_wick / candle_range
+    wick_ratio_down = lower_wick / candle_range
+    
+    status = "NONE"
+    prob = 0.0
+    
+    if wick_ratio_up > 0.4 and last['close'] < last['open']:
+        if delta < 0:
+            status = "BEAR_SWEEP"
+            prob = 0.7 + (delta_strength * 0.3)
+            
+    elif wick_ratio_down > 0.4 and last['close'] > last['open']:
+        if delta > 0:
+            status = "BULL_SWEEP"
+            prob = 0.7 + (delta_strength * 0.3)
+
+    return status, prob
+
+def forced_liquidation_magnet(df, cycle):
+    close = df["close"].values
+    mins, maxs = extrema(close)
+    
+    liquidity_highs = close[maxs] if len(maxs) > 0 else np.array([close[-1]])
+    liquidity_lows = close[mins] if len(mins) > 0 else np.array([close[-1]])
+    
+    recent_highs = liquidity_highs[-5:] if len(liquidity_highs) >= 5 else liquidity_highs
+    recent_lows = liquidity_lows[-5:] if len(liquidity_lows) >= 5 else liquidity_lows
+    
+    high_magnet = np.mean(recent_highs)
+    low_magnet = np.mean(recent_lows)
+    
+    current_price = close[-1]
+    
+    if cycle == "UP":
+        return high_magnet if high_magnet > current_price else current_price * 1.005
+    else:
+        return low_magnet if low_magnet < current_price else current_price * 0.995
+
+def reversal_exhaustion_detection(df):
+    if len(df) < 20:
+        return 0.0
+    recent = df.tail(5)
+    older = df.iloc[-20:-5]
+    price_change_rate = abs(recent['close'].iloc[-1] - recent['close'].iloc[0]) / recent['close'].iloc[0]
+    recent_vol_avg = recent['vol'].mean()
+    older_vol_avg = older['vol'].mean()
+    vol_dry_up = older_vol_avg > 0 and (recent_vol_avg / older_vol_avg < 0.8)
+    score = 0.0
+    if vol_dry_up and price_change_rate > 0.001:
+        score = 0.8
+    elif price_change_rate < 0.0005:
+        score = 0.5
+    return score
+
+def volatility_regime_switching(close):
+    if len(close) < 100:
+        return "Neutral"
+    short_vol = np.std(close[-20:])
+    long_vol = np.std(close[-100:])
+    ratio = short_vol / long_vol if long_vol > 0 else 1
+    if ratio > 1.3:
+        return "Expansion"
+    elif ratio < 0.7:
+        return "Compression"
+    else:
+        return "Transition"
 
 # ==========================
 # TARGET ENGINE
@@ -181,28 +285,98 @@ def process_group(tf_list):
     vol_bear = []
     support_list = []
     resistance_list = []
+    
+    # Feature Lists
+    sweep_list = []
+    sh_prob_list = []
+    magnet_list = []
+    exhaustion_list = []
+    regime_list = []
+    
+    # New Range Rule Lists
+    abs_low_list = []
+    abs_high_list = []
+    recent_extrema_type_list = []
+    recent_extrema_val_list = []
 
     for tf in tf_list:
         if stop_event.is_set():
             break
         df = get_data(SYMBOL, tf)
-        close = df["close"]
+        close = df["close"].values
+        low = df["low"].values
+        high = df["high"].values
 
         phase = spectral_phase(close)
         cycle = detect_cycle(phase)
 
         target = compute_target(close, cycle)
         bull, bear = bullish_bearish_vol(df)
-        support, resistance = support_resistance(close)
+        
+        # ==========================
+        # NEW: ARGMIN/ARGMAX RANGE RULE
+        # ==========================
+        # Rule: Support/Resistance defined by absolute min/max of last 1200 values
+        # Close is always between them (conceptually, if close > high, it becomes new high)
+        
+        abs_low_val = np.min(low)
+        abs_high_val = np.max(high)
+        
+        # Find indices to determine recency
+        # Use where to handle duplicates, take the last occurrence (most recent)
+        idx_low = np.where(low == abs_low_val)[0]
+        idx_low = idx_low[-1] if len(idx_low) > 0 else 0
+        
+        idx_high = np.where(high == abs_high_val)[0]
+        idx_high = idx_high[-1] if len(idx_high) > 0 else 0
+        
+        # Determine what happened most recently
+        if idx_low > idx_high:
+            most_recent_type = "LOW"
+            most_recent_val = abs_low_val
+        else:
+            most_recent_type = "HIGH"
+            most_recent_val = abs_high_val
+            
+        # Apply Rule: Set S/R to these absolute bounds
+        support = abs_low_val
+        resistance = abs_high_val
+        
+        # Store for printing
+        abs_low_list.append(abs_low_val)
+        abs_high_list.append(abs_high_val)
+        recent_extrema_type_list.append(most_recent_type)
+        recent_extrema_val_list.append(most_recent_val)
+        # ==========================
+
         vcomp = vol_compression(close)
 
-        # save for predictive analysis
+        # Liquidity & Sweep Logic
+        sweep_status, sh_prob = detect_sweep_and_stop_hunt(df, cycle)
+        state.liquidity_sweeps[tf] = sweep_status
+        state.stop_hunt_prob[tf] = sh_prob
+        
+        magnet_zone = forced_liquidation_magnet(df, cycle)
+        state.magnet_zones[tf] = magnet_zone
+        
+        exh_score = reversal_exhaustion_detection(df)
+        state.exhaustion_levels[tf] = exh_score
+        
+        regime = volatility_regime_switching(close)
+        state.vol_regimes[tf] = regime
+        
+        sweep_list.append(sweep_status)
+        sh_prob_list.append(sh_prob)
+        magnet_list.append(magnet_zone)
+        exhaustion_list.append(exh_score)
+        regime_list.append(regime)
+
         state.phase_score[tf], state.vol_comp[tf] = phase_transition_score(close)
         state.bull_bear_vol[tf] = (bull, bear)
 
         cycles.append(cycle)
         targets.append(target)
-        prices.append(close.iloc[-1])
+        prices.append(close[-1])
         vol_bull.append(bull)
         vol_bear.append(bear)
         support_list.append(support)
@@ -226,7 +400,18 @@ def process_group(tf_list):
         "support": support_list,
         "resistance": resistance_list,
         "per_tf_cycle": cycles,
-        "per_tf_target": targets
+        "per_tf_target": targets,
+        # New Features
+        "sweeps": sweep_list,
+        "sh_probs": sh_prob_list,
+        "magnets": magnet_list,
+        "exhaustions": exhaustion_list,
+        "regimes": regime_list,
+        # New Range Rule Data
+        "abs_lows": abs_low_list,
+        "abs_highs": abs_high_list,
+        "recent_types": recent_extrema_type_list,
+        "recent_vals": recent_extrema_val_list
     }
 
 # ==========================
@@ -239,7 +424,6 @@ def most_likely_reversal(tf_list):
         phase_score = state.phase_score.get(tf, 0)
         vol_ratio = state.vol_comp.get(tf, 1)
         bull, bear = state.bull_bear_vol.get(tf, (0.5, 0.5))
-        # predictive metric: PhaseScore magnitude * vol expansion * imbalance
         imbalance = abs(bull - bear)
         predictive_score = abs(phase_score) * (1/vol_ratio) * imbalance
         scores[tf] = predictive_score
@@ -252,7 +436,7 @@ def most_likely_reversal(tf_list):
 # MAIN ENGINE LOOP
 # ==========================
 
-print("=== INSTITUTIONAL PREDICTIVE CYCLE ENGINE v2 STARTED ===")
+print("=== INSTITUTIONAL PREDICTIVE CYCLE ENGINE v4 (RANGE RULE) STARTED ===")
 
 while not stop_event.is_set():
     try:
@@ -271,19 +455,26 @@ while not stop_event.is_set():
                              inter_data["cycle"], inter_data["target"], price)
         update_stable_target(price, "major_target", "current_major_cycle",
                              major_data["cycle"], major_data["target"], price)
+                             
+        # CROSS-TF DIVERGENCE
+        fast_bias = 1 if fast_data["cycle"] == "UP" else -1
+        major_bias = 1 if major_data["cycle"] == "UP" else -1
+        divergence_val = 0
+        div_text = "None"
+        if fast_bias != major_bias:
+            divergence_val = abs(fast_bias - major_bias)
+            div_text = f"HIGH DIVERGENCE (Fast:{fast_data['cycle']} vs Major:{major_data['cycle']})"
+        else:
+            div_text = "Aligned"
+        state.divergence_pressure = divergence_val
 
-        # ==========================
-        # Print cycles & stable targets
-        # ==========================
         print("\n", datetime.now())
         print(f"Price: {price:.2f}")
         print("FAST Cycle:", fast_data["cycle"], "StableTarget:", state.fast_target)
         print("INTER Cycle:", inter_data["cycle"], "StableTarget:", state.inter_target)
         print("MAJOR Cycle:", major_data["cycle"], "StableTarget:", state.major_target)
+        print(f"Cross-TF Pressure: {div_text}")
 
-        # ==========================
-        # Per-TF Analysis (vertical)
-        # ==========================
         print("\nPer-TF Analysis:")
         all_data_map = [(FAST_TF, fast_data), (INTER_TF, inter_data), (MAJOR_TF, major_data)]
         for tf_list, data in all_data_map:
@@ -293,13 +484,35 @@ while not stop_event.is_set():
                 print(f"Target: {data['per_tf_target'][i]:.2f}")
                 print(f"BullVol: {data['vol_bull'][i]:.2f}")
                 print(f"BearVol: {data['vol_bear'][i]:.2f}")
-                print(f"Support: {data['support'][i]:.2f}")
-                print(f"Resistance: {data['resistance'][i]:.2f}")
-                print(f"PhaseScore: {state.phase_score[tf]:.4f}")
+                
+                # --- NEW RANGE RULE PRINT ---
+                abs_low = data['abs_lows'][i]
+                abs_high = data['abs_highs'][i]
+                recent_type = data['recent_types'][i]
+                recent_val = data['recent_vals'][i]
+                
+                print(f"  [1200-CANDLE RANGE RULE]")
+                print(f"  Support (ArgMin): {abs_low:.2f}")
+                print(f"  Resistance (ArgMax): {abs_high:.2f}")
+                print(f"  Most Recent Extrema: {recent_type} ({recent_val:.2f})")
+                
+                current_close = data['per_tf_target'][i] # Approximation for close if not passed, but logic holds
+                # Check containment
+                is_between = abs_low <= price <= abs_high
+                print(f"  Close Inside Range: {'YES' if is_between else 'NO (New Range Extreme)'}")
+                # ------------------------------
 
-        # ==========================
-        # Target Priority
-        # ==========================
+                print(f"  [LIQUIDITY ENGINE]")
+                print(f"  Regime: {data['regimes'][i]}")
+                sweep = data['sweeps'][i]
+                if sweep != "NONE":
+                    print(f"  ALERT: {sweep} (Prob: {data['sh_probs'][i]:.2f})")
+                print(f"  Magnet Zone: {data['magnets'][i]:.2f}")
+                if data['exhaustions'][i] > 0.6:
+                    print(f"  EXHAUSTION DETECTED: {data['exhaustions'][i]:.2f}")
+                
+                print(f"  PhaseScore: {state.phase_score[tf]:.4f}")
+
         targets = {
             "FAST": state.fast_target,
             "INTER": state.inter_target,
@@ -310,18 +523,12 @@ while not stop_event.is_set():
         for rank, (name, t) in enumerate(priority_order, start=1):
             print(f"{rank}. {name} Target: {t:.2f} (distance: {abs(t - price):.2f})")
 
-        # ==========================
-        # Resonance Score & Interpretation
-        # ==========================
         print("\nResonance Score:", state.resonance_score)
         print("\nResonance Interpretation:")
         for layer, score in state.resonance_score.items():
             status = interpret_resonance(score)
             print(f"{layer}: Score={score:.4f} -> {status}")
 
-        # ==========================
-        # Most Likely Reversal TF
-        # ==========================
         likely_tf, rev_score = most_likely_reversal(FAST_TF + INTER_TF + MAJOR_TF)
         if likely_tf:
             print(f"\nMost Likely Reversal TF: {likely_tf} (Predictive Score: {rev_score:.4f})")
