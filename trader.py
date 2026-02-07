@@ -1,217 +1,307 @@
 import numpy as np
 import pandas as pd
+import time
+import signal
+import threading
+from datetime import datetime
 from scipy.signal import argrelextrema
 from scipy.fft import fft
 from statsmodels.tsa.stattools import adfuller
 from binance.client import Client
-import time
-import sys
-import os
-
-# ==========================
-# LOAD API
-# ==========================
-def load_api_keys(filepath="api.txt"):
-    try:
-        if not os.path.exists(filepath):
-            raise FileNotFoundError("api.txt missing")
-        with open(filepath, "r") as f:
-            lines = [line.strip() for line in f.readlines() if line.strip()]
-        if len(lines) < 2:
-            raise ValueError("api.txt must contain API_KEY and API_SECRET")
-        return lines[0], lines[1]
-    except Exception as e:
-        print(f"API Load Error: {e}")
-        sys.exit(1)
-
-API_KEY, API_SECRET = load_api_keys()
-client = Client(API_KEY, API_SECRET)
 
 # ==========================
 # CONFIG
 # ==========================
+
 SYMBOL = "BTCUSDC"
-TIMEFRAMES = ["1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","1w"]
-LIMIT = 1200
+
+FAST_TF = ["1m", "3m", "5m"]
+INTER_TF = ["15m", "30m", "1h"]
+MAJOR_TF = ["2h", "4h"]
+
+LOOKBACK = 1000
+SCAN_INTERVAL = 5
+
+client = Client()
 
 # ==========================
-# HELPERS
+# STOP EVENT (Ctrl+C SAFE)
 # ==========================
-def fmt25(x):
-    return f"{float(x):.25f}"
 
-def get_fresh_data(symbol, interval):
-    try:
-        klines = client.get_klines(symbol=symbol, interval=interval, limit=LIMIT)
-        if not klines:
-            return None
+stop_event = threading.Event()
 
-        df = pd.DataFrame(klines, columns=[
-            'time','open','high','low','close','volume',
-            'ct','qav','trades','tb','tq','ig'])
+def signal_handler(sig, frame):
+    print("\nStopping Predictive Cycle Engine...")
+    stop_event.set()
 
-        for col in ['open','high','low','close','volume']:
-            df[col] = df[col].astype(float)
+signal.signal(signal.SIGINT, signal_handler)
 
-        df['time'] = pd.to_datetime(df['time'], unit='ms')
-        return df
-    except:
-        return None
+# ==========================
+# STATE ENGINE
+# ==========================
 
-def stationary_series(series):
-    if len(series) < 50:
-        return series
-    try:
-        result = adfuller(series)
-        if result[1] > 0.05:
-            return series.diff().dropna()
-    except:
-        pass
-    return series
+class CycleEngineState:
+    def __init__(self):
+        self.current_major_cycle = None
+        self.current_inter_cycle = None
+        self.current_fast_cycle = None
+
+        self.major_target = None
+        self.inter_target = None
+        self.fast_target = None
+
+        # v2 predictive features
+        self.phase_score = {}
+        self.resonance_score = {}
+
+state = CycleEngineState()
+
+# ==========================
+# DATA FETCH
+# ==========================
+
+def get_data(symbol, tf):
+    klines = client.get_klines(symbol=symbol, interval=tf, limit=LOOKBACK)
+    df = pd.DataFrame(klines, columns=[
+        "time","open","high","low","close","vol",
+        "ct","qv","nt","tb","tq","ig"
+    ])
+    
+    # Convert all needed columns to float safely
+    for col in ["open", "high", "low", "close", "vol"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    
+    # Drop any rows with missing critical data
+    df.dropna(subset=["close", "high", "low", "vol"], inplace=True)
+    
+    return df
 
 # ==========================
 # ANALYSIS
 # ==========================
-def analyze_tf(df, tf_name):
 
-    if df is None or len(df) < 20:
+def spectral_phase(close):
+    f = fft(close)
+    return float(np.angle(f[1]))
+
+def extrema(close):
+    arr = np.array(close)
+    mins = argrelextrema(arr, np.less_equal, order=5)[0]
+    maxs = argrelextrema(arr, np.greater_equal, order=5)[0]
+    return mins, maxs
+
+def regime_prob(close):
+    try:
+        p = adfuller(close)[1]
+        return float(1 - p)
+    except:
+        return 0.5
+
+def detect_cycle(phase):
+    return "UP" if phase > 0 else "DOWN"
+
+def liquidity_sweep(close):
+    return int(close.iloc[-1] > close.max() * 0.995 or close.iloc[-1] < close.min() * 1.005)
+
+def vol_compression(close):
+    vol = np.std(close[-50:])
+    base = np.std(close)
+    return float(vol / base)
+
+def bullish_bearish_vol(df):
+    bullish = df[df.close >= df.open]["vol"].sum()
+    bearish = df[df.close < df.open]["vol"].sum()
+    total = bullish + bearish
+    return float(bullish / total) if total > 0 else 0.5, float(bearish / total) if total > 0 else 0.5
+
+def support_resistance(close):
+    mins, maxs = extrema(close)
+    support = np.mean(close[mins]) if len(mins) > 0 else np.min(close)
+    resistance = np.mean(close[maxs]) if len(maxs) > 0 else np.max(close)
+    return support, resistance
+
+# ==========================
+# TARGET ENGINE
+# ==========================
+
+def compute_target(close, cycle):
+    return float(np.percentile(close, 90)) if cycle == "UP" else float(np.percentile(close, 10))
+
+def update_stable_target(current_price, target_attr, cycle_attr, new_cycle, new_target, price):
+    try:
+        price = float(price)
+        stable_target = getattr(state, target_attr)
+        stable_target = float(stable_target) if stable_target is not None else None
+    except:
+        return
+
+    current_cycle = getattr(state, cycle_attr)
+
+    if current_cycle != new_cycle:
+        setattr(state, cycle_attr, new_cycle)
+        setattr(state, target_attr, new_target)
+        return
+
+    if stable_target is None:
+        setattr(state, target_attr, new_target)
+        return
+
+    if new_cycle == "UP" and price >= stable_target:
+        setattr(state, target_attr, new_target)
+    if new_cycle == "DOWN" and price <= stable_target:
+        setattr(state, target_attr, new_target)
+
+# ==========================
+# PREDICTIVE FEATURES v2
+# ==========================
+
+def phase_transition_score(close):
+    phase = spectral_phase(close)
+    vol_comp = vol_compression(close)
+    score = (phase * (1 - vol_comp))
+    return score
+
+def resonance_alignment(cycles):
+    up = cycles.count("UP")
+    down = cycles.count("DOWN")
+    total = len(cycles)
+    score = (up - down) / total
+    return score
+
+# ==========================
+# PROCESS TF GROUP
+# ==========================
+
+def process_group(tf_list):
+    cycles = []
+    targets = []
+    prices = []
+    vol_bull = []
+    vol_bear = []
+    support_list = []
+    resistance_list = []
+
+    for tf in tf_list:
+        if stop_event.is_set():
+            break
+
+        df = get_data(SYMBOL, tf)
+        close = df["close"]
+
+        phase = spectral_phase(close)
+        cycle = detect_cycle(phase)
+
+        target = compute_target(close, cycle)
+
+        bull, bear = bullish_bearish_vol(df)
+        support, resistance = support_resistance(close)
+
+        cycles.append(cycle)
+        targets.append(target)
+        prices.append(close.iloc[-1])
+        vol_bull.append(bull)
+        vol_bear.append(bear)
+        support_list.append(support)
+        resistance_list.append(resistance)
+
+        state.phase_score[tf] = phase_transition_score(close)
+
+    if not cycles:
         return None
 
-    prices = df['close'].values
-    current = prices[-1]
-
-    # ===== VOLUME =====
-    bull_mask = df['close'] > df['open']
-    bear_mask = df['close'] < df['open']
-
-    bull_vol = df.loc[bull_mask,'volume'].sum()
-    bear_vol = df.loc[bear_mask,'volume'].sum()
-    total_vol = bull_vol + bear_vol
-
-    if total_vol > 0:
-        bull_pct = (bull_vol/total_vol)*100
-        bear_pct = (bear_vol/total_vol)*100
-    else:
-        bull_pct = bear_pct = 50.0
-
-    # ===== LOCAL EXTREMA =====
-    order = max(5, int(len(df)/40))
-    mins = argrelextrema(prices, np.less, order=order)[0]
-    maxs = argrelextrema(prices, np.greater, order=order)[0]
-
-    support = prices[mins[-1]] if len(mins)>0 else np.min(prices)
-    resistance = prices[maxs[-1]] if len(maxs)>0 else np.max(prices)
-
-    # ===== ABS EXTREMA LAST 1200 =====
-    window_prices = prices[-1200:] if len(prices)>=1200 else prices
-    offset = len(prices) - len(window_prices)
-
-    abs_min_local = np.argmin(window_prices)
-    abs_max_local = np.argmax(window_prices)
-
-    abs_min_idx = abs_min_local + offset
-    abs_max_idx = abs_max_local + offset
-
-    abs_min_val = prices[abs_min_idx]
-    abs_max_val = prices[abs_max_idx]
-
-    # ===== TREND BASED ON MOST RECENT EXTREME =====
-    if abs_min_idx > abs_max_idx:
-        trend = "UP CYCLE"
-        recent_extreme = "ARGMIN"
-    else:
-        trend = "DOWN CYCLE"
-        recent_extreme = "ARGMAX"
-
-    # ===== FFT FORECAST =====
-    try:
-        series = stationary_series(df['close'])
-        if len(series)>20:
-            spectrum = np.abs(fft(series))
-            upper = min(50,len(spectrum)-1)
-            freq_idx = np.argmax(spectrum[1:upper])+1
-            returns = df['close'].pct_change().dropna()
-            amp = np.std(returns)*current
-            omega = 2*np.pi/(freq_idx+1)
-            phase = 0 if trend=="UP CYCLE" else np.pi
-            forecast = current + amp*np.sin(phase + omega)
-        else:
-            forecast = current
-    except:
-        forecast = current
+    price = np.mean(prices)
+    up = cycles.count("UP")
+    down = cycles.count("DOWN")
+    overall_cycle = "UP" if up >= down else "DOWN"
+    target = np.mean(targets)
+    resonance = resonance_alignment(cycles)
+    state.resonance_score["_".join(tf_list)] = resonance
 
     return {
-        "TF": tf_name,
-        "Price": fmt25(current),
-        "Sup": fmt25(support),
-        "Res": fmt25(resistance),
-        "BullVol%": fmt25(bull_pct),
-        "BearVol%": fmt25(bear_pct),
-        "ArgMinIdx": abs_min_idx,
-        "ArgMaxIdx": abs_max_idx,
-        "ArgMinVal": fmt25(abs_min_val),
-        "ArgMaxVal": fmt25(abs_max_val),
-        "RecentExt": recent_extreme,
-        "Trend": trend,
-        "Forecast": fmt25(forecast)
+        "cycle": overall_cycle,
+        "target": target,
+        "price": price,
+        "vol_bull": vol_bull,
+        "vol_bear": vol_bear,
+        "support": support_list,
+        "resistance": resistance_list,
+        "per_tf_cycle": cycles,
+        "per_tf_target": targets
     }
 
 # ==========================
-# MAIN LOOP
+# MAIN ENGINE LOOP
 # ==========================
-def run_mtf_scan():
 
-    print(f"Initializing Scanner for {SYMBOL}")
+print("=== INSTITUTIONAL PREDICTIVE CYCLE ENGINE v2 STARTED ===")
 
+while not stop_event.is_set():
     try:
-        while True:
+        fast_data = process_group(FAST_TF)
+        inter_data = process_group(INTER_TF)
+        major_data = process_group(MAJOR_TF)
 
-            loop_start = time.time()
-            results = []
-            loaded = []
+        if fast_data is None or inter_data is None or major_data is None:
+            continue
 
-            for tf in TIMEFRAMES:
-                df = get_fresh_data(SYMBOL, tf)
-                if df is not None:
-                    res = analyze_tf(df, tf)
-                    if res:
-                        results.append(res)
-                        loaded.append(tf)
+        price = fast_data["price"]
 
-            if results:
+        update_stable_target(price, "fast_target", "current_fast_cycle",
+                             fast_data["cycle"], fast_data["target"], price)
+        update_stable_target(price, "inter_target", "current_inter_cycle",
+                             inter_data["cycle"], inter_data["target"], price)
+        update_stable_target(price, "major_target", "current_major_cycle",
+                             major_data["cycle"], major_data["target"], price)
 
-                df_res = pd.DataFrame(results)
+        # ==========================
+        # Print cycles & stable targets
+        # ==========================
+        print("\n", datetime.now())
+        print(f"Price: {price:.2f}")
+        print("FAST Cycle:", fast_data["cycle"], "StableTarget:", state.fast_target)
+        print("INTER Cycle:", inter_data["cycle"], "StableTarget:", state.inter_target)
+        print("MAJOR Cycle:", major_data["cycle"], "StableTarget:", state.major_target)
 
-                up_score = sum(1 for r in results if r['Trend']=="UP CYCLE")
-                down_score = sum(1 for r in results if r['Trend']=="DOWN CYCLE")
+        # ==========================
+        # Print per-TF Analysis (vertical)
+        # ==========================
+        print("\nPer-TF Analysis:")
+        all_data_map = [(FAST_TF, fast_data), (INTER_TF, inter_data), (MAJOR_TF, major_data)]
+        for tf_list, data in all_data_map:
+            for i, tf in enumerate(tf_list):
+                print(f"\nTF: {tf}")
+                print(f"Cycle: {data['per_tf_cycle'][i]}")
+                print(f"Target: {data['per_tf_target'][i]:.2f}")
+                print(f"BullVol: {data['vol_bull'][i]:.2f}")
+                print(f"BearVol: {data['vol_bear'][i]:.2f}")
+                print(f"Support: {data['support'][i]:.2f}")
+                print(f"Resistance: {data['resistance'][i]:.2f}")
+                print(f"PhaseScore: {state.phase_score[tf]:.4f}")
 
-                if up_score>down_score:
-                    overall="UP DOMINANT"
-                    color="\033[92m"
-                elif down_score>up_score:
-                    overall="DOWN DOMINANT"
-                    color="\033[91m"
-                else:
-                    overall="NEUTRAL"
-                    color="\033[93m"
+        # ==========================
+        # Target Priority
+        # ==========================
+        targets = {
+            "FAST": state.fast_target,
+            "INTER": state.inter_target,
+            "MAJOR": state.major_target
+        }
 
-                os.system('cls' if os.name=='nt' else 'clear')
+        priority_order = sorted(targets.items(), key=lambda x: abs(x[1] - price))
 
-                print(f"=== {SYMBOL} LIVE SCANNER ===")
-                print(pd.Timestamp.now())
-                print("-"*130)
-                print(df_res.to_string(index=False))
-                print("-"*130)
-                print(f"Loaded TF: {len(loaded)}/{len(TIMEFRAMES)}")
-                print(f"MTF DOMINANCE: {color}{overall}\033[0m")
-                print(f"UP: {up_score} | DOWN: {down_score}")
+        print("\nTarget Priority (closest first):")
+        for rank, (name, t) in enumerate(priority_order, start=1):
+            print(f"{rank}. {name} Target: {t:.2f} (distance: {abs(t - price):.2f})")
 
-            elapsed=time.time()-loop_start
-            time.sleep(max(0,5-elapsed))
+        # ==========================
+        # Resonance Score
+        # ==========================
+        print("\nResonance Score:", state.resonance_score)
 
-    except KeyboardInterrupt:
-        print("Stopping...")
-        sys.exit(0)
+        stop_event.wait(SCAN_INTERVAL)
 
-if __name__=="__main__":
-    run_mtf_scan()
+    except Exception as e:
+        print("Engine Error:", e)
+        stop_event.wait(2)
+
+print("Engine stopped cleanly.")
