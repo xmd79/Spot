@@ -17,7 +17,7 @@ SYMBOL = "BTCUSDC"
 
 FAST_TF = ["1m", "3m", "5m"]
 INTER_TF = ["15m", "30m", "1h"]
-MAJOR_TF = ["2h", "4h"]
+MAJOR_TF = ["2h", "4h", "8h", "12h", "1d"]  # added higher TFs
 
 LOOKBACK = 1000
 SCAN_INTERVAL = 5
@@ -67,11 +67,8 @@ def get_data(symbol, tf):
         "ct","qv","nt","tb","tq","ig"
     ])
     
-    # Convert all needed columns to float safely
     for col in ["open", "high", "low", "close", "vol"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    
-    # Drop any rows with missing critical data
     df.dropna(subset=["close", "high", "low", "vol"], inplace=True)
     
     return df
@@ -167,6 +164,27 @@ def resonance_alignment(cycles):
     total = len(cycles)
     score = (up - down) / total
     return score
+
+# ==========================
+# RESONANCE INTERPRETER
+# ==========================
+def interpret_resonance(score):
+    if score == 1:
+        return "Strongly bullish alignment"
+    elif score > 0.3:
+        return "Mostly bullish"
+    elif score > 0:
+        return "Slightly bullish"
+    elif score == 0:
+        return "Neutral / mixed"
+    elif score > -0.3:
+        return "Slightly bearish"
+    elif score > -1:
+        return "Mostly bearish"
+    elif score == -1:
+        return "Strongly bearish"
+    else:
+        return "Unknown"
 
 # ==========================
 # PROCESS TF GROUP
@@ -297,6 +315,14 @@ while not stop_event.is_set():
         # Resonance Score
         # ==========================
         print("\nResonance Score:", state.resonance_score)
+
+        # ==========================
+        # Resonance Interpretation
+        # ==========================
+        print("\nResonance Interpretation:")
+        for layer, score in state.resonance_score.items():
+            status = interpret_resonance(score)
+            print(f"{layer}: Score={score:.4f} -> {status}")
 
         stop_event.wait(SCAN_INTERVAL)
 
