@@ -16,8 +16,8 @@ from binance.client import Client
 SYMBOL = "BTCUSDC"
 
 FAST_TF = ["1m", "3m", "5m"]
-INTER_TF = ["15m", "30m", "1h"]
-MAJOR_TF = ["2h", "4h", "8h", "12h", "1d"]  # added higher TFs
+INTER_TF = ["15m", "30m", "1h", "2h"]  # added 2h to mid-term group
+MAJOR_TF = ["4h", "8h", "12h", "1d"]    # only high TFs
 
 LOOKBACK = 1000
 SCAN_INTERVAL = 5
@@ -50,9 +50,10 @@ class CycleEngineState:
         self.inter_target = None
         self.fast_target = None
 
-        # v2 predictive features
         self.phase_score = {}
         self.resonance_score = {}
+        self.vol_comp = {}
+        self.bull_bear_vol = {}
 
 state = CycleEngineState()
 
@@ -66,11 +67,9 @@ def get_data(symbol, tf):
         "time","open","high","low","close","vol",
         "ct","qv","nt","tb","tq","ig"
     ])
-    
     for col in ["open", "high", "low", "close", "vol"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=["close", "high", "low", "vol"], inplace=True)
-    
     return df
 
 # ==========================
@@ -87,18 +86,8 @@ def extrema(close):
     maxs = argrelextrema(arr, np.greater_equal, order=5)[0]
     return mins, maxs
 
-def regime_prob(close):
-    try:
-        p = adfuller(close)[1]
-        return float(1 - p)
-    except:
-        return 0.5
-
 def detect_cycle(phase):
     return "UP" if phase > 0 else "DOWN"
-
-def liquidity_sweep(close):
-    return int(close.iloc[-1] > close.max() * 0.995 or close.iloc[-1] < close.min() * 1.005)
 
 def vol_compression(close):
     vol = np.std(close[-50:])
@@ -133,30 +122,27 @@ def update_stable_target(current_price, target_attr, cycle_attr, new_cycle, new_
         return
 
     current_cycle = getattr(state, cycle_attr)
-
     if current_cycle != new_cycle:
         setattr(state, cycle_attr, new_cycle)
         setattr(state, target_attr, new_target)
         return
-
     if stable_target is None:
         setattr(state, target_attr, new_target)
         return
-
     if new_cycle == "UP" and price >= stable_target:
         setattr(state, target_attr, new_target)
     if new_cycle == "DOWN" and price <= stable_target:
         setattr(state, target_attr, new_target)
 
 # ==========================
-# PREDICTIVE FEATURES v2
+# PREDICTIVE FEATURES
 # ==========================
 
 def phase_transition_score(close):
     phase = spectral_phase(close)
     vol_comp = vol_compression(close)
     score = (phase * (1 - vol_comp))
-    return score
+    return score, vol_comp
 
 def resonance_alignment(cycles):
     up = cycles.count("UP")
@@ -165,9 +151,6 @@ def resonance_alignment(cycles):
     score = (up - down) / total
     return score
 
-# ==========================
-# RESONANCE INTERPRETER
-# ==========================
 def interpret_resonance(score):
     if score == 1:
         return "Strongly bullish alignment"
@@ -202,7 +185,6 @@ def process_group(tf_list):
     for tf in tf_list:
         if stop_event.is_set():
             break
-
         df = get_data(SYMBOL, tf)
         close = df["close"]
 
@@ -210,9 +192,13 @@ def process_group(tf_list):
         cycle = detect_cycle(phase)
 
         target = compute_target(close, cycle)
-
         bull, bear = bullish_bearish_vol(df)
         support, resistance = support_resistance(close)
+        vcomp = vol_compression(close)
+
+        # save for predictive analysis
+        state.phase_score[tf], state.vol_comp[tf] = phase_transition_score(close)
+        state.bull_bear_vol[tf] = (bull, bear)
 
         cycles.append(cycle)
         targets.append(target)
@@ -222,15 +208,11 @@ def process_group(tf_list):
         support_list.append(support)
         resistance_list.append(resistance)
 
-        state.phase_score[tf] = phase_transition_score(close)
-
     if not cycles:
         return None
 
     price = np.mean(prices)
-    up = cycles.count("UP")
-    down = cycles.count("DOWN")
-    overall_cycle = "UP" if up >= down else "DOWN"
+    overall_cycle = "UP" if cycles.count("UP") >= cycles.count("DOWN") else "DOWN"
     target = np.mean(targets)
     resonance = resonance_alignment(cycles)
     state.resonance_score["_".join(tf_list)] = resonance
@@ -246,6 +228,25 @@ def process_group(tf_list):
         "per_tf_cycle": cycles,
         "per_tf_target": targets
     }
+
+# ==========================
+# MOST LIKELY REVERSAL TF
+# ==========================
+
+def most_likely_reversal(tf_list):
+    scores = {}
+    for tf in tf_list:
+        phase_score = state.phase_score.get(tf, 0)
+        vol_ratio = state.vol_comp.get(tf, 1)
+        bull, bear = state.bull_bear_vol.get(tf, (0.5, 0.5))
+        # predictive metric: PhaseScore magnitude * vol expansion * imbalance
+        imbalance = abs(bull - bear)
+        predictive_score = abs(phase_score) * (1/vol_ratio) * imbalance
+        scores[tf] = predictive_score
+    if scores:
+        likely_tf = max(scores, key=lambda k: scores[k])
+        return likely_tf, scores[likely_tf]
+    return None, 0
 
 # ==========================
 # MAIN ENGINE LOOP
@@ -281,7 +282,7 @@ while not stop_event.is_set():
         print("MAJOR Cycle:", major_data["cycle"], "StableTarget:", state.major_target)
 
         # ==========================
-        # Print per-TF Analysis (vertical)
+        # Per-TF Analysis (vertical)
         # ==========================
         print("\nPer-TF Analysis:")
         all_data_map = [(FAST_TF, fast_data), (INTER_TF, inter_data), (MAJOR_TF, major_data)]
@@ -304,25 +305,26 @@ while not stop_event.is_set():
             "INTER": state.inter_target,
             "MAJOR": state.major_target
         }
-
         priority_order = sorted(targets.items(), key=lambda x: abs(x[1] - price))
-
         print("\nTarget Priority (closest first):")
         for rank, (name, t) in enumerate(priority_order, start=1):
             print(f"{rank}. {name} Target: {t:.2f} (distance: {abs(t - price):.2f})")
 
         # ==========================
-        # Resonance Score
+        # Resonance Score & Interpretation
         # ==========================
         print("\nResonance Score:", state.resonance_score)
-
-        # ==========================
-        # Resonance Interpretation
-        # ==========================
         print("\nResonance Interpretation:")
         for layer, score in state.resonance_score.items():
             status = interpret_resonance(score)
             print(f"{layer}: Score={score:.4f} -> {status}")
+
+        # ==========================
+        # Most Likely Reversal TF
+        # ==========================
+        likely_tf, rev_score = most_likely_reversal(FAST_TF + INTER_TF + MAJOR_TF)
+        if likely_tf:
+            print(f"\nMost Likely Reversal TF: {likely_tf} (Predictive Score: {rev_score:.4f})")
 
         stop_event.wait(SCAN_INTERVAL)
 
