@@ -18,10 +18,10 @@ SYMBOL = "BTCUSDC"
 FAST_TF = ["1m", "3m", "5m"]
 INTER_TF = ["15m", "30m", "1h", "2h"]
 
-# Updated MAJOR_TF to include 6h as requested ("4h 6h 8h ins separated range")
+# Updated MAJOR_TF to include 6h as requested
 MAJOR_TF = ["4h", "6h", "8h"]
 
-# Added BIGGEST_TF for 12h, Daily, and Weekly ("12h daily and weekly tf added as well as biggest resonance")
+# Added BIGGEST_TF for 12h, Daily, and Weekly
 BIGGEST_TF = ["12h", "1d", "1w"]
 
 LOOKBACK = 1200 
@@ -336,33 +336,34 @@ def process_group(tf_list):
         low = df["low"].values
         high = df["high"].values
 
-        # CYCLE LOGIC: MOST RECENT ABSOLUTE EXTREMA
-        idx_low_rev = np.argmin(low[::-1])
-        idx_low = len(low) - 1 - idx_low_rev
-        val_low = low[idx_low]
+        # CYCLE LOGIC: ABSOLUTE ARGMIN/MAX OF LAST 1200 VALUES
         
-        idx_high_rev = np.argmax(high[::-1])
-        idx_high = len(high) - 1 - idx_high_rev
-        val_high = high[idx_high]
+        # Get the absolute values and their indices
+        abs_high = np.max(high)
+        abs_low = np.min(low)
         
+        idx_high = np.argmax(high)
+        idx_low = np.argmin(low)
+        
+        # Determine most recent extrema
         if idx_low > idx_high:
             cycle = "UP"
             most_recent_type = "LOW"
-            most_recent_val = val_low
+            most_recent_val = abs_low
         else:
             cycle = "DOWN"
             most_recent_type = "HIGH"
-            most_recent_val = val_high
+            most_recent_val = abs_high
             
         phase = spectral_phase(close)
         target = compute_target(close, cycle)
         bull, bear = bullish_bearish_vol(df)
         
-        support = val_low
-        resistance = val_high
+        support = abs_low
+        resistance = abs_high
         
-        abs_low_list.append(val_low)
-        abs_high_list.append(val_high)
+        abs_low_list.append(abs_low)
+        abs_high_list.append(abs_high)
         recent_extrema_type_list.append(most_recent_type)
         recent_extrema_val_list.append(most_recent_val)
 
@@ -451,7 +452,7 @@ def most_likely_reversal(tf_list):
 # MAIN ENGINE LOOP
 # ==========================
 
-print("=== INSTITUTIONAL PREDICTIVE CYCLE ENGINE v7 (25 DECIMAL FLOATS) STARTED ===")
+print("=== INSTITUTIONAL PREDICTIVE CYCLE ENGINE STARTED ===")
 
 while not stop_event.is_set():
     try:
@@ -525,8 +526,13 @@ while not stop_event.is_set():
                 print(f"  Resistance (Highest High): {abs_high:.25f}")
                 print(f"  Most Recent Extrema: {recent_type} ({recent_val:.25f})")
                 
+                # Check if inside range
                 is_between = abs_low <= price <= abs_high
-                print(f"  Close Inside Range: {'YES' if is_between else 'NO (New Range Extreme)'}")
+                
+                # Logic: "dont print that Close Inside Range: YES"
+                # Only print if it is NOT inside range (New Range Extreme)
+                if not is_between:
+                    print(f"  Close Inside Range: NO (New Range Extreme)")
                 # ------------------------------
 
                 print(f"  [LIQUIDITY ENGINE]")
