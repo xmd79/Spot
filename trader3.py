@@ -117,7 +117,7 @@ def vol_compression(close):
 
 def bullish_bearish_vol(df):
     """
-    Updated to return percentages (0.0 to 100.0) 
+    Returns percentages (0.0 to 100.0) 
     representing the symmetrical distribution of Bull vs Bear volume.
     """
     if len(df) == 0 or "vol" not in df.columns:
@@ -449,6 +449,62 @@ def most_likely_reversal(tf_list):
     return None, 0
 
 # ==========================
+# SMART MTF REVERSAL LOGIC
+# ==========================
+
+def get_smart_reversal_scan(fast_data, inter_data, major_data):
+    """
+    Determines the incoming Major Reversal (MTF DIP or MTF TOP)
+    based on divergence between cycles and trend alignment.
+    Returns: Reversal Type, Major Target Value, Fast Target Value
+    """
+    # Determine Cycle Directions
+    major_cycle = major_data['cycle']     # The Big Trend
+    fast_cycle = fast_data['cycle']       # Current Momentum
+    
+    # Extract Support/Resistance levels for targeting
+    # We use the mean of the group's levels for the "Reversal Target"
+    major_support = np.mean(major_data['support'])
+    major_resistance = np.mean(major_data['resistance'])
+    
+    # --- ML SCAN LOGIC ---
+    reversal_type = "NEUTRAL"
+    reversal_target = 0.0
+    
+    # SCENARIO 1: DIVERGENCE (Reversal imminent)
+    # Major is UP, but Fast is turning DOWN -> Expecting a DIP to Support
+    if major_cycle == "UP" and fast_cycle == "DOWN":
+        reversal_type = "MTF DIP"
+        reversal_target = major_support
+    
+    # Major is DOWN, but Fast is turning UP -> Expecting a TOP (Rally) to Resistance
+    elif major_cycle == "DOWN" and fast_cycle == "UP":
+        reversal_type = "MTF TOP"
+        reversal_target = major_resistance
+        
+    # SCENARIO 2: ALIGNMENT (Continuation)
+    # Both UP -> Price continues to Resistance (Top of move)
+    elif major_cycle == "UP" and fast_cycle == "UP":
+        reversal_type = "MTF TOP"
+        reversal_target = major_resistance
+        
+    # Both DOWN -> Price continues to Support (Bottom of move)
+    elif major_cycle == "DOWN" and fast_cycle == "DOWN":
+        reversal_type = "MTF DIP"
+        reversal_target = major_support
+
+    # Determine aligned target for Fast only (Inter is excluded from print)
+    # If we are targeting a DIP, Fast target is Support. 
+    # If we are targeting a TOP, Fast target is Resistance.
+    
+    if reversal_type == "MTF DIP":
+        fast_target_val = np.mean(fast_data['support'])
+    else: # MTF TOP or NEUTRAL
+        fast_target_val = np.mean(fast_data['resistance'])
+
+    return reversal_type, reversal_target, fast_target_val
+
+# ==========================
 # MAIN ENGINE LOOP
 # ==========================
 
@@ -494,6 +550,17 @@ while not stop_event.is_set():
         print("BIGGEST Cycle:", biggest_data["cycle"], "StableTarget:", f"{state.biggest_target:.25f}")
         print(f"Cross-TF Pressure: {div_text}")
 
+        # ==========================================
+        # SMART MTF REVERSAL SCAN OUTPUT
+        # ==========================================
+        rev_type, rev_target, fast_aligned = get_smart_reversal_scan(fast_data, inter_data, major_data)
+        
+        print("\n=== MTF SMART REVERSAL SCAN ===")
+        print(f"INCOMING REVERSAL: {rev_type}")
+        print(f"MAJOR REVERSAL TARGET: {rev_target:.25f}")
+        print(f"FAST TARGET (Aligned): {fast_aligned:.25f}")
+        # ==========================================
+
         print("\nPer-TF Analysis:")
         all_data_map = [
             (FAST_TF, fast_data), 
@@ -526,11 +593,7 @@ while not stop_event.is_set():
                 print(f"  Resistance (Highest High): {abs_high:.25f}")
                 print(f"  Most Recent Extrema: {recent_type} ({recent_val:.25f})")
                 
-                # Check if inside range
                 is_between = abs_low <= price <= abs_high
-                
-                # Logic: "dont print that Close Inside Range: YES"
-                # Only print if it is NOT inside range (New Range Extreme)
                 if not is_between:
                     print(f"  Close Inside Range: NO (New Range Extreme)")
                 # ------------------------------
@@ -549,11 +612,10 @@ while not stop_event.is_set():
         targets = {
             "FAST": state.fast_target,
             "INTER": state.inter_target,
-            "MAJOR": state.major_target,
-            "BIGGEST": state.biggest_target
+            "MAJOR": state.major_target
         }
         priority_order = sorted(targets.items(), key=lambda x: abs(x[1] - price))
-        print("\nTarget Priority (closest first):")
+        print("\nTarget Priority (Incoming Reversal - Closest First):")
         for rank, (name, t) in enumerate(priority_order, start=1):
             print(f"{rank}. {name} Target: {t:.25f} (distance: {abs(t - price):.25f})")
 
