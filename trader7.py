@@ -95,17 +95,16 @@ def get_data(symbol, tf):
 # ANALYSIS
 # ==========================
 
-def get_fft_forecast(close, forecast_len=10, top_k=3):
+def get_fft_forecast(close, forecast_len=20, top_k=3):
     """
-    Advanced FFT Forecast:
-    1. Detrends data (Linear).
-    2. Applies Hann window to reduce edge artifacts.
-    3. Identifies top_k dominant frequencies.
-    4. Projects those sine waves forward.
-    5. Re-applies trend.
+    Advanced FFT Forecast returning Directional Extremes:
+    1. Detrends & Windows data.
+    2. Reconstructs signal using top dominant frequencies.
+    3. Returns the Mean, Projected HIGH, and Projected LOW of the forecast window.
     """
     n = len(close)
-    if n < 50: return close[-1] 
+    if n < 50: 
+        return close[-1], close[-1], close[-1]
 
     # 1. Detrend
     t = np.arange(n)
@@ -145,8 +144,8 @@ def get_fft_forecast(close, forecast_len=10, top_k=3):
     future_trend = np.polyval(coeffs, future_t)
     forecast_price = forecast + future_trend
     
-    # Return the mean of the forecast period as the target
-    return float(np.mean(forecast_price))
+    # Return Mean, Max (Peak), Min (Trough) of forecast
+    return float(np.mean(forecast_price)), float(np.max(forecast_price)), float(np.min(forecast_price))
 
 def spectral_phase(close):
     f = fft(close)
@@ -377,11 +376,7 @@ def process_group(tf_list):
         close = df["close"].values
         low = df["low"].values
         high = df["high"].values
-
-        # --- FFT FORECAST (Now used as PRIMARY TARGET) ---
-        forecast_price = get_fft_forecast(close, forecast_len=10, top_k=3)
-        state.fft_forecasts[tf] = forecast_price
-        forecast_list.append(forecast_price)
+        current_price = close[-1]
 
         # --- RANGE RULE LOGIC (Strictly Last 200 Values) ---
         window_len = 200
@@ -394,6 +389,7 @@ def process_group(tf_list):
         idx_low_rel = int(np.argmin(low_200))
         idx_high_rel = int(np.argmax(high_200))
         
+        # Cycle Detection based on Recent Extrema
         if idx_low_rel > idx_high_rel:
             cycle = "UP"
             most_recent_type = "LOW"
@@ -403,13 +399,71 @@ def process_group(tf_list):
             most_recent_type = "HIGH"
             most_recent_val = abs_high
             
+        # --- FFT FORECAST (Directional Logic) ---
+        # Get Mean, Peak, Trough
+        fft_mean, fft_high, fft_low = get_fft_forecast(close, forecast_len=10, top_k=3)
+        state.fft_forecasts[tf] = (fft_mean, fft_high, fft_low)
+        
+        # --- TARGET SELECTION (Volume & Wick Validated) ---
+        # Get Volume Metrics
+        bull_vol_pct, bear_vol_pct = bullish_bearish_vol(df)
+        
+        # Get Wick/Sweep Metrics
+        sweep_status, sh_prob = detect_sweep_and_stop_hunt(df, cycle)
+        state.liquidity_sweeps[tf] = sweep_status
+        state.stop_hunt_prob[tf] = sh_prob
+
+        # Determine "Realistic" Target
+        target = 0.0
+        
+        if cycle == "UP":
+            # Default Target is FFT Projected Peak
+            target = fft_high
+            
+            # Sanity Check: Must be above price
+            if target < current_price:
+                target = current_price * 1.005 # Fallback minimal slope
+            
+            # Volume/Wick Validation
+            # If Bear Vol is dominating, the FFT Peak might be weak. 
+            # If Wick is BULL_SWEEP, it confirms the UP move.
+            if bull_vol_pct < bear_vol_pct and sweep_status != "BULL_SWEEP":
+                # Pressure is weak, target might be closer (Mean rather than Peak)
+                if fft_mean > current_price:
+                    target = fft_mean
+            
+            # Magnet Zone Logic
+            magnet_zone = forced_liquidation_magnet(df, cycle)
+            state.magnet_zones[tf] = magnet_zone
+            # If Magnet (Resistance) is above price, target is min(Fixed Resistance, FFT Peak)
+            if magnet_zone > current_price:
+                target = min(target, magnet_zone)
+                
+        else: # cycle == "DOWN"
+            # Default Target is FFT Projected Trough
+            target = fft_low
+            
+            # Sanity Check: Must be below price
+            if target > current_price:
+                target = current_price * 0.995 # Fallback
+            
+            # Volume/Wick Validation
+            # If Bull Vol is dominating, the FFT Trough might be shallow.
+            # If Wick is BEAR_SWEEP, it confirms the DOWN move.
+            if bear_vol_pct < bull_vol_pct and sweep_status != "BEAR_SWEEP":
+                # Pressure is weak, target might be closer (Mean rather than Trough)
+                if fft_mean < current_price:
+                    target = fft_mean
+            
+            # Magnet Zone Logic
+            magnet_zone = forced_liquidation_magnet(df, cycle)
+            state.magnet_zones[tf] = magnet_zone
+            # If Magnet (Support) is below price, target is max(Fixed Support, FFT Trough)
+            if magnet_zone < current_price:
+                target = max(target, magnet_zone)
+
+        # --- Store Metrics ---
         phase = spectral_phase(close)
-        
-        # CHANGE: Target is now the FFT Prediction, not percentile
-        target = forecast_price 
-        
-        bull, bear = bullish_bearish_vol(df)
-        
         support = abs_low
         resistance = abs_high
         
@@ -419,13 +473,6 @@ def process_group(tf_list):
         recent_extrema_val_list.append(most_recent_val)
 
         vcomp = vol_compression(close)
-
-        sweep_status, sh_prob = detect_sweep_and_stop_hunt(df, cycle)
-        state.liquidity_sweeps[tf] = sweep_status
-        state.stop_hunt_prob[tf] = sh_prob
-        
-        magnet_zone = forced_liquidation_magnet(df, cycle)
-        state.magnet_zones[tf] = magnet_zone
         
         exh_score = reversal_exhaustion_detection(df)
         state.exhaustion_levels[tf] = exh_score
@@ -440,15 +487,16 @@ def process_group(tf_list):
         regime_list.append(regime)
 
         state.phase_score[tf], state.vol_comp[tf] = phase_transition_score(close)
-        state.bull_bear_vol[tf] = (bull, bear)
+        state.bull_bear_vol[tf] = (bull_vol_pct, bear_vol_pct)
 
         cycles.append(cycle)
         targets.append(target)
-        prices.append(close[-1])
-        vol_bull.append(bull)
-        vol_bear.append(bear)
+        prices.append(current_price)
+        vol_bull.append(bull_vol_pct)
+        vol_bear.append(bear_vol_pct)
         support_list.append(support)
         resistance_list.append(resistance)
+        forecast_list.append(target) # Storing the calculated directional target
 
     if not cycles:
         return None
@@ -572,11 +620,11 @@ while not stop_event.is_set():
         state.divergence_pressure = divergence_val
 
         print("\n", datetime.now())
-        print(f"Price: {price:.25f}")
-        print("FAST Cycle:", fast_data["cycle"], "FFT Target:", f"{state.fast_target:.25f}")
-        print("INTER Cycle:", inter_data["cycle"], "FFT Target:", f"{state.inter_target:.25f}")
-        print("MAJOR Cycle:", major_data["cycle"], "FFT Target:", f"{state.major_target:.25f}")
-        print("BIGGEST Cycle:", biggest_data["cycle"], "FFT Target:", f"{state.biggest_target:.25f}")
+        print(f"Price: {price:.4f}")
+        print("FAST Cycle:", fast_data["cycle"], "Target:", f"{state.fast_target:.4f}")
+        print("INTER Cycle:", inter_data["cycle"], "Target:", f"{state.inter_target:.4f}")
+        print("MAJOR Cycle:", major_data["cycle"], "Target:", f"{state.major_target:.4f}")
+        print("BIGGEST Cycle:", biggest_data["cycle"], "Target:", f"{state.biggest_target:.4f}")
         print(f"Cross-TF Pressure: {div_text}")
 
         # ==========================================
@@ -586,8 +634,8 @@ while not stop_event.is_set():
         
         print("\n=== MTF SMART REVERSAL SCAN ===")
         print(f"INCOMING REVERSAL: {rev_type}")
-        print(f"MAJOR REVERSAL TARGET: {rev_target:.25f}")
-        print(f"FAST TARGET (Aligned): {fast_aligned:.25f}")
+        print(f"MAJOR REVERSAL TARGET: {rev_target:.4f}")
+        print(f"FAST TARGET (Aligned): {fast_aligned:.4f}")
         # ==========================================
 
         print("\nPer-TF Analysis:")
@@ -602,13 +650,11 @@ while not stop_event.is_set():
             for i, tf in enumerate(tf_list):
                 print(f"\nTF: {tf}")
                 print(f"Cycle: {data['per_tf_cycle'][i]}")
-                # This target is now explicitly the FFT Forecast
-                print(f"Target (FFT): {data['per_tf_target'][i]:.25f}")
+                print(f"Target (FFT Directional): {data['per_tf_target'][i]:.4f}")
                 
                 bull_vol_val = data['vol_bull'][i]
                 bear_vol_val = data['vol_bear'][i]
-                print(f"BullVol: {bull_vol_val:.25f}%")
-                print(f"BearVol: {bear_vol_val:.25f}%")
+                print(f"BullVol: {bull_vol_val:.2f}% vs BearVol: {bear_vol_val:.2f}%")
                 
                 # --- RANGE RULE PRINT ---
                 abs_low = data['abs_lows'][i]
@@ -617,9 +663,9 @@ while not stop_event.is_set():
                 recent_val = data['recent_vals'][i]
                 
                 print(f"  [200-CANDLE RANGE RULE]")
-                print(f"  Support (Lowest Low): {abs_low:.25f}")
-                print(f"  Resistance (Highest High): {abs_high:.25f}")
-                print(f"  Most Recent Extrema: {recent_type} ({recent_val:.25f})")
+                print(f"  Support (Lowest Low): {abs_low:.4f}")
+                print(f"  Resistance (Highest High): {abs_high:.4f}")
+                print(f"  Most Recent Extrema: {recent_type} ({recent_val:.4f})")
                 
                 is_between = abs_low <= price <= abs_high
                 if not is_between:
@@ -629,12 +675,12 @@ while not stop_event.is_set():
                 print(f"  Regime: {data['regimes'][i]}")
                 sweep = data['sweeps'][i]
                 if sweep != "NONE":
-                    print(f"  ALERT: {sweep} (Prob: {data['sh_probs'][i]:.25f})")
-                print(f"  Magnet Zone: {data['magnets'][i]:.25f}")
+                    print(f"  ALERT: {sweep} (Prob: {data['sh_probs'][i]:.2f})")
+                print(f"  Magnet Zone: {data['magnets'][i]:.4f}")
                 if data['exhaustions'][i] > 0.6:
-                    print(f"  EXHAUSTION DETECTED: {data['exhaustions'][i]:.25f}")
+                    print(f"  EXHAUSTION DETECTED: {data['exhaustions'][i]:.2f}")
                 
-                print(f"  PhaseScore: {state.phase_score[tf]:.25f}")
+                print(f"  PhaseScore: {state.phase_score[tf]:.4f}")
 
         targets = {
             "FAST": state.fast_target,
@@ -642,19 +688,19 @@ while not stop_event.is_set():
             "MAJOR": state.major_target
         }
         priority_order = sorted(targets.items(), key=lambda x: abs(x[1] - price))
-        print("\nTarget Priority (FFT Forecast - Closest First):")
+        print("\nTarget Priority (Directional FFT - Closest First):")
         for rank, (name, t) in enumerate(priority_order, start=1):
-            print(f"{rank}. {name} Target: {t:.25f} (distance: {abs(t - price):.25f})")
+            print(f"{rank}. {name} Target: {t:.4f} (distance: {abs(t - price):.4f})")
 
         print("\nResonance Score:", state.resonance_score)
         print("\nResonance Interpretation:")
         for layer, score in state.resonance_score.items():
             status = interpret_resonance(score)
-            print(f"{layer}: Score={score:.25f} -> {status}")
+            print(f"{layer}: Score={score:.2f} -> {status}")
 
         likely_tf, rev_score = most_likely_reversal(FAST_TF + INTER_TF + MAJOR_TF + BIGGEST_TF)
         if likely_tf:
-            print(f"\nMost Likely Reversal TF: {likely_tf} (Predictive Score: {rev_score:.25f})")
+            print(f"\nMost Likely Reversal TF: {likely_tf} (Predictive Score: {rev_score:.4f})")
 
         stop_event.wait(SCAN_INTERVAL)
 
