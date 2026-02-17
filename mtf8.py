@@ -3,12 +3,16 @@ import numpy as np
 import talib as ta
 import sys
 import concurrent.futures
+import re
 
 # --- Configuration ---
 RSI_LENGTH = 14
-VOLUME_SMA_LENGTH = 20  # For volume average calculation
-VOLUME_MULTIPLIER = 1.5 # Threshold for "Spike" (e.g. 1.5x average volume)
-FFT_FORECAST_BARS = 10  # Project next 30 mins (10 * 3m)
+VOLUME_SMA_LENGTH = 20
+LOOKBACK_LIMIT = 500  # Window for Extrema calculation
+
+# Physics/Thermo Constants
+PHI = 1.61803398875
+GOLDEN_RATIO_DERIV = 0.61803398875
 
 class Trader:
     def __init__(self, file):
@@ -27,8 +31,24 @@ class Trader:
     def get_usdc_pairs(self):
         try:
             exchange_info = self.client.get_exchange_info()
-            trading_pairs = [symbol['symbol'] for symbol in exchange_info['symbols'] 
-                             if symbol['quoteAsset'] == 'USDC' and symbol['status'] == 'TRADING']
+            trading_pairs = []
+            
+            for symbol in exchange_info['symbols']:
+                # 1. Must be USDC pair
+                if symbol['quoteAsset'] != 'USDC':
+                    continue
+                    
+                # 2. Must be Trading
+                if symbol['status'] != 'TRADING':
+                    continue
+                
+                # 3. Strict English Abbreviation Check
+                base_asset = symbol['baseAsset']
+                if not re.match(r'^[A-Z0-9]+$', base_asset):
+                    continue
+                
+                trading_pairs.append(symbol['symbol'])
+                
             return trading_pairs
         except Exception as e:
             print(f"Error fetching pairs: {e}")
@@ -37,9 +57,8 @@ class Trader:
 filename = 'credentials.txt'
 trader = Trader(filename)
 
-def get_klines_data(client, symbol, interval, limit=100):
+def get_klines_data(client, symbol, interval, limit=500):
     try:
-        # Increased limit slightly for better FFT resolution
         klines = client.get_klines(symbol=symbol, interval=interval, limit=limit)
         if not klines or len(klines) < 50: 
             return None
@@ -48,264 +67,263 @@ def get_klines_data(client, symbol, interval, limit=100):
         highs = np.array([float(entry[2]) for entry in klines], dtype=np.float64)
         lows = np.array([float(entry[3]) for entry in klines], dtype=np.float64)
         volumes = np.array([float(entry[5]) for entry in klines], dtype=np.float64)
-        raw_closes = [float(entry[4]) for entry in klines]
         
-        return closes, highs, lows, volumes, raw_closes
+        return closes, highs, lows, volumes
     except Exception:
         return None
 
-def check_regression_dip(symbol, interval, client):
-    """ Checks if price is below the lower regression band (0.99 factor) """
-    data = get_klines_data(client, symbol, interval, limit=100)
-    if data is None:
-        return False
+def analyze_extrema(lows, highs, timeframe_name):
+    """
+    Analyzes Lowest Low and Highest High over the LOOKBACK_LIMIT.
+    Determines which occurred more recently (ArgMin vs ArgMax).
+    """
+    l_vals = lows[-LOOKBACK_LIMIT:]
+    h_vals = highs[-LOOKBACK_LIMIT:]
     
-    close = data[0]
+    ll_val = np.min(l_vals)
+    hh_val = np.max(h_vals)
     
-    if np.std(close) == 0:
-        return False
+    idx_ll = int(np.argmin(l_vals))
+    idx_hh = int(np.argmax(h_vals))
+    
+    # Convert to "bars ago" (0 = most recent)
+    bars_ago_ll = (LOOKBACK_LIMIT - 1) - idx_ll
+    bars_ago_hh = (LOOKBACK_LIMIT - 1) - idx_hh
+    
+    recent_extrema = "NONE"
+    if bars_ago_ll < bars_ago_hh:
+        recent_extrema = "ARGMIN (Low)"
+    else:
+        recent_extrema = "ARGMAX (High)"
+        
+    return {
+        'timeframe': timeframe_name,
+        'll': ll_val,
+        'hh': hh_val,
+        'bars_ago_ll': bars_ago_ll,
+        'bars_ago_hh': bars_ago_hh,
+        'recent_type': recent_extrema
+    }
 
-    # Regression Logic
-    x = close
-    y = range(len(x))
+def check_volume_induction(lows, volumes):
+    """
+    Checks if the lowest low was accompanied by a volume spike.
+    """
+    l_vals = lows[-LOOKBACK_LIMIT:]
+    v_vals = volumes[-LOOKBACK_LIMIT:]
     
+    idx_ll = int(np.argmin(l_vals))
+    vol_at_ll = v_vals[idx_ll]
+    
+    avg_vol = np.mean(v_vals)
+    
+    is_induction = vol_at_ll > (avg_vol * 1.2)
+    return is_induction, vol_at_ll, avg_vol
+
+def analyze_ht_sine(closes):
+    """
+    Uses Hilbert Transform Sine Wave to detect cycle turns.
+    """
     try:
-        coeffs = np.polyfit(y, x, 1)
-        best_fit_line1 = np.polyval(coeffs, y)
-        best_fit_line3 = best_fit_line1 * 0.99  # Lower band
+        sine, leadsine = ta.HT_SINE(closes)
         
-        if x[-1] < best_fit_line3[-1]:
-            return True
+        s_val = sine[-1]
+        ls_val = leadsine[-1]
+        s_prev = sine[-2]
+        ls_prev = leadsine[-2]
+        
+        signal = "HOLD"
+        
+        if ls_val > s_val and ls_prev <= s_prev:
+            signal = "REVERSAL_UP" 
+        elif ls_val < s_val and ls_prev >= s_prev:
+            signal = "REVERSAL_DOWN" 
+            
+        return signal, s_val, ls_val
     except:
-        pass
-        
-    return False
+        return "ERROR", 0, 0
 
 def calculate_fft_forecast(closes):
     """
-    Fast FFT Forecast Algo:
-    1. Detrend data (remove linear trend).
-    2. FFT to find frequencies.
-    3. Filter noise (keep top 5 dominant cycles).
-    4. Reconstruct and project forward.
+    FFT Forecast - Used for direction validation only.
     """
     n = len(closes)
-    
-    # 1. Detrend
     t = np.arange(n)
     coeffs = np.polyfit(t, closes, 1)
     trend = np.polyval(coeffs, t)
     detrended = closes - trend
     
-    # 2. FFT
     fft_vals = np.fft.fft(detrended)
     freqs = np.fft.fftfreq(n)
     
-    # 3. Filter Noise (Keep top dominant frequencies)
-    # Sort by amplitude (absolute value)
     indices = np.argsort(np.abs(fft_vals))[::-1]
     
-    # Zero out small frequencies (noise cancellation)
-    filtered_fft = np.zeros_like(fft_vals)
-    keep_n = 5 # Keep top 5 cycles for 'fast' signal
-    for i in indices[:keep_n]:
-        filtered_fft[i] = fft_vals[i]
-        
-    # 4. Inverse FFT to get cleaned cycle
-    cleaned_cycle = np.fft.ifft(filtered_fft).real
+    forecast_bars = 10
+    future_t = np.arange(n, n + forecast_bars)
+    forecast_signal = np.zeros(forecast_bars)
     
-    # Forecast next steps
-    forecast = []
-    last_t = n - 1
-    
-    # We manually project the dominant frequencies forward
-    # Recalculate the future values using the filtered spectrum
-    future_t = np.arange(n, n + FFT_FORECAST_BARS)
-    forecast_signal = np.zeros(FFT_FORECAST_BARS)
-    
+    keep_n = 3
     for i in indices[:keep_n]:
         amp = np.abs(fft_vals[i]) / n
         phase = np.angle(fft_vals[i])
         freq = freqs[i]
-        # Forecast component: amp * cos(2*pi*freq*t + phase)
         forecast_signal += amp * np.cos(2 * np.pi * freq * future_t + phase)
     
-    # Re-add the trend
     future_trend = np.polyval(coeffs, future_t)
     forecast_prices = forecast_signal + future_trend
     
     return forecast_prices
 
-def analyze_final_candidate(symbol, client):
-    """
-    Final analysis: RSI, Volume Spike, and FFT Target Calculation.
-    """
-    data = get_klines_data(client, symbol, '3m', limit=100)
-    if data is None:
-        return None
-
-    closes, highs, lows, volumes, raw_closes = data
-
-    if np.std(closes) == 0:
-        return None
-
-    # 1. RSI Calculation
-    try:
-        rsi_array = ta.RSI(closes, timeperiod=RSI_LENGTH)
-        if np.isnan(rsi_array[-1]):
-            return None
-        current_rsi = rsi_array[-1]
-    except:
-        return None
-
-    # 2. Volume Spike Check
-    vol_sma = ta.SMA(volumes, timeperiod=VOLUME_SMA_LENGTH)
-    current_vol = volumes[-1]
-    avg_vol = vol_sma[-1]
-    
-    # If volume is 0 or NaN, skip
-    if np.isnan(avg_vol) or avg_vol == 0:
-        return None
-        
-    vol_ratio = current_vol / avg_vol
-    
-    # 3. FFT Forecast
-    try:
-        forecast_prices = calculate_fft_forecast(closes)
-        # Target is the highest price in the forecast window
-        target_price = np.max(forecast_prices)
-        # Confidence: Check if forecast is generally upward
-        trend_direction = "UP" if forecast_prices[-1] > closes[-1] else "DOWN/NEUTRAL"
-    except:
-        return None
-
-    # Algo Scoring: 
-    # We want Low RSI (oversold) and High Volume (reversal pressure)
-    # Score = (100 - RSI) * VolumeRatio. Higher is better.
-    score = (100 - current_rsi) * vol_ratio
-
-    return {
-        'symbol': symbol,
-        'rsi': current_rsi,
-        'score': score,
-        'last_close': closes[-1],
-        'volume_ratio': vol_ratio,
-        'target_price': target_price,
-        'forecast_trend': trend_direction,
-        'forecast_data': forecast_prices,
-        'last_10_closes': raw_closes[-10:]
-    }
-
-def run_stage_filter(symbols, interval, client):
-    found_pairs = []
-    # print(f"Scanning {len(symbols)} pairs on {interval}...") # Reduced verbosity for speed
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_symbol = {executor.submit(check_regression_dip, symbol, interval, client): symbol for symbol in symbols}
-        
-        for future in concurrent.futures.as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                if future.result():
-                    found_pairs.append(symbol)
-            except Exception:
-                pass
-    
-    return found_pairs
-
-def run_final_analysis(symbols, client):
+def check_mtf_dip(symbols, client):
     candidates = []
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        future_to_symbol = {executor.submit(analyze_final_candidate, symbol, client): symbol for symbol in symbols}
-        
-        for future in concurrent.futures.as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                result = future.result()
-                if result:
-                    # Filter: Only keep if Volume Spike exists (Ratio > 1.0 minimum) and RSI < 40
-                    if result['volume_ratio'] > 1.0 and result['rsi'] < 40:
-                        candidates.append(result)
-            except Exception:
-                pass
+    # Expanded Timeframes
+    timeframes = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h']
     
-    # Sort by Highest Score (Best Risk/Reward)
-    candidates.sort(key=lambda x: x['score'], reverse=True)
-    return candidates
+    def process_symbol(symbol):
+        data_map = {}
+        
+        # Fetch all TFs
+        for tf in timeframes:
+            data = get_klines_data(client, symbol, tf, 500)
+            if data:
+                data_map[tf] = data
+            else:
+                return None # Skip if any TF data missing
+        
+        # Analyze Extrema for all TFs
+        extrema_map = {}
+        for tf, data in data_map.items():
+            c, h, l, v = data
+            extrema_map[tf] = analyze_extrema(l, h, tf)
+        
+        # --- CRITERIA CHECK ---
+        
+        # 1. Strict 1m and 5m Criteria: MUST be ArgMin Recent
+        if extrema_map['1m']['recent_type'] != "ARGMIN (Low)":
+            return None
+        if extrema_map['5m']['recent_type'] != "ARGMIN (Low)":
+            return None
+            
+        # 2. Majority TF Criteria: Most TFs must have ArgMin Recent
+        argmin_count = 0
+        for tf in timeframes:
+            if extrema_map[tf]['recent_type'] == "ARGMIN (Low)":
+                argmin_count += 1
+        
+        # Require strict majority (e.g., > 4 out of 8)
+        if argmin_count < 5:
+            return None
+            
+        # 3. Volume Induction (1m)
+        c_1m, h_1m, l_1m, v_1m = data_map['1m']
+        induction_1m, vol_ll, avg_vol = check_volume_induction(l_1m, v_1m)
+        if not induction_1m:
+            return None
+
+        # 4. Target Calculation (Phi Resistance 0.618 from 5m)
+        c_5m, h_5m, l_5m, v_5m = data_map['5m']
+        hh_5m = extrema_map['5m']['hh']
+        ll_5m = extrema_map['5m']['ll']
+        price_range = hh_5m - ll_5m
+        
+        target_price = ll_5m + (price_range * GOLDEN_RATIO_DERIV)
+        current_price = c_5m[-1]
+        
+        if current_price >= target_price:
+            return None
+
+        # 5. Sine Signal Confirmation
+        sig_5m, _, _ = analyze_ht_sine(c_5m)
+        sig_1m, _, _ = analyze_ht_sine(c_1m)
+        
+        if sig_5m != "REVERSAL_UP" and sig_1m != "REVERSAL_UP":
+            return None
+
+        # FFT Forecast
+        forecast = calculate_fft_forecast(c_5m)
+        
+        # Scoring
+        rsi = ta.RSI(c_5m, 14)[-1]
+        score = (target_price - current_price) * 1000
+        score += (100 - rsi)
+        if sig_5m == "REVERSAL_UP": score += 50
+        
+        return {
+            'symbol': symbol,
+            'price': current_price,
+            'target': target_price,
+            'rsi': rsi,
+            'score': score,
+            'extrema_map': extrema_map, # Pass all extrema data
+            'induction_vol': vol_ll,
+            'avg_vol': avg_vol,
+            'sine_sig_5m': sig_5m,
+            'sine_sig_1m': sig_1m,
+            'forecast': forecast,
+            'phi_support': ll_5m
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        results = list(executor.map(process_symbol, symbols))
+        
+    return [r for r in results if r is not None]
 
 # --- Main Execution ---
 
 print("Fetching trading pairs...")
 trading_pairs = trader.get_usdc_pairs()
+print(f"Scanning {len(trading_pairs)} USDC pairs ...")
 
-# Stage 1: 2h Filter
-filtered_pairs_2h = run_stage_filter(trading_pairs, '2h', trader.client)
-if not filtered_pairs_2h:
-    print("No dips on 2h.")
-    sys.exit(0)
+candidates = check_mtf_dip(trading_pairs, trader.client)
 
-# Stage 2: 15m Filter
-filtered_pairs_15m = run_stage_filter(filtered_pairs_2h, '15m', trader.client)
-if not filtered_pairs_15m:
-    print("No dips on 15m.")
-    sys.exit(0)
-
-# Stage 3: 5m Filter
-filtered_pairs_5m = run_stage_filter(filtered_pairs_15m, '5m', trader.client)
-if not filtered_pairs_5m:
-    print("No dips on 5m.")
-    sys.exit(0)
-
-# Stage 4: 3m Analysis (RSI + FFT + Volume)
-final_candidates = run_final_analysis(filtered_pairs_5m, trader.client)
-
-# Results
-if final_candidates:
-    print("\n" + "="*70)
-    print(f"=== BEST MTF DIP CANDIDATE (FFT Forecast & Volume Confirmed) ===")
-    print("="*70)
+if candidates:
+    candidates.sort(key=lambda x: x['score'], reverse=True)
     
-    best = final_candidates[0]
+    best = candidates[0]
+    
+    print("\n" + "="*100)
+    print(f"=== CRITERIA MET: Strict ArgMin Recent (1m/5m) & Majority TFs ArgMin ===")
+    print("="*100)
     
     print(f"\n[WINNER] {best['symbol']}")
-    print(f"Current Price: {best['last_close']:.5f}")
-    print(f"RSI (3m): {best['rsi']:.2f}")
-    print(f"Vol Spike: {best['volume_ratio']:.2f}x Avg")
-    print(f"Algo Score: {best['score']:.2f}")
+    print(f"Current Price: {best['price']:.25f}")
+    print(f"Algo Score:    {best['score']:.25f}")
+    print(f"RSI (5m):      {best['rsi']:.25f}")
     
-    print("-" * 70)
-    print("TRADE SETUP (Forecast FFT):")
-    print("-" * 70)
+    print("-" * 100)
+    print("EXTREMA ANALYSIS (Per Timeframe - 25 Decimal Precision):")
+    print("-" * 100)
     
-    # Entry Logic: Current price or slight dip
-    entry_price = best['last_close']
-    target_price = best['target_price']
+    # Print logic for all TFs
+    tf_order = ['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h']
+    for tf in tf_order:
+        ext = best['extrema_map'][tf]
+        print(f"{tf:<5} | Recent: {ext['recent_type']:<15} | LL: {ext['ll']:.25f} | HH: {ext['hh']:.25f}")
     
-    # Stop Loss: Below recent low (safety)
-    # We can approximate a stop for display purposes based on last 10 candles low
-    stop_price = min(best['last_10_closes']) * 0.999 
+    print("-" * 100)
+    print("VOLUME INDUCTION (1m Support Confirmation):")
+    print("-" * 100)
+    print(f"Vol at Low: {best['induction_vol']:.25f} vs Avg Vol: {best['avg_vol']:.25f}")
     
-    print(f"Best Entry Price: {entry_price:.5f} (Market or Limit)")
-    print(f"Target Exit Price (FFT): {target_price:.5f}")
-    print(f"Forecast Direction: {best['forecast_trend']}")
-    print(f"Suggested Stop Loss: {stop_price:.5f}")
+    print("-" * 100)
+    print("TARGET LOGIC:")
+    print("-" * 100)
+    print(f"Target (Phi Resistance 0.618): {best['target']:.25f}")
+    print(f"Stop Loss (5m LL):             {best['phi_support']:.25f}")
     
-    # Verify FFT Forecast Prints
-    print("-" * 70)
-    print("FFT PRICE PROJECTION (Next 30 mins):")
-    print("-" * 70)
-    for i, f_price in enumerate(best['forecast_data']):
-        # Assuming 3m interval, steps are 3 mins
-        minutes = (i+1) * 3
-        print(f" +{minutes}m: {f_price:.5f}")
-        
-    print("="*70)
+    print("-" * 100)
+    print("SINE SIGNALS:")
+    print("-" * 100)
+    print(f"5m Sine: {best['sine_sig_5m']} | 1m Sine: {best['sine_sig_1m']}")
     
-    print("\nTop 5 Candidates (Score Ranked):")
-    for i, c in enumerate(final_candidates[:5]):
-        print(f"{i+1}. {c['symbol']} | RSI: {c['rsi']:.2f} | Vol: {c['volume_ratio']:.2f}x | Target: {c['target_price']:.5f}")
+    print("="*100)
+    
+    print("\nTop 5 Candidates:")
+    for i, c in enumerate(candidates[:5]):
+        print(f"{i+1}. {c['symbol']} | Score: {c['score']:.0f} | Tgt: {c['target']:.25f}")
+
 else:
-    print("No candidates found matching MTF dip + Volume Spike criteria.")
+    print("No candidates found matching strict ArgMin recency and Volume Induction criteria.")
 
 sys.exit(0)
