@@ -3,7 +3,7 @@ import pandas as pd
 import time
 import signal
 import threading
-import talib as ta  # Required for HT_SINE
+import talib as ta
 from datetime import datetime
 from scipy.signal import argrelextrema
 from scipy.fft import fft, fftfreq
@@ -21,14 +21,13 @@ INTER_TF = ["15m", "30m", "1h", "2h"]
 MAJOR_TF = ["4h", "6h", "8h"]
 BIGGEST_TF = ["12h", "1d", "1w"]
 
-# LOOKBACK is 500 to provide data for FFT
 LOOKBACK = 500 
 SCAN_INTERVAL = 5
 
 client = Client()
 
 # ==========================
-# STOP EVENT (Ctrl+C SAFE)
+# STOP EVENT
 # ==========================
 
 stop_event = threading.Event()
@@ -60,10 +59,8 @@ class CycleEngineState:
         self.vol_comp = {}
         self.bull_bear_vol = {}
         
-        # Forecasting State
         self.fft_forecasts = {}
         
-        # Liquidity & Exhaustion States
         self.liquidity_sweeps = {}
         self.stop_hunt_prob = {}
         self.magnet_zones = {}
@@ -71,10 +68,9 @@ class CycleEngineState:
         self.vol_regimes = {}
         self.divergence_pressure = 0
 
-        # --- NEW: HT_SINE & Dominant Cycle State ---
-        self.dominant_cycles = {}   # Stores dominant period per TF
-        self.ht_sine_signals = {}   # Stores "TOP", "BOTTOM", or None per TF
-        self.turn_projections = {}  # Stores estimated bars until next turn
+        self.dominant_cycles = {}
+        self.ht_sine_signals = {}
+        self.turn_projections = {}
 
 state = CycleEngineState()
 
@@ -101,90 +97,41 @@ def get_data(symbol, tf):
 # ANALYSIS
 # ==========================
 
-# --- 1. DOMINANT CYCLE FFT (From Script 1) ---
 def get_dominant_cycle_fft(price):
-    """
-    Extracts the dominant cycle period from price data using FFT.
-    Returns period in bars (clamped 10-80).
-    """
     n = len(price)
     if n < 50:
-        return 20 # Default fallback
-
-    # Detrend
+        return 20
     detrended = price - ta.SMA(price, 20)
-    
-    # FFT
     fft_vals = fft(detrended)
     power = np.abs(fft_vals)**2
     freqs = fftfreq(n)
-    
-    # Find peak frequency (positive only)
     positive_mask = freqs > 0
     if not np.any(positive_mask):
         return 20
-        
     dominant_freq = freqs[positive_mask][np.argmax(power[positive_mask])]
-    
     if dominant_freq != 0:
         period = int(abs(1 / dominant_freq))
     else:
         period = 20
-        
     return max(10, min(period, 80))
 
-# --- 2. HT_SINE REVERSAL DETECTION (From Script 1) ---
 def detect_ht_sine_reversal(close):
-    """
-    Uses HT_SINE for phase turning points.
-    Returns: (signal_type, dominant_cycle)
-    signal_type: "TOP", "BOTTOM", or None
-    """
-    # Calculate Sine Waves
     sine, leadsine = ta.HT_SINE(close)
-    
-    # Normalize (handle NaNs at start)
     sine = np.nan_to_num(sine)
     leadsine = np.nan_to_num(leadsine)
-    
-    # Determine Dominant Cycle for this TF
     cycle_period = get_dominant_cycle_fft(close)
-    
     signal_type = None
-    
-    # Check the last closed candle (index -1 vs -2)
-    # Note: In live trading, we check the most recently completed candle logic
-    # Script 1 logic: sine[i-1] vs sine[i] (current forming vs previous)
-    # For fixed signals, we check the cross that just happened.
-    
     last = len(close) - 1
-    
-    # Top Condition: Sine crosses UNDER Leadsine near top (+0.8)
-    if (sine[last-1] > leadsine[last-1] and 
-        sine[last] < leadsine[last] and 
-        sine[last] > 0.8):
+    if (sine[last-1] > leadsine[last-1] and sine[last] < leadsine[last] and sine[last] > 0.8):
         signal_type = "TOP"
-        
-    # Bottom Condition: Sine crosses OVER Leadsine near bottom (-0.8)
-    elif (sine[last-1] < leadsine[last-1] and 
-          sine[last] > leadsine[last] and 
-          sine[last] < -0.8):
+    elif (sine[last-1] < leadsine[last-1] and sine[last] > leadsine[last] and sine[last] < -0.8):
         signal_type = "BOTTOM"
-        
     return signal_type, cycle_period
 
 def get_fft_forecast(close, forecast_len=20, top_k=3):
-    """
-    Advanced FFT Forecast returning Directional Extremes:
-    1. Detrends & Windows data.
-    2. Reconstructs signal using top dominant frequencies.
-    3. Returns the Mean, Projected HIGH, and Projected LOW of the forecast window.
-    """
     n = len(close)
     if n < 50: 
         return close[-1], close[-1], close[-1]
-
-    # 1. Detrend
     t = np.arange(n)
     try:
         coeffs = np.polyfit(t, close, 1)
@@ -193,36 +140,22 @@ def get_fft_forecast(close, forecast_len=20, top_k=3):
     except:
         detrended = close - np.mean(close)
         trend = np.linspace(0,0,n)
-
-    # 2. Windowing (Hann window)
     window = np.hanning(n)
     windowed_data = detrended * window
-
-    # 3. FFT
     fft_vals = fft(windowed_data)
     freqs = fftfreq(n)
-    
-    # 4. Filter Dominant Cycles
     magnitudes = np.abs(fft_vals[1:n//2])
     top_indices = np.argsort(magnitudes)[-top_k:] + 1
-    
-    # 5. Reconstruct Signal for Future
     future_t = np.arange(n, n + forecast_len)
     forecast = np.zeros(forecast_len)
-    
     for idx in top_indices:
         amp = np.abs(fft_vals[idx]) / (n/2)
         phase = np.angle(fft_vals[idx])
         freq = freqs[idx]
-        
         if freq != 0:
             forecast += amp * np.cos(2 * np.pi * freq * future_t + phase)
-            
-    # 6. Re-apply Trend
     future_trend = np.polyval(coeffs, future_t)
     forecast_price = forecast + future_trend
-    
-    # Return Mean, Max (Peak), Min (Trough) of forecast
     return float(np.mean(forecast_price)), float(np.max(forecast_price)), float(np.min(forecast_price))
 
 def spectral_phase(close):
@@ -235,9 +168,6 @@ def extrema(close):
     maxs = argrelextrema(arr, np.greater_equal, order=5)[0]
     return mins, maxs
 
-def detect_cycle(phase):
-    return "UP" if phase > 0 else "DOWN"
-
 def vol_compression(close):
     vol = np.std(close[-50:])
     base = np.std(close)
@@ -246,24 +176,14 @@ def vol_compression(close):
 def bullish_bearish_vol(df):
     if len(df) == 0 or "vol" not in df.columns:
         return 50.0, 50.0
-    
     total_vol = df["vol"].sum()
     if total_vol == 0:
         return 50.0, 50.0
-    
     buy_vol = df["tb"].sum() 
     sell_vol = total_vol - buy_vol
-    
     bull_pct = (buy_vol / total_vol) * 100.0
     bear_pct = (sell_vol / total_vol) * 100.0
-    
     return float(bull_pct), float(bear_pct)
-
-def support_resistance(close):
-    mins, maxs = extrema(close)
-    support = np.mean(close[mins]) if len(mins) > 0 else np.min(close)
-    resistance = np.mean(close[maxs]) if len(maxs) > 0 else np.max(close)
-    return support, resistance
 
 # ==========================
 # LIQUIDITY & SWEEP LOGIC
@@ -272,54 +192,41 @@ def support_resistance(close):
 def detect_sweep_and_stop_hunt(df, cycle):
     if len(df) < 10:
         return "NONE", 0.0
-
     last = df.iloc[-1]
     taker_buy = last['tb']
     taker_sell = last['vol'] - last['tb']
     delta = taker_buy - taker_sell
     delta_strength = abs(delta) / last['vol'] if last['vol'] > 0 else 0
-    
     candle_range = last['high'] - last['low']
     if candle_range == 0:
         return "NONE", 0.0
-
     upper_wick = last['high'] - max(last['open'], last['close'])
     lower_wick = min(last['open'], last['close']) - last['low']
-    
     wick_ratio_up = upper_wick / candle_range
     wick_ratio_down = lower_wick / candle_range
-    
     status = "NONE"
     prob = 0.0
-    
     if wick_ratio_up > 0.4 and last['close'] < last['open']:
         if delta < 0:
             status = "BEAR_SWEEP"
             prob = 0.7 + (delta_strength * 0.3)
-            
     elif wick_ratio_down > 0.4 and last['close'] > last['open']:
         if delta > 0:
             status = "BULL_SWEEP"
             prob = 0.7 + (delta_strength * 0.3)
-
     return status, prob
 
 def forced_liquidation_magnet(df, cycle):
     if len(df) == 0: return 0
     close = df["close"].values
     mins, maxs = extrema(close)
-    
     liquidity_highs = close[maxs] if len(maxs) > 0 else np.array([close[-1]])
     liquidity_lows = close[mins] if len(mins) > 0 else np.array([close[-1]])
-    
     recent_highs = liquidity_highs[-5:] if len(liquidity_highs) >= 5 else liquidity_highs
     recent_lows = liquidity_lows[-5:] if len(liquidity_lows) >= 5 else liquidity_lows
-    
     high_magnet = np.mean(recent_highs)
     low_magnet = np.mean(recent_lows)
-    
     current_price = close[-1]
-    
     if cycle == "UP":
         return high_magnet if high_magnet > current_price else current_price * 1.005
     else:
@@ -360,12 +267,10 @@ def volatility_regime_switching(close):
 
 def update_stable_target(current_price, target_attr, cycle_attr, new_cycle, new_target, price):
     try:
-        price = float(price)
         stable_target = getattr(state, target_attr)
         stable_target = float(stable_target) if stable_target is not None else None
     except:
         return
-
     current_cycle = getattr(state, cycle_attr)
     if current_cycle != new_cycle:
         setattr(state, cycle_attr, new_cycle)
@@ -374,8 +279,6 @@ def update_stable_target(current_price, target_attr, cycle_attr, new_cycle, new_
     if stable_target is None:
         setattr(state, target_attr, new_target)
         return
-    # For FFT targets, we update them constantly as the projection evolves
-    # But we still respect cycle flips
     setattr(state, target_attr, new_target)
 
 # ==========================
@@ -397,25 +300,17 @@ def resonance_alignment(cycles):
     return score
 
 def interpret_resonance(score):
-    if score == 1:
-        return "Strongly bullish alignment"
-    elif score > 0.3:
-        return "Mostly bullish"
-    elif score > 0:
-        return "Slightly bullish"
-    elif score == 0:
-        return "Neutral / mixed"
-    elif score > -0.3:
-        return "Slightly bearish"
-    elif score > -1:
-        return "Mostly bearish"
-    elif score == -1:
-        return "Strongly bearish"
-    else:
-        return "Unknown"
+    if score == 1: return "Strongly bullish alignment"
+    elif score > 0.3: return "Mostly bullish"
+    elif score > 0: return "Slightly bullish"
+    elif score == 0: return "Neutral / mixed"
+    elif score > -0.3: return "Slightly bearish"
+    elif score > -1: return "Mostly bearish"
+    elif score == -1: return "Strongly bearish"
+    else: return "Unknown"
 
 # ==========================
-# PROCESS TF GROUP
+# PROCESS TF GROUP (FIXED V2)
 # ==========================
 
 def process_group(tf_list):
@@ -427,17 +322,13 @@ def process_group(tf_list):
     support_list = []
     resistance_list = []
     
-    # Feature Lists
     sweep_list = []
     sh_prob_list = []
     magnet_list = []
     exhaustion_list = []
     regime_list = []
-    
-    # Forecast List
     forecast_list = []
 
-    # Range Rule Lists
     abs_low_list = []
     abs_high_list = []
     recent_extrema_type_list = []
@@ -448,7 +339,6 @@ def process_group(tf_list):
             break
         df = get_data(SYMBOL, tf)
         if len(df) < 200: 
-            print(f"Skipping {tf}: not enough data for 200-candle range rule.")
             continue 
         
         close = df["close"].values
@@ -456,38 +346,23 @@ def process_group(tf_list):
         high = df["high"].values
         current_price = close[-1]
 
-        # --- 1. HT_SINE & DOMINANT CYCLE LOGIC (NEW) ---
+        # HT_SINE Logic
         reversal_signal, dom_cycle = detect_ht_sine_reversal(close)
         state.dominant_cycles[tf] = dom_cycle
         state.ht_sine_signals[tf] = reversal_signal
-        
-        # Project next turn time (bars remaining)
-        # If we just hit a TOP, the next turn is BOTTOM in ~dom_cycle/2 bars
-        # If we just hit a BOTTOM, the next turn is TOP in ~dom_cycle/2 bars
-        # If NONE, we estimate based on current position in cycle (simplified)
-        bars_to_turn = 0
-        if reversal_signal == "TOP":
-            bars_to_turn = dom_cycle // 2
-        elif reversal_signal == "BOTTOM":
-            bars_to_turn = dom_cycle // 2
-        else:
-            # Estimate roughly (if no signal, we are somewhere in the middle)
-            bars_to_turn = dom_cycle // 4 
-            
+        bars_to_turn = dom_cycle // 2 if reversal_signal != "NONE" else dom_cycle // 4
         state.turn_projections[tf] = bars_to_turn
 
-        # --- RANGE RULE LOGIC (Strictly Last 200 Values) ---
+        # Range Rule Logic
         window_len = 200
         low_200 = low[-window_len:]
         high_200 = high[-window_len:]
-        
         abs_low = float(np.min(low_200))
         abs_high = float(np.max(high_200))
-        
         idx_low_rel = int(np.argmin(low_200))
         idx_high_rel = int(np.argmax(high_200))
         
-        # Cycle Detection based on Recent Extrema
+        # Cycle Detection
         if idx_low_rel > idx_high_rel:
             cycle = "UP"
             most_recent_type = "LOW"
@@ -497,50 +372,39 @@ def process_group(tf_list):
             most_recent_type = "HIGH"
             most_recent_val = abs_high
             
-        # --- FFT FORECAST (Directional Logic) ---
+        # FFT Forecast
         fft_mean, fft_high, fft_low = get_fft_forecast(close, forecast_len=10, top_k=3)
         state.fft_forecasts[tf] = (fft_mean, fft_high, fft_low)
         
-        # --- TARGET SELECTION (Volume & Wick Validated) ---
         bull_vol_pct, bear_vol_pct = bullish_bearish_vol(df)
-        
-        # Get Wick/Sweep Metrics
         sweep_status, sh_prob = detect_sweep_and_stop_hunt(df, cycle)
         state.liquidity_sweeps[tf] = sweep_status
         state.stop_hunt_prob[tf] = sh_prob
 
-        # Determine "Realistic" Target
+        magnet_zone = forced_liquidation_magnet(df, cycle)
+        state.magnet_zones[tf] = magnet_zone
+        
         target = 0.0
         
+        # --- STRICT INDIVIDUAL TARGET LOGIC ---
         if cycle == "UP":
-            target = fft_high
-            if target < current_price:
-                target = current_price * 1.005
-            
+            candidate = fft_high
+            if candidate < current_price:
+                candidate = magnet_zone if magnet_zone > current_price else current_price * 1.005
             if bull_vol_pct < bear_vol_pct and sweep_status != "BULL_SWEEP":
                 if fft_mean > current_price:
-                    target = fft_mean
-            
-            magnet_zone = forced_liquidation_magnet(df, cycle)
-            state.magnet_zones[tf] = magnet_zone
-            if magnet_zone > current_price:
-                target = min(target, magnet_zone)
-                
+                    candidate = fft_mean
+            target = max(candidate, current_price * 1.001) # ENSURE > PRICE
         else: # cycle == "DOWN"
-            target = fft_low
-            if target > current_price:
-                target = current_price * 0.995
-            
+            candidate = fft_low
+            if candidate > current_price:
+                candidate = magnet_zone if magnet_zone < current_price else current_price * 0.995
             if bear_vol_pct < bull_vol_pct and sweep_status != "BEAR_SWEEP":
                 if fft_mean < current_price:
-                    target = fft_mean
-            
-            magnet_zone = forced_liquidation_magnet(df, cycle)
-            state.magnet_zones[tf] = magnet_zone
-            if magnet_zone < current_price:
-                target = max(target, magnet_zone)
+                    candidate = fft_mean
+            target = min(candidate, current_price * 0.999) # ENSURE < PRICE
 
-        # --- Store Metrics ---
+        # Store Data
         phase = spectral_phase(close)
         support = abs_low
         resistance = abs_high
@@ -551,10 +415,8 @@ def process_group(tf_list):
         recent_extrema_val_list.append(most_recent_val)
 
         vcomp = vol_compression(close)
-        
         exh_score = reversal_exhaustion_detection(df)
         state.exhaustion_levels[tf] = exh_score
-        
         regime = volatility_regime_switching(close)
         state.vol_regimes[tf] = regime
         
@@ -580,8 +442,28 @@ def process_group(tf_list):
         return None
 
     price = np.mean(prices)
+    
+    # Determine Consensus
     overall_cycle = "UP" if cycles.count("UP") >= cycles.count("DOWN") else "DOWN"
-    target = np.mean(targets)
+    
+    # --- CONSENSUS TARGET FILTERING (THE FIX) ---
+    # Only average targets that match the consensus direction
+    valid_targets = []
+    for i, c in enumerate(cycles):
+        if c == overall_cycle:
+            valid_targets.append(targets[i])
+            
+    # If we have valid targets, average them. If not (rare edge case), fallback to logic
+    if valid_targets:
+        target = np.mean(valid_targets)
+    else:
+        # Fallback: Force the average target to obey the consensus
+        raw_avg = np.mean(targets)
+        if overall_cycle == "UP":
+            target = max(raw_avg, price * 1.001)
+        else:
+            target = min(raw_avg, price * 0.999)
+
     resonance = resonance_alignment(cycles)
     state.resonance_score["_".join(tf_list)] = resonance
 
@@ -714,7 +596,6 @@ while not stop_event.is_set():
         print(f"INCOMING REVERSAL: {rev_type}")
         print(f"MAJOR REVERSAL TARGET: {rev_target:.4f}")
         print(f"FAST TARGET (Aligned): {fast_aligned:.4f}")
-        # ==========================================
 
         print("\nPer-TF Analysis:")
         all_data_map = [
@@ -728,9 +609,8 @@ while not stop_event.is_set():
             for i, tf in enumerate(tf_list):
                 print(f"\nTF: {tf}")
                 print(f"Cycle: {data['per_tf_cycle'][i]}")
-                print(f"Target (FFT Directional): {data['per_tf_target'][i]:.4f}")
+                print(f"Target (Directional Fixed): {data['per_tf_target'][i]:.4f}")
                 
-                # --- NEW: HT_SINE OUTPUT ---
                 ht_sig = state.ht_sine_signals.get(tf, "NONE")
                 dom_cyc = state.dominant_cycles.get(tf, 0)
                 bars_left = state.turn_projections.get(tf, 0)
@@ -745,7 +625,6 @@ while not stop_event.is_set():
                 bear_vol_val = data['vol_bear'][i]
                 print(f"  BullVol: {bull_vol_val:.2f}% vs BearVol: {bear_vol_val:.2f}%")
                 
-                # --- RANGE RULE PRINT ---
                 abs_low = data['abs_lows'][i]
                 abs_high = data['abs_highs'][i]
                 recent_type = data['recent_types'][i]
@@ -777,7 +656,7 @@ while not stop_event.is_set():
             "MAJOR": state.major_target
         }
         priority_order = sorted(targets.items(), key=lambda x: abs(x[1] - price))
-        print("\nTarget Priority (Directional FFT - Closest First):")
+        print("\nTarget Priority (Closest First):")
         for rank, (name, t) in enumerate(priority_order, start=1):
             print(f"{rank}. {name} Target: {t:.4f} (distance: {abs(t - price):.4f})")
 
