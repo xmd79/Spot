@@ -2212,18 +2212,12 @@ if __name__ == "__main__":
     # ── PHYSICS METRICS ────────────────────────────────────────────────────
     _hdr("⚛️  PHYSICS METRICS — Energy, Momentum, Vibration")
     vib = vibration_energy_score(d1m, d3m, d5m)
-    # Angular momentum from REAL stored close+volume arrays (fixes constant-array bug)
-    c_1m_phys = np.array(d1m.get('_close',  [entry] * 21))
-    v_1m_phys = np.array(d1m.get('_volume', [1.0]   * 20))
-    ang_mom_phys, ang_dir = angular_momentum_score(c_1m_phys, v_1m_phys, lookback=20)
-    # Also display the per-TF stored angular momentum direction
     console.print(f"  Vibration Energy Score   : [bold {'green' if vib > 50 else 'yellow'}]{vib:.1f}/100[/bold {'green' if vib > 50 else 'yellow'}]")
-    console.print(f"  Angular Momentum (1m)    : {'[green]UP ↑[/green]' if ang_dir=='UP' else '[red]DOWN ↓[/red]' if ang_dir=='DOWN' else '[yellow]NEUTRAL →[/yellow]'}  ({ang_mom_phys:+.4f})")
-    # Show stored ang_mom_dir from all short TFs
+    # Angular momentum per short TF — uses real stored close+volume arrays
     for tf in ['1m', '3m', '5m']:
         stored_dir = best["data"][tf].get('ang_mom_dir', 'NEUTRAL')
         stored_val = best["data"][tf].get('ang_mom', 0.0)
-        dir_c = "[green]UP↑[/green]" if stored_dir=='UP' else "[red]DOWN↓[/red]" if stored_dir=='DOWN' else "[yellow]NEUTRAL[/yellow]"
+        dir_c = "[green]UP ↑[/green]" if stored_dir=='UP' else "[red]DOWN ↓[/red]" if stored_dir=='DOWN' else "[yellow]NEUTRAL →[/yellow]"
         console.print(f"  Angular Momentum ({tf})  : {dir_c}  ({stored_val:+.4f})")
 
     # Rotational symmetry from 5m
