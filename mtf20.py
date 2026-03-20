@@ -73,6 +73,7 @@ LINEARREG_PERIOD       = 50    # talib.LINEARREG period for channel
 
 KLINES_LIMIT   = 1200
 LOOKBACK_PERIODS = {tf: 1200 for tf in TF_LIST}
+MIN_VOLUME_USDC  = 500_000   # minimum 24h volume in USDC — filters illiquid pairs
 
 # ── Per-TF extrema lookback: 500 candles of each TF's own resolution ──────────
 #
@@ -165,13 +166,31 @@ class Trader:
         )
 
     def get_usdc_pairs(self):
-        info  = self.client.get_exchange_info()
+        """
+        Returns all USDC-quoted pairs that are:
+        • actively trading
+        • ASCII uppercase symbols only (filters derivative tokens)
+        • 24h USDC volume ≥ MIN_VOLUME_USDC (filters illiquid pairs that
+          pass all signal checks but never actually pump)
+
+        Volume data is fetched once via get_ticker() which returns all
+        24h stats in a single API call — no per-symbol overhead.
+        """
+        info    = self.client.get_exchange_info()
+        tickers = {t['symbol']: float(t['quoteVolume'])
+                   for t in self.client.get_ticker()}
+
         pairs = []
         for s in info['symbols']:
-            if s['quoteAsset'] == 'USDC' and s['status'] == 'TRADING':
-                sym = s['symbol']
-                if sym.isascii() and sym.isupper():
-                    pairs.append(sym)
+            if s['quoteAsset'] != 'USDC' or s['status'] != 'TRADING':
+                continue
+            sym = s['symbol']
+            if not (sym.isascii() and sym.isupper()):
+                continue
+            vol_24h = tickers.get(sym, 0.0)
+            if vol_24h < MIN_VOLUME_USDC:
+                continue
+            pairs.append(sym)
         return pairs
 
 # ====================== DATA ======================
@@ -764,11 +783,28 @@ def compute_tf(client, symbol, tf, higher_tf_ranges=None):
     # ── MACD ──────────────────────────────────────────────────────────────────
     macd_val = macd(c)
 
-    # ── Amplitude / sine target ───────────────────────────────────────────────
-    price_std       = float(np.std(c[~np.isnan(c)]))
-    amplitude_price = price_std * 2.0
-    fft_val         = fft_forecast(c)
+    # ── FFT: proper dominant harmonic targets (replaces DC mean) ─────────────
+    # fft_dominant_target() decomposes the close array into its top-N amplitude
+    # harmonics, skipping the DC component (index 0 = mean price), and projects
+    # constructive interference peaks as real magnetic price levels.
+    # The old fft_forecast(c) = np.mean(fft.real) = DC mean — NOT a target.
+    fft_harmonics   = fft_dominant_target(c, float(c[-1]), n_harmonics=5)
+    # Store the single highest-amplitude harmonic peak for fast lookup.
+    # Filter: must be above current price and within ±20% range.
+    valid_fft = [t for t in fft_harmonics
+                 if t[0] > float(c[-1]) and t[0] < float(c[-1]) * 1.20]
+    fft_val = valid_fft[0][0] if valid_fft else float(c[-1]) * 1.05   # fallback 5%
+    # Store all harmonic targets for exit engine use
+    fft_harmonic_targets = [(float(t[0]), float(t[1])) for t in fft_harmonics
+                            if t[0] > float(c[-1])]
+
+    price_std         = float(np.std(c[~np.isnan(c)]))
+    amplitude_price   = price_std * 2.0
     sine_price_target = float(c[-1]) + (amplitude_price / 2.0) * (1.0 - sine_val)
+
+    # ── Angular momentum: computed from REAL close + volume arrays ────────────
+    # Fixes the previous bug where a constant array was passed, giving always 0.
+    ang_mom_val, ang_mom_dir = angular_momentum_score(c, v, lookback=20)
 
     # ── Volatility compression ────────────────────────────────────────────────
     bandwidth      = (float(high_band[-1]) - float(low_band[-1])) / (float(c[-1]) + 1e-8)
@@ -829,6 +865,15 @@ def compute_tf(client, symbol, tf, higher_tf_ranges=None):
         "macd":   macd_val,
         "price":  current_price,
 
+        # Raw arrays stored for angular momentum and other calcs in exit engine
+        # Stored as lists to be JSON-serialisable if needed
+        "_close": c.tolist(),
+        "_volume": v.tolist(),
+
+        # Angular momentum (real arrays — fixes the constant-array bug)
+        "ang_mom":     ang_mom_val,
+        "ang_mom_dir": ang_mom_dir,   # 'UP' / 'DOWN' / 'NEUTRAL'
+
         # talib MOMENTUM — crossover signals
         "momentum":      mom_val,
         "momentum_prev": mom_prev,
@@ -857,8 +902,9 @@ def compute_tf(client, symbol, tf, higher_tf_ranges=None):
         "fg_label": fg_label,
         "fg_score": fg_score,
 
-        # FFT
-        "fft": fft_val,
+        # FFT — proper dominant harmonic targets (NOT DC mean)
+        "fft":              fft_val,             # top harmonic peak above price
+        "fft_harmonics":    fft_harmonic_targets, # all harmonic targets above price
 
         # talib LINEARREG regression channel
         "low_reg":      float(low_band[-1]),
@@ -924,9 +970,35 @@ def compute_tf(client, symbol, tf, higher_tf_ranges=None):
     return data
 
 # ====================== FILTERS ======================
-def all_forecasts_above_price(tf_data):
-    cur = tf_data['1m']['price']
-    return all(d['fft'] > cur for d in tf_data.values())
+def has_structural_upside(tf_data):
+    """
+    Replaces all_forecasts_above_price() which used FFT DC mean (= mean price)
+    as a filter — producing stochastic noise that randomly rejected valid dips.
+
+    Correct gate: confirm there is REAL structural upside room above current price.
+    Requires ALL of:
+    • The 5m HH structural ceiling (argmax 1200-bar) is at least 2% above current
+      price — otherwise price is already near the top of its recent range
+    • The 1h HH structural ceiling is at least 5% above current price — confirming
+      macro room to run
+    • 1m wick_hh (500-bar extrema) is above current price — there is a recent
+      high to mean-revert toward
+
+    If any of these fail, the pair is near its structural ceiling and buying the
+    dip would be buying into a top, not catching a reversal.
+    """
+    cur  = tf_data['1m']['price']
+    hh5m = tf_data.get('5m', {}).get('max_threshold', cur)
+    hh1h = tf_data.get('1h', {}).get('max_threshold', cur)
+    wh1m = tf_data.get('1m', {}).get('wick_hh', cur)
+
+    if cur <= 0:
+        return False
+    upside_5m  = (hh5m  - cur) / cur * 100
+    upside_1h  = (hh1h  - cur) / cur * 100
+    upside_wh  = (wh1m  - cur) / cur * 100
+
+    return upside_5m >= 2.0 and upside_1h >= 5.0 and upside_wh >= 0.5
 
 def has_resistance_zones_above(tf_data):
     """
@@ -1241,8 +1313,8 @@ def scan(symbol, client):
             return None
         tf_data[tf] = d
 
-    if not all_forecasts_above_price(tf_data):    return None
-    if not has_resistance_zones_above(tf_data):   return None   # HH used as anchor; need real vol zones
+    if not has_structural_upside(tf_data):       return None   # near structural ceiling
+    if not has_resistance_zones_above(tf_data):  return None   # need identifiable vol walls
 
     imbalance    = orderbook(client, symbol)
     score        = ai_score(tf_data, imbalance)
@@ -1678,14 +1750,16 @@ def compute_exit_price(best, entry_price):
     add(lo15 + df15*0.382, "Fibo15m 0.382", '15m', 1.1, 'fibo')
     add(lo15 + df15*0.618, "Fibo15m 0.618", '15m', 1.3, 'fibo')
 
-    # ── 3. FFT DOMINANT HARMONICS (short TFs only, proper decomposition) ──
-    # Uses frequency decomposition to find constructive interference peaks.
-    # 4h/1d excluded — their DC component is far from current price.
+    # ── 3. FFT DOMINANT HARMONICS (proper decomposition, short TFs only) ─────
+    # Uses fft_dominant_target() which skips DC and finds real constructive
+    # interference peaks. Stored per-TF in data['fft_harmonics'].
+    # 4h/1d excluded — too wide a time span, harmonics aren't actionable.
     for tf in ['1m', '3m', '5m', '15m']:
-        # Also use the simple FFT value as a fast approximation
-        fft_simple = d[tf].get('fft', 0)
-        if fft_simple > 0:
-            add(fft_simple, f"FFT-mean {tf}", tf, 1.1, 'fft')
+        harmonics = d[tf].get('fft_harmonics', [])
+        for i, (h_price, h_weight) in enumerate(harmonics[:3]):
+            # Weight by amplitude: dominant harmonics get higher weight
+            w = 1.2 + h_weight * 2.0   # range ~1.2–1.8 depending on amplitude share
+            add(h_price, f"FFT-harmonic#{i+1} {tf}", tf, min(w, 1.8), 'fft')
 
     # ── 4. FREQUENCY RESONANCE NODES (time-at-price magnets) ──────────────
     # These are price levels where price spent the most time historically.
@@ -1741,11 +1815,12 @@ def compute_exit_price(best, entry_price):
 
     # ── PHYSICS SCORING ────────────────────────────────────────────────────
 
-    # Angular momentum from 1m data
-    ang_mom, ang_dir = angular_momentum_score(
-        np.array([d1m.get('price', entry_price)] * 21),  # proxy
-        np.array([1.0] * 20)
-    )
+    # Angular momentum from REAL 1m close + volume arrays (stored in data dict)
+    # Previous bug: passed np.array([price]*21) — constant array, always NEUTRAL.
+    # Fix: use the actual close/volume arrays stored during compute_tf.
+    c_1m_raw = np.array(d1m.get('_close',  [entry_price] * 21))
+    v_1m_raw = np.array(d1m.get('_volume', [1.0] * 20))
+    ang_mom_exit, ang_dir = angular_momentum_score(c_1m_raw, v_1m_raw, lookback=20)
     ang_factor = 1.2 if ang_dir == 'UP' else 1.0 if ang_dir == 'NEUTRAL' else 0.8
 
     # Vibration energy score
@@ -1863,12 +1938,29 @@ def compute_exit_price(best, entry_price):
     return deduped[:7], primary_exit
 
 
-# ====================== ML INSTANT BACKTEST ======================
+# ====================== FORWARD PROBABILITY ESTIMATOR ======================
+# (Previously named ml_instant_backtest — renamed to be honest about what it is.
+#  This does NOT replay historical trades. It estimates forward bounce probability
+#  from current structural position using validated market microstructure signals.)
 
-def ml_instant_backtest(best_data, entry_price):
+def estimate_bounce_probability(best_data, entry_price):
     """
-    Instant structural backtest using in-memory 1200-bar data.
-    Estimates win rate, expected gain, and bounce strength per TF.
+    Forward bounce probability estimator.
+
+    Estimates the likelihood and magnitude of an upward price move from the
+    current structural position, using in-memory indicator data already
+    computed for all 8 timeframes.
+
+    This is NOT a backtest. It does NOT replay historical kline data.
+    It is a forward probability model based on:
+    • Structural depth: how far into the 500-bar wick range is current price
+    • Oscillator depth: how oversold RSI and HT_SINE are
+    • Signal stack: how many reversal signals are confirmed
+    • ATR tier: volatility context (HIGH = bigger/faster moves)
+    • Volume delta: is buying pressure entering
+
+    The win_rate output is a calibrated estimate, not a historical statistic.
+    Treat it as a signal-weighted prior, not a precise probability.
     """
     FORWARD_BARS = {'1m':30,'3m':20,'5m':15,'15m':10,'30m':8,'1h':5,'4h':3,'1d':2}
 
@@ -1951,6 +2043,90 @@ def _hdr(title):
     console.print(f"\n[bold white]{title}[/bold white]")
     _sep()
 
+# ====================== SCAN PERSISTENCE CACHE ======================
+import json, os, time as _time
+
+CACHE_FILE    = "scanner_cache.json"
+CACHE_MAX_RUNS = 10   # keep last N scan results per symbol
+
+def _load_cache():
+    """Load the scan history cache from disk. Returns empty dict on first run."""
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_cache(cache):
+    """Persist the scan history cache to disk atomically."""
+    try:
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, 'w') as f:
+            json.dump(cache, f, indent=2)
+        os.replace(tmp, CACHE_FILE)
+    except Exception as e:
+        logging.warning(f"Cache save failed: {e}")
+
+def _update_cache(cache, symbol, grade, score, sniper, pat_bonus):
+    """
+    Append a new scan result for a symbol.
+    Each entry records: timestamp, grade, score, sniper, pat_bonus.
+    Keeps only the last CACHE_MAX_RUNS entries to bound file size.
+    """
+    entry = {
+        "ts":        int(_time.time()),
+        "grade":     grade,
+        "score":     round(score, 1),
+        "sniper":    sniper,
+        "pat_bonus": pat_bonus,
+    }
+    if symbol not in cache:
+        cache[symbol] = []
+    cache[symbol].append(entry)
+    cache[symbol] = cache[symbol][-CACHE_MAX_RUNS:]
+
+def _get_grade_trend(cache, symbol):
+    """
+    Analyse grade trend for a symbol across recent scans.
+
+    Returns dict:
+      run_count   : how many times this symbol has appeared
+      grade_hist  : list of grades from oldest to newest e.g. ['C','C','B','A']
+      improving   : True if grade is monotonically improving over last 3 runs
+      streak      : number of consecutive scans with sniper=True
+      best_score  : highest score seen across all cached runs
+      first_seen  : unix timestamp of first appearance in cache
+    """
+    history = cache.get(symbol, [])
+    if not history:
+        return None
+
+    grades    = [h['grade'] for h in history]
+    sniper_streak = 0
+    for h in reversed(history):
+        if h['sniper']:
+            sniper_streak += 1
+        else:
+            break
+
+    grade_order = {'F': 0, 'C': 1, 'B': 2, 'A': 3}
+    improving = False
+    if len(grades) >= 3:
+        last3 = [grade_order.get(g, 0) for g in grades[-3:]]
+        improving = last3[0] < last3[1] < last3[2]
+
+    return {
+        'run_count':  len(history),
+        'grade_hist': grades,
+        'improving':  improving,
+        'streak':     sniper_streak,
+        'best_score': max(h['score'] for h in history),
+        'first_seen': history[0]['ts'],
+    }
+    _sep()
+
 # ====================== MAIN ======================
 if __name__ == "__main__":
     trader  = Trader("credentials.txt")
@@ -1962,6 +2138,7 @@ if __name__ == "__main__":
     )
 
     candidates = []
+    scan_cache = _load_cache()   # load scan history before the loop
 
     with Live(build_table(candidates), refresh_per_second=3, vertical_overflow="visible") as live:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -1970,7 +2147,18 @@ if __name__ == "__main__":
                 result = future.result()
                 if result:
                     candidates.append(result)
+                    # Update cache for every candidate that passed filters
+                    _update_cache(
+                        scan_cache,
+                        result['symbol'],
+                        result.get('sniper_grade', 'F'),
+                        result['score'],
+                        result['sniper'],
+                        result.get('pat_bonus', 0),
+                    )
                 live.update(build_table(candidates))
+
+    _save_cache(scan_cache)   # persist after scan completes
 
     if not candidates:
         console.print("[red]No candidates passed all filters.[/red]")
@@ -1992,6 +2180,20 @@ if __name__ == "__main__":
     console.print(f"  ML Conf (1m)    : {d1m['ml_score']}%")
     console.print(f"  OB Imbalance    : {best['imbalance']:+.4f}")
 
+    # ── SCAN HISTORY TREND ─────────────────────────────────────────────────
+    trend = _get_grade_trend(scan_cache, symbol)
+    if trend and trend['run_count'] > 1:
+        hist_str  = " → ".join(trend['grade_hist'][-5:])
+        impr_str  = "[bold green]IMPROVING ↑[/bold green]" if trend['improving'] else "[dim]stable[/dim]"
+        streak_str= (f"[bold green]Sniper streak: {trend['streak']} runs ✔[/bold green]"
+                     if trend['streak'] >= 2 else f"streak: {trend['streak']}")
+        console.print(f"  Grade History   : [cyan]{hist_str}[/cyan]  {impr_str}  {streak_str}")
+        console.print(f"  Best Score Seen : [green]{trend['best_score']:.1f}[/green]  over {trend['run_count']} scans")
+        if trend['improving'] and trend['streak'] >= 1:
+            console.print(f"  [bold green]⚡ Signal is BUILDING — consecutive improvement detected[/bold green]")
+    else:
+        console.print(f"  Grade History   : [dim]first appearance (no prior scan history)[/dim]")
+
     # Sniper grade display
     console.print(f"  Sniper          : ", end="")
     if best['sniper']:
@@ -2010,11 +2212,19 @@ if __name__ == "__main__":
     # ── PHYSICS METRICS ────────────────────────────────────────────────────
     _hdr("⚛️  PHYSICS METRICS — Energy, Momentum, Vibration")
     vib = vibration_energy_score(d1m, d3m, d5m)
-    ang_mom, ang_dir = angular_momentum_score(
-        np.array([d1m['price']] * 21), np.array([1.0]*20)
-    )
+    # Angular momentum from REAL stored close+volume arrays (fixes constant-array bug)
+    c_1m_phys = np.array(d1m.get('_close',  [entry] * 21))
+    v_1m_phys = np.array(d1m.get('_volume', [1.0]   * 20))
+    ang_mom_phys, ang_dir = angular_momentum_score(c_1m_phys, v_1m_phys, lookback=20)
+    # Also display the per-TF stored angular momentum direction
     console.print(f"  Vibration Energy Score   : [bold {'green' if vib > 50 else 'yellow'}]{vib:.1f}/100[/bold {'green' if vib > 50 else 'yellow'}]")
-    console.print(f"  Angular Momentum Dir     : {'[green]UP ↑[/green]' if ang_dir=='UP' else '[red]DOWN ↓[/red]' if ang_dir=='DOWN' else '[yellow]NEUTRAL →[/yellow]'}")
+    console.print(f"  Angular Momentum (1m)    : {'[green]UP ↑[/green]' if ang_dir=='UP' else '[red]DOWN ↓[/red]' if ang_dir=='DOWN' else '[yellow]NEUTRAL →[/yellow]'}  ({ang_mom_phys:+.4f})")
+    # Show stored ang_mom_dir from all short TFs
+    for tf in ['1m', '3m', '5m']:
+        stored_dir = best["data"][tf].get('ang_mom_dir', 'NEUTRAL')
+        stored_val = best["data"][tf].get('ang_mom', 0.0)
+        dir_c = "[green]UP↑[/green]" if stored_dir=='UP' else "[red]DOWN↓[/red]" if stored_dir=='DOWN' else "[yellow]NEUTRAL[/yellow]"
+        console.print(f"  Angular Momentum ({tf})  : {dir_c}  ({stored_val:+.4f})")
 
     # Rotational symmetry from 5m
     sym = rotational_symmetry_target(entry, d5m['wick_ll'], d5m['wick_hh'])
@@ -2171,17 +2381,19 @@ if __name__ == "__main__":
         console.print(f"  {tf:>4}  [dim]{hh:>14.8f}[/dim]  [cyan]{t[0]:>14}[/cyan]  "
                       f"[cyan]{t[1]:>14}[/cyan]  [cyan]{t[2]:>14}[/cyan]  {gap:>+8.3f}%  {rwy}")
 
-    # ── FFT TARGETS ───────────────────────────────────────────────────────
-    _hdr("🔭 FFT TARGETS — Short TFs only (1m/3m/5m/15m/30m)")
-    console.print(f"  {'TF':>4}  {'FFT Value':>16}  {'Gain%':>8}  Valid?")
+    # ── FFT HARMONIC TARGETS ──────────────────────────────────────────────
+    _hdr("🔭 FFT DOMINANT HARMONIC TARGETS — Short TFs (1m/3m/5m/15m/30m)")
+    console.print(f"  [dim]Proper frequency decomposition — DC mean excluded. Top amplitude peaks only.[/dim]")
+    console.print(f"  {'TF':>4}  {'Top Harmonic':>16}  {'Gain%':>8}  {'Harmonics>Price':>16}  Valid?")
     _sep("-")
     for tf in ['1m','3m','5m','15m','30m']:
         d   = best["data"][tf]
         fft = d['fft']
+        harmonics = d.get('fft_harmonics', [])
         gain_f = (fft-entry)/entry*100 if entry>0 else 0
         valid = "[green]YES[/green]" if 2.0<=gain_f<=15.0 else "[dim]out of range[/dim]"
-        console.print(f"  {tf:>4}  [bold cyan]{fft:>16.8f}[/bold cyan]  {gain_f:>+8.3f}%  {valid}")
-    console.print(f"  [dim]Note: 4h/1d FFT excluded — DC component = mean price, not a target[/dim]")
+        console.print(f"  {tf:>4}  [bold cyan]{fft:>16.8f}[/bold cyan]  {gain_f:>+8.3f}%  {len(harmonics):>16}  {valid}")
+    console.print(f"  [dim]4h/1d excluded — their dominant frequency covers months, not actionable for fast spikes[/dim]")
 
     # ── HH STRUCTURAL ANCHORS ─────────────────────────────────────────────
     _hdr("🏔️  STRUCTURAL CEILING ANCHORS — argmax 1200-Bar per TF")
@@ -2213,12 +2425,15 @@ if __name__ == "__main__":
     console.print(f"  Sine Price Target (1m)   : {d1m['sine_price_target']:.8f} USDC")
     console.print(f"  LINEARREG Forecast (1m+5): [cyan]{d1m['reg_forecast']:.8f}[/cyan] USDC")
 
-    console.print(f"\n  [bold cyan]── FFT Magnetic Targets (short TFs) ──[/bold cyan]")
+    console.print(f"\n  [bold cyan]── FFT Dominant Harmonic Targets (short TFs) ──[/bold cyan]")
+    console.print(f"  [dim]Top amplitude harmonic peaks above entry — real magnetic levels, not DC mean[/dim]")
     for tf in ['1m','3m','5m','15m','30m']:
-        fv   = best['data'][tf]['fft']
+        fv   = best['data'][tf]['fft']    # now = top harmonic peak above price
+        harmonics = best['data'][tf].get('fft_harmonics', [])
         gf   = (fv-entry)/entry*100
         col  = "cyan" if 2.0<=gf<=15.0 else "dim"
-        console.print(f"  FFT {tf:<5}: [{col}]{fv:.8f} USDC[/{col}]  ({gf:+.3f}%)")
+        n_harm = len(harmonics)
+        console.print(f"  FFT {tf:<5}: [{col}]{fv:.8f} USDC[/{col}]  ({gf:+.3f}%)  [{n_harm} harmonics above price]")
 
     console.print(f"\n  [bold green]── HH Structural Anchors (reject targets) ──[/bold green]")
     console.print(f"  HH (5m)  : [green]{tp2:.8f} USDC[/green]  (+{(tp2-entry)/entry*100:.3f}%)")
@@ -2235,9 +2450,10 @@ if __name__ == "__main__":
         col= "bold green" if label.endswith("★") else "white"
         console.print(f"  {label:<12} : [{col}]{val:.8f} USDC[/{col}]  (+{gv:.3f}%)")
 
-    # ── ML INSTANT BACKTEST ───────────────────────────────────────────────
-    _hdr("🧠 ML INSTANT BACKTEST — Structural Bounce Estimation")
-    bt_results, cons_gain, cons_min, cons_max = ml_instant_backtest(best['data'], entry)
+    # ── FORWARD BOUNCE PROBABILITY ESTIMATE ──────────────────────────────────
+    _hdr("🧠 FORWARD BOUNCE PROBABILITY — Structural Signal-Weighted Estimate")
+    console.print(f"  [dim]Not a backtest. Forward probability from current position + signal stack.[/dim]")
+    bt_results, cons_gain, cons_min, cons_max = estimate_bounce_probability(best['data'], entry)
     console.print(f"  {'TF':>4}  {'Pos%LL':>8}  {'WinRate':>8}  {'EstGain%':>9}  {'EV%':>7}  {'→T1%':>7}  Bounce")
     _sep("-")
     for tf in TF_LIST:
