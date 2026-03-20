@@ -2125,21 +2125,121 @@ def _get_grade_trend(cache, symbol):
         'best_score': max(h['score'] for h in history),
         'first_seen': history[0]['ts'],
     }
-    _sep()
 
-# ====================== MAIN ======================
-if __name__ == "__main__":
-    trader  = Trader("credentials.txt")
-    symbols = trader.get_usdc_pairs()
-    talib_s = "[green]talib: MOM+LINEARREG+RSI+HT_SINE[/green]" if HAS_TALIB else "[yellow]scipy fallback[/yellow]"
-    console.print(
-        f"[bold cyan]Scanning {len(symbols)} USDC pairs | "
-        f"1200-bar | 500-bar extrema | {talib_s}[/bold cyan]"
-    )
+# ====================== SMART ENTRY PRICE ======================
 
+def compute_smart_entry(client, symbol, d1m):
+    """
+    Compute the optimal limit-order entry price rather than using the raw
+    last close. The goal is to enter as close to the actual dip bottom as
+    possible while still getting filled quickly.
+
+    Strategy
+    ────────
+    1. Fetch current live order book (top 5 bid levels).
+    2. Compute three candidate prices:
+         a) best_bid  — top of the bid stack (immediate fill)
+         b) atr_entry — best_bid − 0.5×ATR, stepping toward wick_ll
+         c) wick_ll   — 500-bar confirmed lowest close (hard support floor)
+    3. Choose the candidate that is:
+         • Above wick_ll (never enter below confirmed structural support)
+         • Closest to wick_ll without going under it
+         • Within 1 ATR of best_bid (still realistically fillable)
+
+    Returns dict with smart_entry, best_bid, atr_entry, wick_ll,
+    rationale, and discount_pct vs last close.
+    """
+    wick_ll    = d1m.get('wick_ll', 0.0)
+    last_close = d1m.get('price', 0.0)
+    atr_val    = d1m.get('atr_value', 0.0)
+
+    best_bid = last_close
+    try:
+        ob = client.get_order_book(symbol=symbol, limit=5)
+        if ob['bids']:
+            best_bid = float(ob['bids'][0][0])
+    except Exception:
+        pass
+
+    cand_bid = best_bid
+    cand_atr = best_bid - (atr_val * 0.5) if atr_val > 0 else best_bid
+    cand_wl  = wick_ll * 1.0001   # tiny buffer above wick_ll
+
+    if atr_val > 0 and cand_atr >= cand_wl and (best_bid - cand_atr) <= atr_val:
+        smart     = cand_atr
+        rationale = "ATR-adjusted bid (bid − 0.5×ATR), above wick_ll"
+    elif best_bid >= cand_wl:
+        smart     = cand_bid
+        rationale = "Current best bid — price above wick_ll support"
+    else:
+        smart     = cand_wl
+        rationale = "wick_ll floor entry — price swept below support, reversal zone"
+
+    discount_pct = (last_close - smart) / last_close * 100 if last_close > 0 else 0.0
+
+    return {
+        'smart_entry':  round(smart, 10),
+        'best_bid':     round(best_bid, 10),
+        'atr_entry':    round(cand_atr, 10),
+        'wick_ll':      round(wick_ll, 10),
+        'rationale':    rationale,
+        'discount_pct': round(discount_pct, 4),
+    }
+
+
+# ====================== ENTRY READINESS ======================
+
+RESCAN_INTERVAL_SECS = 60   # wait between rescans when not ready
+MIN_SIGNALS_TO_ENTER = 3    # minimum inflection signals required
+MIN_GRADE_TO_ENTER   = 'B'  # minimum sniper grade ('A' or 'B')
+
+def is_entry_ready(best):
+    """
+    Returns True only when the best candidate has sufficient confirmed
+    inflection signals to enter immediately.
+
+    All must pass:
+    • Grade ≥ MIN_GRADE_TO_ENTER  (B or A)
+    • strong_signals ≥ MIN_SIGNALS_TO_ENTER  (at least 3/7)
+    • MOM crossover OR delta_cross_up is active  (at least one hard inflection)
+    • Delta signal is not SELL_DOMINANT
+    """
+    d1m   = best["data"]["1m"]
+    grade = best.get('sniper_grade', 'F')
+    dsig  = d1m.get('delta_signal', 'NEUTRAL')
+
+    grade_order = {'F': 0, 'C': 1, 'B': 2, 'A': 3}
+    if grade_order.get(grade, 0) < grade_order.get(MIN_GRADE_TO_ENTER, 2):
+        return False
+
+    strong_signals = sum([
+        bool(d1m.get('mom_cross_up')),
+        bool(d1m.get('delta_cross_up')),
+        bool(d1m.get('rsi_turning_up')),
+        bool(d1m.get('sine_cross_up')),
+        bool(d1m.get('vol_climax')),
+        bool(d1m.get('liq_sweep')),
+        dsig in ('BUY_DOMINANT', 'BUY_LEAN'),
+    ])
+
+    if strong_signals < MIN_SIGNALS_TO_ENTER:
+        return False
+
+    if not d1m.get('mom_cross_up') and not d1m.get('delta_cross_up'):
+        return False
+
+    if dsig == 'SELL_DOMINANT':
+        return False
+
+    return True
+
+
+def run_one_scan(trader, symbols, scan_cache):
+    """
+    Execute one full market scan pass. Returns (candidates, best) or
+    ([], None) if nothing passed filters.
+    """
     candidates = []
-    scan_cache = _load_cache()   # load scan history before the loop
-
     with Live(build_table(candidates), refresh_per_second=3, vertical_overflow="visible") as live:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             futures = [ex.submit(scan, s, trader.client) for s in symbols]
@@ -2147,7 +2247,6 @@ if __name__ == "__main__":
                 result = future.result()
                 if result:
                     candidates.append(result)
-                    # Update cache for every candidate that passed filters
                     _update_cache(
                         scan_cache,
                         result['symbol'],
@@ -2158,27 +2257,122 @@ if __name__ == "__main__":
                     )
                 live.update(build_table(candidates))
 
-    _save_cache(scan_cache)   # persist after scan completes
+    _save_cache(scan_cache)
 
     if not candidates:
-        console.print("[red]No candidates passed all filters.[/red]")
-        sys.exit(1)
+        return [], None
 
-    best   = max(candidates, key=lambda x: x["score"])
+    best = max(candidates, key=lambda x: x["score"])
+    return candidates, best
+
+
+# ====================== MAIN ======================
+if __name__ == "__main__":
+    import time as _sleep_time
+
+    trader  = Trader("credentials.txt")
+    talib_s = "[green]talib active[/green]" if HAS_TALIB else "[yellow]scipy fallback[/yellow]"
+    scan_cache = _load_cache()
+
+    scan_round  = 0
+    best        = None
+    entry_ready = False
+
+    # ── RESCAN LOOP — keeps scanning until entry is confirmed ──────────────
+    while not entry_ready:
+        scan_round += 1
+        symbols = trader.get_usdc_pairs()   # refresh pair list each round (new listings, delistings)
+
+        console.print(
+            f"\n[bold cyan]{'='*65}[/bold cyan]"
+        )
+        console.print(
+            f"[bold cyan]  SCAN ROUND {scan_round} | {len(symbols)} USDC pairs "
+            f"(≥${MIN_VOLUME_USDC/1e3:.0f}k 24h vol) | {talib_s}[/bold cyan]"
+        )
+        console.print(
+            f"[bold cyan]  Waiting for Grade ≥ {MIN_GRADE_TO_ENTER} with ≥{MIN_SIGNALS_TO_ENTER}/7 "
+            f"inflection signals before entry[/bold cyan]"
+        )
+        console.print(f"[bold cyan]{'='*65}[/bold cyan]")
+
+        candidates, best = run_one_scan(trader, symbols, scan_cache)
+
+        if not best:
+            console.print(f"[yellow]Round {scan_round}: No candidates passed filters. "
+                          f"Rescanning in {RESCAN_INTERVAL_SECS}s...[/yellow]")
+            _sleep_time.sleep(RESCAN_INTERVAL_SECS)
+            continue
+
+        # Show brief status for this round
+        d1m_check = best["data"]["1m"]
+        grade_now  = best.get('sniper_grade', 'F')
+        gscr_now   = best.get('sniper_gscr', 0)
+        dsig_now   = d1m_check.get('delta_signal', 'NEUTRAL')
+        sig_count  = sum([
+            bool(d1m_check.get('mom_cross_up')),
+            bool(d1m_check.get('delta_cross_up')),
+            bool(d1m_check.get('rsi_turning_up')),
+            bool(d1m_check.get('sine_cross_up')),
+            bool(d1m_check.get('vol_climax')),
+            bool(d1m_check.get('liq_sweep')),
+            dsig_now in ('BUY_DOMINANT', 'BUY_LEAN'),
+        ])
+        gc_now = {"A":"bold green","B":"green","C":"yellow","F":"red"}.get(grade_now,"red")
+        console.print(
+            f"\n  Round {scan_round} best: [bold cyan]{best['symbol']}[/bold cyan]  "
+            f"Grade:[{gc_now}]{grade_now}({gscr_now})[/{gc_now}]  "
+            f"Signals:[bold]{sig_count}/7[/bold]  "
+            f"Delta:[cyan]{dsig_now}[/cyan]  "
+            f"MOM:{'[green]✔[/green]' if d1m_check.get('mom_cross_up') else '[dim]✘[/dim]'}  "
+            f"ΔCross:{'[green]✔[/green]' if d1m_check.get('delta_cross_up') else '[dim]✘[/dim]'}"
+        )
+
+        entry_ready = is_entry_ready(best)
+
+        if not entry_ready:
+            console.print(
+                f"  [yellow]Not ready yet — Grade {grade_now}, {sig_count}/7 signals. "
+                f"Rescanning in {RESCAN_INTERVAL_SECS}s...[/yellow]"
+            )
+            _sleep_time.sleep(RESCAN_INTERVAL_SECS)
+        else:
+            console.print(
+                f"  [bold green]✔ ENTRY CONFIRMED after {scan_round} scan round(s). "
+                f"Grade {grade_now} | {sig_count}/7 signals. Proceeding.[/bold green]"
+            )
+
+    # ── ENTRY CONFIRMED — compute smart entry and run full report ──────────
     symbol = best['symbol']
     d1m    = best["data"]["1m"]
     d3m    = best["data"]["3m"]
     d5m    = best["data"]["5m"]
-    entry  = d1m["price"]
+
+    # Smart entry price (live order book + ATR + wick_ll)
+    smart  = compute_smart_entry(trader.client, symbol, d1m)
+    entry  = smart['smart_entry']   # use smart entry, not raw last close
 
     console.print(f"\n[bold magenta]{'='*65}[/bold magenta]")
-    console.print(f"[bold magenta]   BEST MTF PUMP HUNTER — DIP INFLECTION CANDIDATE[/bold magenta]")
+    console.print(f"[bold magenta]   MTF PUMP HUNTER — ENTRY CONFIRMED ✔[/bold magenta]")
     console.print(f"[bold magenta]{'='*65}[/bold magenta]")
     console.print(f"  Symbol          : [bold cyan]{symbol}[/bold cyan]")
     console.print(f"  AI Score        : [bold green]{best['score']:.1f}[/bold green]")
     console.print(f"  Pattern Bonus   : [yellow]+{best.get('pat_bonus',0)}[/yellow]")
     console.print(f"  ML Conf (1m)    : {d1m['ml_score']}%")
     console.print(f"  OB Imbalance    : {best['imbalance']:+.4f}")
+    console.print(f"  Scan Rounds     : [cyan]{scan_round}[/cyan]")
+
+    # ── SMART ENTRY PRICE ─────────────────────────────────────────────────
+    console.print(f"\n  [bold green]── Smart Entry Price ──[/bold green]")
+    console.print(f"  Smart Entry     : [bold green]{smart['smart_entry']:.8f} USDC[/bold green]  ← USE THIS as limit order")
+    console.print(f"  Best Bid (live) : [cyan]{smart['best_bid']:.8f} USDC[/cyan]")
+    console.print(f"  ATR Candidate   : [cyan]{smart['atr_entry']:.8f} USDC[/cyan]  (bid − 0.5×ATR)")
+    console.print(f"  wick_ll floor   : [red]{smart['wick_ll']:.8f} USDC[/red]  (500-bar structural support)")
+    console.print(f"  Last Close      : [dim]{d1m['price']:.8f} USDC[/dim]")
+    disc = smart['discount_pct']
+    disc_c = "[green]" if disc > 0 else "[yellow]"
+    console.print(f"  Discount vs Close: {disc_c}{disc:+.4f}%[/{disc_c[1:]}")
+    console.print(f"  Rationale       : [dim]{smart['rationale']}[/dim]")
 
     # ── SCAN HISTORY TREND ─────────────────────────────────────────────────
     trend = _get_grade_trend(scan_cache, symbol)
@@ -2507,16 +2701,18 @@ if __name__ == "__main__":
 
         # Optimal path explanation
         console.print(f"\n  [bold white]── Optimal Entry Path ──[/bold white]")
-        console.print(f"  [green]1. Wait for MOM crossover on 1m (if not yet)[/green]")
-        console.print(f"  [green]2. Enter at {entry:.8f} USDC (current 1m close)[/green]")
-        console.print(f"  [green]3. First target: {primary['price']:.8f} USDC (+{primary['gain']:.2f}%)[/green]")
+        console.print(f"  [bold green]1. Place LIMIT BUY at {smart['smart_entry']:.8f} USDC[/bold green]  ← smart entry price")
+        console.print(f"  [green]   (Best bid: {smart['best_bid']:.8f} | wick_ll floor: {smart['wick_ll']:.8f})[/green]")
+        console.print(f"  [green]2. First target  : {primary['price']:.8f} USDC (+{primary['gain']:.2f}%)[/green]")
         if len(exit_targets) > 1:
             t2 = exit_targets[1]
-            console.print(f"  [cyan]4. If momentum holds: {t2['price']:.8f} USDC (+{t2['gain']:.2f}%)[/cyan]")
+            gain2 = (t2['price'] - smart['smart_entry']) / smart['smart_entry'] * 100
+            console.print(f"  [cyan]3. If momentum holds: {t2['price']:.8f} USDC (+{gain2:.2f}% from entry)[/cyan]")
         if len(exit_targets) > 2:
             t3 = exit_targets[2]
-            console.print(f"  [yellow]5. Extended target: {t3['price']:.8f} USDC (+{t3['gain']:.2f}%)[/yellow]")
-        console.print(f"  [dim]Spot: no stop loss. If dip extends, wait for next MOM crossover.[/dim]")
+            gain3 = (t3['price'] - smart['smart_entry']) / smart['smart_entry'] * 100
+            console.print(f"  [yellow]4. Extended target  : {t3['price']:.8f} USDC (+{gain3:.2f}% from entry)[/yellow]")
+        console.print(f"  [dim]Spot: no stop loss. If dip extends, wait for next MOM+delta crossover.[/dim]")
     else:
         console.print("  [yellow]No targets found in 2-15% range. Range too tight or price too close to HH.[/yellow]")
         console.print(f"  [dim]Consensus exit estimate: {consensus_exit:.8f} USDC (+{cons_gain:.2f}%)[/dim]")
@@ -2573,8 +2769,8 @@ if __name__ == "__main__":
     primary_gain_val = exit_targets[0]['gain']  if exit_targets else cons_gain
 
     send_alert(
-        f"🚀 PUMP: {symbol} | Grade {grade} ({gscr}) | Score {best['score']:.0f}\n"
-        f"Entry {entry:.8f} | Target {primary_exit_val:.8f} (+{primary_gain_val:.2f}%)\n"
+        f"🚀 PUMP ENTRY CONFIRMED: {symbol} | Grade {grade} ({gscr}) | Round {scan_round}\n"
+        f"Smart Entry {smart['smart_entry']:.8f} | Target {primary_exit_val:.8f} (+{primary_gain_val:.2f}%)\n"
         f"VibEnergy {vib:.0f}/100 | F&G {d1m['fg_score']} ({d1m['fg_label']})\n"
         f"MOM {d1m.get('momentum_1m',0):+.6f} | Delta {dsig} | "
         f"ATR {d1m.get('atr_pct',0):.3f}% ({d1m.get('atr_tier','?')}) | "
