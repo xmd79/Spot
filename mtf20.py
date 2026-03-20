@@ -783,18 +783,16 @@ def compute_tf(client, symbol, tf, higher_tf_ranges=None):
     # ── MACD ──────────────────────────────────────────────────────────────────
     macd_val = macd(c)
 
-    # ── FFT: proper dominant harmonic targets (replaces DC mean) ─────────────
-    # fft_dominant_target() decomposes the close array into its top-N amplitude
-    # harmonics, skipping the DC component (index 0 = mean price), and projects
-    # constructive interference peaks as real magnetic price levels.
-    # The old fft_forecast(c) = np.mean(fft.real) = DC mean — NOT a target.
-    fft_harmonics   = fft_dominant_target(c, float(c[-1]), n_harmonics=5)
-    # Store the single highest-amplitude harmonic peak for fast lookup.
-    # Filter: must be above current price and within ±20% range.
+    # ── FFT: TF-aware dominant harmonic targets ───────────────────────────────
+    # Each TF uses its own analysis window, period band, and forward projection
+    # horizon — so 1m targets are micro-cycle peaks (minutes ahead) and 1h
+    # targets are macro-cycle peaks (hours ahead), genuinely distinct per TF.
+    fft_harmonics = fft_dominant_target(c, float(c[-1]), n_harmonics=5, tf=tf)
+    # Best harmonic peak above current price within 20% range
     valid_fft = [t for t in fft_harmonics
                  if t[0] > float(c[-1]) and t[0] < float(c[-1]) * 1.20]
-    fft_val = valid_fft[0][0] if valid_fft else float(c[-1]) * 1.05   # fallback 5%
-    # Store all harmonic targets for exit engine use
+    fft_val = valid_fft[0][0] if valid_fft else float(c[-1]) * 1.05
+    # All harmonic targets above current price (for exit engine)
     fft_harmonic_targets = [(float(t[0]), float(t[1])) for t in fft_harmonics
                             if t[0] > float(c[-1])]
 
@@ -1431,53 +1429,140 @@ def send_alert(msg):
 
 # ====================== PHYSICS-INSPIRED HELPERS ======================
 
-def fft_dominant_target(c, entry_price, n_harmonics=5):
+def fft_dominant_target(c, entry_price, n_harmonics=5, tf='1m'):
     """
-    Proper FFT target: find the dominant frequency components (harmonics)
-    of the close array and project their constructive interference peaks
-    as price targets.
+    TF-aware FFT harmonic target projection.
 
-    Unlike np.mean(fft.real) which is just the DC offset (mean price),
-    this identifies the top-N amplitude harmonics and computes where they
-    constructively interfere in the near future — giving real magnetic levels.
+    Each timeframe operates on its own characteristic window and projects
+    forward by its own near-term horizon so targets are genuinely distinct
+    per TF — not collapsed to the same mean-reversion level.
 
-    Returns list of (target_price, amplitude_weight) sorted by amplitude desc.
+    Key design decisions
+    ────────────────────
+    1. TF-specific analysis window
+       Each TF uses only the most recent N candles that cover its natural
+       cycle length. 1m uses last 120 bars (~2h of micro-cycles), 1h uses
+       last 168 bars (~1 week of hourly cycles), etc.
+       This ensures the FFT finds cycles meaningful to that TF's resolution.
+
+    2. TF-specific forward projection
+       Harmonics are projected N bars ahead where N = the number of bars
+       that covers the near-term horizon for that TF:
+         1m  → 10 bars ahead  (10 minutes)
+         3m  → 8  bars ahead  (24 minutes)
+         5m  → 6  bars ahead  (30 minutes)
+         15m → 4  bars ahead  (1 hour)
+         30m → 3  bars ahead  (1.5 hours)
+         1h  → 2  bars ahead  (2 hours)
+         4h  → 2  bars ahead  (8 hours)
+         1d  → 1  bar  ahead  (1 day)
+
+    3. Period-band filtering per TF
+       Each TF has a valid period band (min_period, max_period in bars).
+       Harmonics outside the band for that TF are discarded — so 1m
+       harmonics with 500-bar periods are not mixed into the 1m projection
+       (those are 1d-scale cycles, not 1m-scale cycles).
+
+    4. Peak finding across forward window
+       Instead of evaluating only at bar n+1, we reconstruct the signal
+       across the full forward horizon and find the highest peak that is
+       above entry_price. This gives the price level the cycle is actually
+       heading toward, not just the value at the next bar.
+
+    Returns list of (target_price, amplitude_weight, period_bars)
+    sorted by amplitude descending. Only includes targets > entry_price.
     """
+    # TF configuration: (analysis_window, forward_bars, min_period, max_period)
+    TF_CONFIG = {
+        '1m':  (120,  10,  2,   60),
+        '3m':  (120,   8,  3,  100),
+        '5m':  (100,   6,  4,  120),
+        '15m': (96,    4,  5,  150),
+        '30m': (72,    3,  6,  200),
+        '1h':  (168,   2,  8,  300),
+        '4h':  (90,    2, 10,  500),
+        '1d':  (60,    1, 15, 1200),
+    }
+    cfg = TF_CONFIG.get(tf, (120, 5, 3, 200))
+    window_n, fwd_bars, min_period, max_period = cfg
+
     c_clean = c[~np.isnan(c)].astype(float)
     if len(c_clean) < 32:
         return []
 
-    n      = len(c_clean)
-    mean_c = np.mean(c_clean)
-    detr   = c_clean - mean_c       # detrend: remove DC offset
+    # Use only the TF-specific window (recent cycles relevant to this TF)
+    c_win = c_clean[-window_n:] if len(c_clean) > window_n else c_clean
+    n = len(c_win)
+    if n < 16:
+        return []
 
-    fft_vals  = np.fft.rfft(detr)
-    freqs     = np.fft.rfftfreq(n)
-    amplitudes= np.abs(fft_vals)
+    # Linear detrend (remove trend slope + DC) so FFT sees pure oscillation
+    x     = np.arange(n, dtype=float)
+    slope, intercept = np.polyfit(x, c_win, 1)
+    trend = slope * x + intercept
+    detr  = c_win - trend
 
-    # Skip DC (index 0) — that's the mean, not a target
-    amps_no_dc = amplitudes[1:]
-    freqs_no_dc= freqs[1:]
-    phases_no_dc = np.angle(fft_vals[1:])
+    fft_vals   = np.fft.rfft(detr)
+    freqs      = np.fft.rfftfreq(n)
+    amplitudes = np.abs(fft_vals)
 
-    # Top-N amplitude harmonics
-    top_idx = np.argsort(amps_no_dc)[::-1][:n_harmonics]
+    # Skip DC (index 0)
+    amps   = amplitudes[1:]
+    freqs_ = freqs[1:]
+    phases = np.angle(fft_vals[1:])
 
-    targets = []
-    # Project each harmonic 1 period ahead
-    for idx in top_idx:
-        amp   = float(amps_no_dc[idx])
-        freq  = float(freqs_no_dc[idx])
-        phase = float(phases_no_dc[idx])
+    # Filter to harmonics whose period falls within the TF-appropriate band
+    valid_mask = np.zeros(len(amps), dtype=bool)
+    for i, freq in enumerate(freqs_):
         if freq < 1e-8:
             continue
-        period_bars = int(round(1.0 / freq)) if freq > 0 else n
-        # Peak of this harmonic at bar n (next bar): mean + amp × cos(phase_at_n+1)
-        phase_at_next = phase + 2 * np.pi * freq * (n + 1)
-        target = mean_c + amp * np.cos(phase_at_next)
-        weight = amp / (np.sum(amps_no_dc) + 1e-10)
-        targets.append((float(target), float(weight), period_bars))
+        period = 1.0 / freq
+        if min_period <= period <= max_period:
+            valid_mask[i] = True
 
+    if not np.any(valid_mask):
+        # Fallback: use all harmonics if none pass the period filter
+        valid_mask[:] = True
+
+    valid_amps   = amps[valid_mask]
+    valid_freqs  = freqs_[valid_mask]
+    valid_phases = phases[valid_mask]
+
+    # Pick top-N by amplitude within the valid band
+    top_idx = np.argsort(valid_amps)[::-1][:n_harmonics]
+
+    targets = []
+    amp_sum = float(np.sum(valid_amps)) + 1e-10
+
+    for idx in top_idx:
+        amp   = float(valid_amps[idx])
+        freq  = float(valid_freqs[idx])
+        phase = float(valid_phases[idx])
+        if freq < 1e-8 or amp < 1e-10:
+            continue
+
+        period_bars = int(round(1.0 / freq))
+
+        # Reconstruct the detrended signal across the forward window
+        # and find the peak value in the projection horizon
+        # trend at bar n + k: trend[-1] + slope * k
+        best_peak = None
+        for k in range(1, fwd_bars + 1):
+            # Trend continuation
+            trend_k = float(trend[-1]) + slope * k
+            # Harmonic value at n + k
+            phase_k = phase + 2 * np.pi * freq * (n + k)
+            signal_k = trend_k + amp * np.cos(phase_k)
+            if signal_k > entry_price:
+                if best_peak is None or signal_k > best_peak:
+                    best_peak = signal_k
+
+        if best_peak is not None:
+            weight = amp / amp_sum
+            targets.append((float(best_peak), float(weight), period_bars))
+
+    # Sort by amplitude weight descending
+    targets.sort(key=lambda x: x[1], reverse=True)
     return targets
 
 
@@ -2189,19 +2274,19 @@ def compute_smart_entry(client, symbol, d1m):
 
 # ====================== ENTRY READINESS ======================
 
-RESCAN_INTERVAL_SECS = 60   # wait between rescans when not ready
-MIN_SIGNALS_TO_ENTER = 3    # minimum inflection signals required
-MIN_GRADE_TO_ENTER   = 'B'  # minimum sniper grade ('A' or 'B')
+RESCAN_INTERVAL_SECS = 5    # wait between rescans when not ready
+MIN_SIGNALS_TO_ENTER = 2    # minimum inflection signals required
+MIN_GRADE_TO_ENTER   = 'C'  # minimum sniper grade ('A', 'B', or 'C')
 
 def is_entry_ready(best):
     """
-    Returns True only when the best candidate has sufficient confirmed
-    inflection signals to enter immediately.
+    Returns True when the best candidate has sufficient signals to enter.
 
     All must pass:
-    • Grade ≥ MIN_GRADE_TO_ENTER  (B or A)
-    • strong_signals ≥ MIN_SIGNALS_TO_ENTER  (at least 3/7)
-    • MOM crossover OR delta_cross_up is active  (at least one hard inflection)
+    • Grade ≥ MIN_GRADE_TO_ENTER
+    • strong_signals ≥ MIN_SIGNALS_TO_ENTER
+    • At least ONE of: MOM crossover, delta_cross_up, vol_climax, liq_sweep
+      (at least one concrete event, not just oversold readings)
     • Delta signal is not SELL_DOMINANT
     """
     d1m   = best["data"]["1m"]
@@ -2209,7 +2294,7 @@ def is_entry_ready(best):
     dsig  = d1m.get('delta_signal', 'NEUTRAL')
 
     grade_order = {'F': 0, 'C': 1, 'B': 2, 'A': 3}
-    if grade_order.get(grade, 0) < grade_order.get(MIN_GRADE_TO_ENTER, 2):
+    if grade_order.get(grade, 0) < grade_order.get(MIN_GRADE_TO_ENTER, 1):
         return False
 
     strong_signals = sum([
@@ -2225,7 +2310,15 @@ def is_entry_ready(best):
     if strong_signals < MIN_SIGNALS_TO_ENTER:
         return False
 
-    if not d1m.get('mom_cross_up') and not d1m.get('delta_cross_up'):
+    # At least one concrete event signal (not just oscillator readings)
+    has_event = (
+        d1m.get('mom_cross_up') or
+        d1m.get('delta_cross_up') or
+        d1m.get('vol_climax') or
+        d1m.get('liq_sweep') or
+        d1m.get('bullish_engulf')
+    )
+    if not has_event:
         return False
 
     if dsig == 'SELL_DOMINANT':
