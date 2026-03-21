@@ -11,13 +11,13 @@ vs mtf20 — ALL improvements applied:
   ✅ REAL RSI Divergence: compares RSI trough at prior price LL vs current RSI
   ✅ Instant Backtest: replays last 300 1m bars, scores each historical setup
        against actual forward outcome — prints hit-rate, avg gain, Sharpe
-  ✅ Two-pass pre-filter: Round 1 scans 1m only → shortlists top 15 →
-       Round 2 runs full 8-TF deep scan on shortlist only (3-5× faster)
+  ✅ Two-pass scan: Stage 1 fast 1m gate on ALL pairs → Stage 2 full 8-TF
+       deep scan on ALL Stage-1 survivors (no cap, no shortlist limit)
   ✅ VWAP: Volume Weighted Average Price — strong intraday reversal gate
   ✅ Aggressive Trade Tape (aggTrades): real aggressor-side volume for best
        bid/ask split accuracy
   ✅ Funding Rate awareness via futures endpoint (squeeze setup filter)
-  ✅ Cooldown guard: blocks re-alerting same symbol within COOLDOWN_MINUTES
+  ✅ No cooldown — full universe rescanned every 5s, nothing skipped
   ✅ ATR-dynamic target cap: max_target = entry + 3×ATR for short-term plays
   ✅ Tightened sniper gate: all 5 conditions simultaneously required for A grade
   ✅ Garbage collector + fresh data: gc.collect() + del between iterations
@@ -83,18 +83,26 @@ LINEARREG_PERIOD       = 50    # talib.LINEARREG period for channel
 
 KLINES_LIMIT   = 1200
 LOOKBACK_PERIODS = {tf: 1200 for tf in TF_LIST}
-MIN_VOLUME_USDC  = 500_000   # minimum 24h volume in USDC — filters illiquid pairs
 
-# ── New constants ────────────────────────────────────────────────────────────
-COOLDOWN_MINUTES        = 15    # don't re-alert same symbol within N minutes
-PREFILTER_TOP_N         = 15    # Round-1 shortlist size before deep 8-TF scan
-BACKTEST_BARS           = 300   # bars to replay in instant backtest
-BACKTEST_FORWARD_BARS   = 20    # look this many bars ahead to score each setup
-BACKTEST_MIN_GAIN_PCT   = 3.0   # % gain required to count as a "win"
-SCAN_SLEEP_SECS         = 5     # sleep between scan iterations
-ML_TRAIN_BARS           = 200   # bars of 1m history used to train ML model
+# ── Pair universe: scan ALL spot USDC pairs, no volume floor ─────────────────
+# Every listed USDC spot pair is included. Table shows all, sorted by score.
+MIN_VOLUME_USDC  = 0    # 0 = no filter — full Binance USDC spot universe
+
+# ── Timing: no cooldown, only 5s sleep between iterations ────────────────────
+SCAN_SLEEP_SECS         = 5     # sleep between iterations (no entry found)
+
+# ── Scan / ML config ─────────────────────────────────────────────────────────
+# PREFILTER_TOP_N removed — all Stage-1 survivors go to deep scan, no cap
+ML_KLINES_LIMIT         = 1500  # separate klines fetch for ML — larger than KLINES_LIMIT
+ML_TRAIN_BARS           = 1200  # training window bars (more bars = more positive labels)
+ML_MIN_POSITIVE_LABELS  = 5     # min pump examples to train; else use heuristic score
+BACKTEST_BARS           = 800   # bars to replay in instant backtest
+BACKTEST_FORWARD_BARS   = 20    # bars ahead to measure outcome
+BACKTEST_MIN_GAIN_PCT   = 3.0   # % gain threshold = win
+
+# ── Physics / exit ────────────────────────────────────────────────────────────
 ATR_TARGET_CAP_MULT     = 3.0   # max target = entry + N × ATR
-VWAP_LOOKBACK           = 100   # bars for VWAP calculation
+VWAP_LOOKBACK           = 100   # bars for VWAP
 FUNDING_RATE_THRESHOLD  = -0.0003  # negative funding → long squeeze risk
 
 # ── Per-TF extrema lookback: 500 candles of each TF's own resolution ──────────
@@ -189,31 +197,34 @@ class Trader:
 
     def get_usdc_pairs(self):
         """
-        Returns all USDC-quoted pairs that are:
-        • actively trading
-        • ASCII uppercase symbols only (filters derivative tokens)
-        • 24h USDC volume ≥ MIN_VOLUME_USDC (filters illiquid pairs that
-          pass all signal checks but never actually pump)
+        Returns ALL spot USDC-quoted pairs from Binance that are actively TRADING.
 
-        Volume data is fetched once via get_ticker() which returns all
-        24h stats in a single API call — no per-symbol overhead.
+        Rules:
+        • quoteAsset == 'USDC'  (spot market, stable-coin quoted)
+        • status == 'TRADING'   (actively listed, not suspended)
+        • isSpotTradingAllowed   (pure spot pairs only — no margin-only symbols)
+        • No volume floor — every pair is included regardless of liquidity.
+          Low-volume pairs will simply score lower and never reach Grade A.
+          The full universe means no potential pump is missed.
+
+        All 24h stats fetched in a single get_ticker() call to avoid per-symbol
+        API overhead. Symbol count is logged so you can verify the full list.
         """
         info    = self.client.get_exchange_info()
-        tickers = {t['symbol']: float(t['quoteVolume'])
-                   for t in self.client.get_ticker()}
+        tickers = {t['symbol']: t for t in self.client.get_ticker()}
 
         pairs = []
         for s in info['symbols']:
-            if s['quoteAsset'] != 'USDC' or s['status'] != 'TRADING':
+            if s['quoteAsset'] != 'USDC':
                 continue
-            sym = s['symbol']
-            if not (sym.isascii() and sym.isupper()):
+            if s['status'] != 'TRADING':
                 continue
-            vol_24h = tickers.get(sym, 0.0)
-            if vol_24h < MIN_VOLUME_USDC:
+            if not s.get('isSpotTradingAllowed', True):
                 continue
-            pairs.append(sym)
-        return pairs
+            pairs.append(s['symbol'])
+
+        logging.info(f"Binance USDC spot universe: {len(pairs)} pairs")
+        return sorted(pairs)
 
 # ====================== DATA ======================
 def get_klines(client, symbol, interval):
@@ -1104,26 +1115,49 @@ def _build_feature_vector(d):
 def train_ml_model(client, symbol, bars=ML_TRAIN_BARS, fwd=BACKTEST_FORWARD_BARS,
                    min_gain=BACKTEST_MIN_GAIN_PCT):
     """
-    Train a GradientBoostingClassifier on the last `bars` candles of 1m data.
-    For each bar i in [0, bars-fwd], compute features from a synthetic indicator
-    snapshot and label = 1 if close[i+fwd] / close[i] - 1 >= min_gain/100.
+    Train a GradientBoostingClassifier on the last ML_TRAIN_BARS candles of 1m data.
 
-    Returns trained sklearn Pipeline or None if sklearn unavailable / insufficient data.
+    Uses a DEDICATED klines fetch with ML_KLINES_LIMIT (1500) — larger than the
+    normal KLINES_LIMIT (1200) so training always has enough bars even after
+    slicing off the forward-label window. This is the fix for "insufficient data".
+
+    For each bar i, features are computed from indicators up to that bar.
+    Label = 1 if max(close[i+1 : i+fwd+1]) / close[i] - 1 >= min_gain/100
+    (i.e. price pumped ≥ min_gain% at any point in the next `fwd` bars).
+
+    Requires ML_MIN_POSITIVE_LABELS positive examples to fit; else returns None
+    and the caller falls back to the heuristic ml_score.
     """
     if not HAS_SKLEARN:
         return None
     try:
-        klines = get_klines(client, symbol, '1m')
-        if klines is None or len(klines[3]) < bars + fwd + 50:
+        # Dedicated larger fetch — bypasses the global KLINES_LIMIT cap
+        k = client.get_klines(symbol=symbol, interval='1m', limit=ML_KLINES_LIMIT)
+        if not k:
             return None
-        o, h, l, c, v = klines
-        # Use last `bars + fwd` candles for training
-        n_total = bars + fwd
-        o = o[-n_total:]; h = h[-n_total:]; l = l[-n_total:]
-        c = c[-n_total:]; v = v[-n_total:]
+        o = np.array([float(x[1]) for x in k])
+        h = np.array([float(x[2]) for x in k])
+        l = np.array([float(x[3]) for x in k])
+        c = np.array([float(x[4]) for x in k])
+        v = np.array([float(x[5]) for x in k])
 
+        # Adapt to WHATEVER data is available — never reject based on length.
+        # New assets (e.g. DYMUSDC) may have far fewer than ML_TRAIN_BARS candles.
+        # We use ALL available bars, automatically scaling down every threshold:
+        #   • min_hist : minimum bars needed before an indicator is meaningful
+        #   • bars_to_use : training window — all bars minus forward label horizon
+        #   • loop start : min_hist (not hardcoded 50)
+        total_avail = len(c)
+        min_hist    = max(20, RSI_LENGTH + MOM_PERIOD + 5)  # smallest viable indicator window
+        bars_to_use = total_avail - fwd - min_hist
+        if bars_to_use < 10:
+            # Truly brand-new listing with almost no history — skip gracefully
+            logging.info(f"ML skip {symbol}: only {total_avail} bars available (need >{fwd + min_hist + 10})")
+            return None
+
+        # No slicing needed — use the full fetched array as-is
         X, y = [], []
-        for i in range(50, bars):  # need 50 bars history for indicators
+        for i in range(min_hist, min_hist + bars_to_use):  # adaptive start
             c_i = c[:i+1]; o_i = o[:i+1]; h_i = h[:i+1]; l_i = l[:i+1]; v_i = v[:i+1]
             # Fast feature extraction (subset of compute_tf)
             rsi_v  = calc_rsi(c_i)
@@ -1169,7 +1203,7 @@ def train_ml_model(client, symbol, bars=ML_TRAIN_BARS, fwd=BACKTEST_FORWARD_BARS
 
         X = np.array(X, dtype=float)
         y = np.array(y, dtype=int)
-        if len(X) < 20 or np.sum(y) < 3:
+        if len(X) < 30 or np.sum(y) < ML_MIN_POSITIVE_LABELS:
             return None
 
         pipe = Pipeline([
@@ -1624,18 +1658,15 @@ def sniper_pattern_score(tf_data):
         if d.get('delta_signal') == 'BUY_DOMINANT': bonus += 15
     return bonus
 
-# ====================== COOLDOWN REGISTRY ======================
-# Prevents re-alerting the same symbol too quickly after a confirmed entry.
-_cooldown_registry = {}   # symbol → unix timestamp of last alert
+# ====================== COOLDOWN REGISTRY (DISABLED) ======================
+# No cooldown — every iteration rescans full universe with 5s sleep only.
+_cooldown_registry = {}
 
 def is_on_cooldown(symbol):
-    """Returns True if this symbol was alerted within COOLDOWN_MINUTES."""
-    last = _cooldown_registry.get(symbol, 0)
-    return (_time.time() - last) < COOLDOWN_MINUTES * 60
+    return False   # disabled — no cooldown
 
 def mark_alerted(symbol):
-    """Record that we just alerted this symbol."""
-    _cooldown_registry[symbol] = _time.time()
+    pass           # disabled — no cooldown
 
 
 # ====================== ROUND-1 PRE-FILTER (1m only) ======================
@@ -2710,8 +2741,8 @@ def run_one_scan(trader, symbols, scan_cache):
     """
     Execute one full market scan pass with two-stage pre-filter.
 
-    Stage 1 (fast): scan all symbols on 1m only → shortlist top PREFILTER_TOP_N
-    Stage 2 (deep): full 8-TF analysis on shortlist only → final candidates
+    Stage 1 (fast): 1m-only scan on ALL symbols — rejects obvious non-dips
+    Stage 2 (deep): full 8-TF analysis on ALL Stage-1 survivors (no cap)
 
     For the top-1 candidate: train ML model + run instant backtest.
     Returns (candidates, best) or ([], None).
@@ -2727,18 +2758,22 @@ def run_one_scan(trader, symbols, scan_cache):
                 prefilter_results.append(res)
 
     prefilter_results.sort(key=lambda x: x[1], reverse=True)
-    shortlist = [r[0] for r in prefilter_results[:PREFILTER_TOP_N]
-                 if not is_on_cooldown(r[0])]
-    console.print(f" shortlisted [bold cyan]{len(shortlist)}[/bold cyan] for deep scan")
+    # ALL pairs that passed Stage 1 gate go into the deep scan — no cap.
+    # Stage 1 already rejected pairs with RSI>55 or sine>0.3 (clearly not dipping).
+    # Everything else is a candidate and gets the full 8-TF treatment.
+    deep_scan_list = [r[0] for r in prefilter_results]
+    console.print(
+        f" [bold cyan]{len(deep_scan_list)}[/bold cyan] pairs passed Stage 1 → deep 8-TF scan on all"
+    )
 
-    if not shortlist:
+    if not deep_scan_list:
         return [], None
 
-    # ── STAGE 2: Full 8-TF deep scan on shortlist ─────────────────────────────
+    # ── STAGE 2: Full 8-TF deep scan on ALL Stage-1 survivors ────────────────
     candidates = []
     with Live(build_table(candidates), refresh_per_second=3, vertical_overflow="visible") as live:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            futures = [ex.submit(scan, s, trader.client) for s in shortlist]
+            futures = [ex.submit(scan, s, trader.client) for s in deep_scan_list]
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
                 if result:
@@ -2811,7 +2846,7 @@ if __name__ == "__main__":
 
     scan_round = 0
     console.print(f"\n[bold cyan]MTF PUMP HUNTER — CONTINUOUS SCAN MODE[/bold cyan]")
-    console.print(f"[bold cyan]{talib_s}  |  {sk_s}  |  sleep={SCAN_SLEEP_SECS}s  |  cooldown={COOLDOWN_MINUTES}min[/bold cyan]\n")
+    console.print(f"[bold cyan]{talib_s}  |  {sk_s}  |  sleep={SCAN_SLEEP_SECS}s between iterations[/bold cyan]\n")
 
     # ── CONTINUOUS SCAN LOOP ────────────────────────────────────────────────
     # Never exits. Iterates indefinitely, hunting for pump setups.
@@ -2822,18 +2857,17 @@ if __name__ == "__main__":
         # ── Garbage collection — force clean state before new iteration ─────
         gc.collect()
 
-        symbols = trader.get_usdc_pairs()   # refresh pair list (new listings, delistings)
+        symbols = trader.get_usdc_pairs()   # full USDC spot universe, refreshed every round
 
         console.print(
             f"\n[bold cyan]{'='*65}[/bold cyan]"
         )
         console.print(
-            f"[bold cyan]  SCAN ROUND {scan_round} | {len(symbols)} USDC pairs "
-            f"(≥${MIN_VOLUME_USDC/1e3:.0f}k 24h vol) | {talib_s} | {sk_s}[/bold cyan]"
+            f"[bold cyan]  SCAN ROUND {scan_round} | {len(symbols)} USDC spot pairs (full universe) | {talib_s} | {sk_s}[/bold cyan]"
         )
         console.print(
             f"[bold cyan]  Waiting for Grade ≥ {MIN_GRADE_TO_ENTER} with ≥{MIN_SIGNALS_TO_ENTER}/7 "
-            f"inflection signals | cooldown={COOLDOWN_MINUTES}min | sleep={SCAN_SLEEP_SECS}s[/bold cyan]"
+            f"inflection signals | rescan every {SCAN_SLEEP_SECS}s[/bold cyan]"
         )
         console.print(f"[bold cyan]{'='*65}[/bold cyan]")
 
@@ -2909,9 +2943,6 @@ if __name__ == "__main__":
             f"  [bold green]✔ ENTRY CONFIRMED round {scan_round}. "
             f"Grade {grade_now} | {sig_count}/7 signals. Proceeding.[/bold green]"
         )
-
-        # Mark cooldown so we don't re-alert this symbol immediately
-        mark_alerted(best['symbol'])
 
         # ── COMPUTE SMART ENTRY AND FULL REPORT ────────────────────────────
         symbol = best['symbol']
