@@ -250,55 +250,48 @@ def fft_analysis(close_list, volume_list, high_list, current_price, tf_label):
     }
 
 
-def full_fft_report(pair, current_price):
+def _run_fft_for_tfs(pair, current_price, tf_list, sanity_cap_pct=25.0):
     """
-    Run FFT analysis on 1m, 3m, 5m.
-    Returns list of per-TF result dicts + best_overall dict.
+    Generic: run fft_analysis for each (label, interval) in tf_list.
+    sanity_cap_pct controls the max % forecast above current_price.
+    Returns (tf_results, best_overall) or ([], None).
     """
-    tfs = [
-        ('1m',  '1m'),
-        ('3m',  '3m'),
-        ('5m',  '5m'),
-    ]
     tf_results = []
-
-    for label, interval in tfs:
+    for label, interval in tf_list:
         try:
             klines = trader.client.get_klines(
                 symbol=pair, interval=interval, limit=FFT_CANDLES + 20
             )
         except Exception:
             continue
-
         if len(klines) < 32:
             continue
-
         close  = [float(k[4]) for k in klines]
         volume = [float(k[5]) for k in klines]
         high   = [float(k[2]) for k in klines]
-
         result = fft_analysis(close, volume, high, current_price, label)
         if result:
+            # re-apply cap with the per-group sanity limit
+            result['forecast']   = min(result['forecast'],
+                                       current_price * (1 + sanity_cap_pct / 100))
+            result['upside_pct'] = round(
+                (result['forecast'] - current_price) / current_price * 100.0, 4)
             tf_results.append(result)
 
     if not tf_results:
         return [], None
 
-    # ── best overall: volume-weighted average of per-TF forecasts
-    #    weight each TF by its volume-resistance confidence
-    #    (higher res_volume = stronger signal)
     forecasts = np.array([r['forecast'] for r in tf_results])
     weights   = np.array([
         r['res_volume'] if r['res_volume'] > 0 else 1.0
         for r in tf_results
     ], dtype=np.float64)
 
-    best_forecast  = float(np.average(forecasts, weights=weights))
-    best_upside    = (best_forecast - current_price) / current_price * 100.0
-
-    # consensus confidence: inverse of spread between TF forecasts
-    spread      = float(np.std(forecasts) / best_forecast * 100) if best_forecast > 0 else 0
-    confidence  = round(max(0.0, min(100.0, 100.0 - spread * 8)), 1)
+    best_forecast = float(np.average(forecasts, weights=weights))
+    best_upside   = (best_forecast - current_price) / current_price * 100.0
+    spread        = float(np.std(forecasts) / best_forecast * 100) \
+                    if best_forecast > 0 else 0.0
+    confidence    = round(max(0.0, min(100.0, 100.0 - spread * 8)), 1)
 
     best_overall = {
         'current':    current_price,
@@ -307,8 +300,85 @@ def full_fft_report(pair, current_price):
         'confidence': confidence,
         'spread_pct': round(spread, 4),
     }
-
     return tf_results, best_overall
+
+
+def full_fft_report(pair, current_price):
+    """
+    Short-term  : 1m, 3m, 5m        (cap +25%)
+    Medium-term : 15m, 30m, 1h, 2h  (cap +60%, cascade stops at resistance)
+
+    For HTF cascade: we walk 15m→30m→1h→2h and stop projecting further
+    once a resistance level is hit (i.e. fft_target is capped by res_target).
+    Returns (stf_results, stf_best, htf_results, htf_best).
+    """
+    stf_tfs = [('1m', '1m'), ('3m', '3m'), ('5m', '5m')]
+    htf_tfs = [('15m', '15m'), ('30m', '30m'), ('1h', '1h'), ('2h', '2h')]
+
+    stf_results, stf_best = _run_fft_for_tfs(pair, current_price,
+                                              stf_tfs, sanity_cap_pct=25.0)
+
+    # HTF cascade: stop at first TF where resistance is hit
+    # "resistance hit" = res_target exists AND fft_target >= res_target
+    # meaning price would reach and test that wall within this TF's cycle
+    htf_results = []
+    for label, interval in htf_tfs:
+        try:
+            klines = trader.client.get_klines(
+                symbol=pair, interval=interval, limit=FFT_CANDLES + 20
+            )
+        except Exception:
+            continue
+        if len(klines) < 32:
+            continue
+        close  = [float(k[4]) for k in klines]
+        volume = [float(k[5]) for k in klines]
+        high   = [float(k[2]) for k in klines]
+        result = fft_analysis(close, volume, high, current_price, label)
+        if not result:
+            continue
+
+        # apply 60% cap for HTF
+        result['forecast']   = min(result['forecast'],
+                                   current_price * 1.60)
+        result['upside_pct'] = round(
+            (result['forecast'] - current_price) / current_price * 100.0, 4)
+
+        htf_results.append(result)
+
+        # cascade stop: resistance exists and FFT projection reaches/exceeds it
+        # → this is where price will face real selling pressure; no point going higher
+        if (result['res_target'] is not None
+                and result['fft_target'] >= result['res_target'] * 0.98):
+            result['cascade_stop'] = True
+            break
+        result['cascade_stop'] = False
+
+    # compute HTF best overall
+    if htf_results:
+        forecasts = np.array([r['forecast'] for r in htf_results])
+        weights   = np.array([
+            r['res_volume'] if r['res_volume'] > 0 else 1.0
+            for r in htf_results
+        ], dtype=np.float64)
+        htf_best_forecast = float(np.average(forecasts, weights=weights))
+        htf_best_upside   = (htf_best_forecast - current_price) / current_price * 100.0
+        spread            = float(np.std(forecasts) / htf_best_forecast * 100) \
+                            if htf_best_forecast > 0 else 0.0
+        confidence        = round(max(0.0, min(100.0, 100.0 - spread * 5)), 1)
+        htf_best = {
+            'current':    current_price,
+            'forecast':   round(htf_best_forecast, 8),
+            'upside_pct': round(htf_best_upside, 4),
+            'confidence': confidence,
+            'spread_pct': round(spread, 4),
+            'tfs_used':   len(htf_results),
+            'stopped_at': htf_results[-1]['tf'] if htf_results else '—',
+        }
+    else:
+        htf_best = None
+
+    return stf_results, stf_best, htf_results, htf_best
 
 # ─────────────────────────────────────────────
 #  SPIKE SCORE  (for stage tables)
@@ -396,48 +466,86 @@ def print_stage_table(pairs, label_map, stage_label, show_cmo=False):
 #  FFT REPORT PRINTER
 # ─────────────────────────────────────────────
 
-def print_fft_report(pair, label_map, tf_results, best_overall):
+def _print_tf_block(r):
+    """Print one timeframe block, shared by STF and HTF sections."""
+    has_res  = r['res_target'] is not None
+    stop_tag = '  ◄ CASCADE STOP (resistance reached)' \
+               if r.get('cascade_stop') else ''
+    print(f'  ┌─ [{r["tf"]}] {"─"*52}┐')
+    print(f'  │  Dominant cycle  : {r["dominant_period"]} bars')
+    print(f'  │  Oscillation amp : {r["osc_amplitude"]}')
+    print(f'  │  FFT projection  : {r["fft_target"]}')
+    if has_res:
+        print(f'  │  Vol resistance  : {r["res_target"]}  '
+              f'(vol weight {r["res_volume"]:.0f}){stop_tag}')
+    else:
+        print(f'  │  Vol resistance  : none found above entry')
+    print(f'  │  ── Forecast ────────────────────────────────────────────')
+    print(f'  │  Price target    : {r["forecast"]}')
+    print(f'  │  Upside          : +{r["upside_pct"]} %')
+    blend = '60% vol-res + 40% FFT' if has_res else '100% FFT (no resistance)'
+    print(f'  │  Blend method    : {blend}')
+    print(f'  └{"─"*60}┘')
+    print()
+
+
+def print_fft_report(pair, label_map, stf_results, stf_best,
+                     htf_results, htf_best):
     lbl = label_map.get(pair, pair.replace('USDC', ''))
     w   = 62
 
     print(f'\n  {"═"*w}')
     print(f'  ◈  FFT SPIKE FORECAST  ·  {lbl}  ({pair})')
     print(f'  {"═"*w}')
-    print(f'  Entry price : {best_overall["current"]}')
+    print(f'  Entry price : {stf_best["current"] if stf_best else "—"}')
     print()
 
-    # per-TF breakdown
-    for r in tf_results:
-        has_res = r['res_target'] is not None
-        print(f'  ┌─ [{r["tf"]}] ──────────────────────────────────────────────┐')
-        print(f'  │  Dominant cycle  : {r["dominant_period"]} bars')
-        print(f'  │  Oscillation amp : {r["osc_amplitude"]}')
-        print(f'  │  FFT projection  : {r["fft_target"]}')
-        if has_res:
-            print(f'  │  Vol resistance  : {r["res_target"]}  '
-                  f'(vol weight {r["res_volume"]:.0f})')
-        else:
-            print(f'  │  Vol resistance  : none found above entry')
-        print(f'  │  ── [{r["tf"]}] Forecast ──────────────────────────────────')
-        print(f'  │  Price target    : {r["forecast"]}')
-        print(f'  │  Upside          : +{r["upside_pct"]} %')
-        if has_res:
-            print(f'  │  Blend           : 60% vol-res + 40% FFT')
-        else:
-            print(f'  │  Blend           : 100% FFT  (no resistance found)')
-        print(f'  └{"─"*58}┘')
+    # ── SHORT-TERM: 1m / 3m / 5m ────────────────────────────
+    if stf_results:
+        print(f'  ▸ SHORT-TERM TARGETS  (1m · 3m · 5m)')
+        print()
+        for r in stf_results:
+            _print_tf_block(r)
+
+        print(f'  {"═"*w}')
+        print(f'  ★  BEST SHORT-TERM FORECAST  (1m/3m/5m consensus)')
+        print(f'  {"─"*w}')
+        print(f'  Consensus target : {stf_best["forecast"]}')
+        print(f'  Upside           : +{stf_best["upside_pct"]} %')
+        print(f'  Confidence       : {stf_best["confidence"]} %'
+              f'  (TF spread {stf_best["spread_pct"]} %)')
+        print(f'  Method           : volume-weighted avg · 1m/3m/5m')
+        print(f'  {"═"*w}')
         print()
 
-    # best overall
-    print(f'  {"═"*w}')
-    print(f'  ★  BEST OVERALL FORECAST')
-    print(f'  {"─"*w}')
-    print(f'  Consensus target : {best_overall["forecast"]}')
-    print(f'  Upside           : +{best_overall["upside_pct"]} %')
-    print(f'  Confidence       : {best_overall["confidence"]} %  '
-          f'(TF spread {best_overall["spread_pct"]} %)')
-    print(f'  Method           : volume-weighted average across 1m/3m/5m forecasts')
-    print(f'  {"═"*w}\n')
+    # ── MEDIUM/LONGER-TERM: 15m / 30m / 1h / 2h ────────────
+    if htf_results:
+        stopped = htf_results[-1].get('cascade_stop', False)
+        stop_tf = htf_results[-1]['tf']
+        tfs_run = ' · '.join(r['tf'] for r in htf_results)
+        print(f'  ▸ HIGHER-TIMEFRAME TARGETS  ({tfs_run})')
+        if stopped:
+            print(f'    Cascade stopped at {stop_tf} — '
+                  f'resistance wall reached, no projection beyond')
+        print()
+        for r in htf_results:
+            _print_tf_block(r)
+
+        if htf_best:
+            print(f'  {"═"*w}')
+            print(f'  ★  BEST HIGHER-TIMEFRAME FORECAST  ({tfs_run})')
+            print(f'  {"─"*w}')
+            print(f'  Consensus target : {htf_best["forecast"]}')
+            print(f'  Upside           : +{htf_best["upside_pct"]} %')
+            print(f'  Confidence       : {htf_best["confidence"]} %'
+                  f'  (TF spread {htf_best["spread_pct"]} %)')
+            print(f'  TFs used         : {htf_best["tfs_used"]}  '
+                  f'(stopped at {htf_best["stopped_at"]})')
+            print(f'  Method           : volume-weighted avg · HTF cascade')
+            print(f'  {"═"*w}')
+            print()
+    else:
+        print(f'  HTF forecast: insufficient data.\n')
 
 # ─────────────────────────────────────────────
 #  MAIN LOOP
@@ -544,11 +652,14 @@ while True:
     # ── FFT forecast on winner ────────────────────────────────
     _, _, current_price = spike_score_and_cmo(best_symbol)
     if current_price:
-        print(f'  Running FFT forecast on '
-              f'{label_map.get(best_symbol, best_symbol)}...')
-        tf_results, best_overall = full_fft_report(best_symbol, current_price)
-        if tf_results:
-            print_fft_report(best_symbol, label_map, tf_results, best_overall)
+        lbl = label_map.get(best_symbol, best_symbol)
+        print(f'  Running FFT forecast on {lbl}...')
+        stf_results, stf_best, htf_results, htf_best = \
+            full_fft_report(best_symbol, current_price)
+        if stf_results or htf_results:
+            print_fft_report(best_symbol, label_map,
+                             stf_results, stf_best,
+                             htf_results, htf_best)
         else:
             print('  FFT: insufficient data for forecast.\n')
     else:
