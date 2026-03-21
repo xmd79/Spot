@@ -2685,7 +2685,7 @@ def compute_smart_entry(client, symbol, d1m):
 # ====================== ENTRY READINESS ======================
 
 RESCAN_INTERVAL_SECS = 5    # wait between rescans when not ready
-MIN_SIGNALS_TO_ENTER = 2    # minimum inflection signals required
+MIN_SIGNALS_TO_ENTER = 4    # minimum inflection signals required
 MIN_GRADE_TO_ENTER   = 'C'  # minimum sniper grade ('A', 'B', or 'C')
 
 def is_entry_ready(best):
