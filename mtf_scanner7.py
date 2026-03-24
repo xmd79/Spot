@@ -103,31 +103,77 @@ FIB_RATIOS = [
 ]
 
 # ─────────────────────────────────────────────
-#  CLIENT
+#  CLIENT - ONLY USDC SPOT TRADING PAIRS (FIXED)
 # ─────────────────────────────────────────────
 class Trader:
     def __init__(self, file):
         lines = [l.rstrip('\n') for l in open(file)]
         self.client = Client(lines[0], lines[1])
 
+    # ── Binance product/yield base assets that are NOT real spot coins ──────────
+    # These tokens appear as TRADING on exchange info but are Binance-internal
+    # yield, collateral, or pegged products with no conventional spot klines.
+    _EXCLUDED_BASES = {
+        'BFUSD', 'FDUSD', 'TUSD', 'USDP', 'USDS', 'DAI', 'FRAX',
+        'LUSD', 'USTC', 'EURS', 'EURT', 'AEUR',
+        'BBTC', 'BETH', 'BBNB', 'LDBNB', 'WBETH',
+        'LDETH', 'LDBTC', 'LDUSDT', 'LDBUSD',
+    }
+
     def get_usdc_pairs(self):
         """
-        Returns:
-          pairs      — list of raw Binance symbols e.g. ['1000BONKUSDC', 'BTCUSDC']
-          label_map  — {symbol: official_base_asset_ticker}
-                       Uses Binance's own baseAsset field — always the official
-                       coin abbreviation regardless of numeric prefix.
+        Returns only genuine USDC spot trading pairs.
+        A symbol must pass ALL gates to be included:
+
+          Gate 1  quoteAsset == USDC
+          Gate 2  status == TRADING
+          Gate 3  isSpotTradingAllowed explicitly True (default False)
+          Gate 4  SPOT in permissions / permissionSets
+          Gate 5  baseAsset NOT in _EXCLUDED_BASES (blocks BFUSD, BBTC, BETH…)
+          Gate 6  live ticker price NOT within 0.5% of $1.00
+                  (catches any stablecoin-vs-USDC pair not in the static list)
         """
-        info      = self.client.get_exchange_info()
+        info  = self.client.get_exchange_info()
+        raw   = []
+
+        for s in info['symbols']:
+            if s['quoteAsset'] != 'USDC':                      continue
+            if s['status']     != 'TRADING':                   continue
+            if s['symbol'].endswith('USD'):                    continue
+            if not s.get('isSpotTradingAllowed', False):       continue
+
+            perms     = s.get('permissions', [])
+            perm_sets = s.get('permissionSets', [])
+            flat_sets = [p for sub in perm_sets for p in sub]
+            if 'SPOT' not in perms and 'SPOT' not in flat_sets:
+                continue
+
+            base = s['baseAsset']
+            if base in self._EXCLUDED_BASES:                   continue
+
+            raw.append((s['symbol'], base))
+
+        if not raw:
+            return [], {}
+
+        # Gate 6: live price sanity — skip anything pegged near $1.00
+        try:
+            tickers   = self.client.get_all_tickers()
+            price_map = {t['symbol']: float(t['price']) for t in tickers}
+        except Exception:
+            price_map = {}
+
         pairs     = []
         label_map = {}
-        for s in info['symbols']:
-            if s['quoteAsset'] == 'USDC' and s['status'] == 'TRADING':
-                sym  = s['symbol']
-                base = s['baseAsset']
-                pairs.append(sym)
-                label_map[sym] = base
+        for sym, base in raw:
+            price = price_map.get(sym)
+            if price is not None and 0.995 <= price <= 1.005:
+                continue   # stablecoin-vs-USDC, skip
+            pairs.append(sym)
+            label_map[sym] = base
+
         return pairs, label_map
+
 
 trader = Trader(CREDENTIALS_FILE)
 
@@ -969,6 +1015,7 @@ def run_stage(fn, symbols, label):
     print()
     return out
 
+
 # ─────────────────────────────────────────────
 #  FFT + VOLUME-RESISTANCE ANALYSIS
 #  (original logic preserved; HT data added to result)
@@ -1206,6 +1253,7 @@ def full_fft_report(pair, current_price):
 
     return stf_results, stf_best, htf_results, htf_best
 
+
 # ─────────────────────────────────────────────
 #  SPIKE SCORE  (for stage tables)
 # ─────────────────────────────────────────────
@@ -1247,6 +1295,7 @@ def spike_score_and_cmo(pair):
     except Exception:
         return 0.0, None, None
 
+
 # ─────────────────────────────────────────────
 #  STAGE TABLE PRINTER
 # ─────────────────────────────────────────────
@@ -1286,6 +1335,7 @@ def print_stage_table(pairs, label_map, stage_label, show_cmo=False):
         print(f'  │  {i:>3}  {lbl:<10}  {pr_s:>13}  {sc:>9.1f}  {cmo_s:>8}  │')
 
     print(sep + '\n')
+
 
 # ─────────────────────────────────────────────
 #  FFT REPORT PRINTER
@@ -3260,104 +3310,10 @@ def print_ml_report(ml_result, label_map):
 
 
 # ─────────────────────────────────────────────
-#  NEW SNIPER LOGIC — Exhaustion + Absorption + Trigger
-#  Added exactly as requested for fast scalping/spike entries
+#  MAIN LOOP
 # ─────────────────────────────────────────────
 
-def detect_stop_hunt(klines_1m, lookback=30):
-    """
-    Detects liquidity grab / stop-hunt (fake breakdown or breakout that snaps back).
-    This is the "Trigger" part of the sniper stack.
-    """
-    if len(klines_1m) < lookback:
-        return False, {}
-    h = np.array([float(k[2]) for k in klines_1m[-lookback:]])
-    l = np.array([float(k[3]) for k in klines_1m[-lookback:]])
-    c = np.array([float(k[4]) for k in klines_1m[-lookback:]])
-    prev_max_h = np.max(h[:-1])
-    prev_min_l = np.min(l[:-1])
-    last_h = h[-1]
-    last_l = l[-1]
-    last_c = c[-1]
-    fake_down = last_l < prev_min_l and last_c > prev_min_l * 1.0015   # broke low → snapped back
-    fake_up   = last_h > prev_max_h and last_c < prev_max_h * 0.9985
-    triggered = fake_down or fake_up
-    return triggered, {
-        'fake_breakdown': fake_down,
-        'fake_breakout':  fake_up,
-        'stop_hunt_level': prev_min_l if fake_down else (prev_max_h if fake_up else None),
-    }
-
-def volume_acceleration(klines_1m, short_window=5, long_window=20):
-    """
-    Volume burst detector (spike fuel).
-    current_volume / avg_volume > 2.0 = strong acceleration.
-    """
-    if len(klines_1m) < long_window:
-        return 0.0, 0.0
-    vols = np.array([float(k[5]) for k in klines_1m[-long_window:]])
-    recent_avg = np.mean(vols[-short_window:])
-    base_avg   = np.mean(vols[:-short_window])
-    if base_avg == 0:
-        return 0.0, 0.0
-    accel_ratio = recent_avg / base_avg
-    roc_pct     = (recent_avg - base_avg) / base_avg * 100.0
-    return accel_ratio, roc_pct
-
-def sniper_confluence_score(pair, sel_detail):
-    """
-    Full sniper confluence (0-100):
-    Exhaustion (from real order flow) +
-    Absorption (from real order flow) +
-    Stop-hunt Trigger +
-    Volume Acceleration +
-    Geometry bonus (your existing φ·e·π score)
-    """
-    d = sel_detail.get(pair, {})
-    if not d:
-        return 0.0, {}
-
-    exh   = d.get('exhaustion_score', 0.0)
-    absb  = d.get('absorption_score', 0.0)
-    delta = d.get('delta_ratio', 0.0)
-    geo   = d.get('geometry_score', 0.0)
-
-    try:
-        klines = trader.client.get_klines(symbol=pair, interval='1m', limit=100)
-    except Exception:
-        return 0.0, {}
-
-    stop_trigger, stop_d = detect_stop_hunt(klines)
-    vol_accel_ratio, vol_roc = volume_acceleration(klines)
-
-    # weighted confluence
-    exh_score   = min(30, max(0, exh * 5)) if exh > 3 else 0
-    abs_score   = min(25, absb * 3) if absb > 4 else 0
-    trigger_sc  = 30 if stop_trigger else 0
-    vol_score   = min(15, (vol_accel_ratio - 1.5) * 10) if vol_accel_ratio > 2.0 else 0
-    geo_bonus   = geo * 0.5
-
-    total = exh_score + abs_score + trigger_sc + vol_score + geo_bonus
-    total = min(100.0, total)
-
-    return total, {
-        'exhaustion': round(exh, 2),
-        'absorption': round(absb, 2),
-        'delta_ratio': round(delta, 4),
-        'stop_hunt': stop_trigger,
-        'stop_hunt_detail': stop_d,
-        'vol_accel_ratio': round(vol_accel_ratio, 2),
-        'vol_roc_pct': round(vol_roc, 1),
-        'geo_bonus': round(geo_bonus, 1),
-        'confluence': round(total, 1),
-    }
-
-
-# ─────────────────────────────────────────────
-#  MAIN LOOP — with full sniper logic added
-# ─────────────────────────────────────────────
-
-print(f'\n  MTF Dip Scanner + FFT Forecast + φ·e·π Time Geometry + SNIPER LOGIC')
+print(f'\n  MTF Dip Scanner + FFT Forecast + φ·e·π Time Geometry')
 print(f'  {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}')
 print(f'  All USDC pairs  |  {MAX_WORKERS} threads  |  retry {LOOP_SLEEP}s')
 print(f'  φ={PHI:.4f}  e={E:.4f}  b={GOLDEN_B:.5f}  φ∠={PHI_ANGLE:.2f}°\n')
@@ -3412,6 +3368,9 @@ while True:
         time.sleep(LOOP_SLEEP); continue
 
     # ── multi-TF argmin confirmation (1m AND 3m AND 5m) ──────
+    #  Passes only if argmin > argmax on ALL three TFs.
+    #  This ensures the most recent price extreme is the LOW
+    #  (not the high) across every short timeframe simultaneously.
     print(f'  Running multi-TF argmin check on {len(fp3)} pairs...')
     fp4, thr_map = run_multi_tf_argmin_stage(fp3)
     print(f'  multi-TF argmin → {len(fp4)} passed (1m∧3m∧5m argmin>argmax)')
@@ -3519,12 +3478,16 @@ while True:
         print(f'  Ranking by: raw CMO (most negative = deepest oversold)')
         print(f'  Secondary:  φ·e·π geometry score (structural quality)')
 
+        # composite rank: normalize CMO (most negative = best) and geo score
         scored = []
         for i, p in enumerate(sel_pairs):
             cmo_v = sel_cmo[i] or 0.0
             geo_v = sel_detail[p].get('geometry_score', 0.0)
+            # lower CMO = better; higher geo = better
+            # composite = -cmo_normalized + geo_normalized
             scored.append((p, cmo_v, geo_v))
 
+        # rank by CMO primarily (most negative), then by geo
         scored.sort(key=lambda x: (x[1], -x[2]))
         best_symbol = scored[0][0]
         best_d      = sel_detail[best_symbol]
@@ -3574,15 +3537,18 @@ while True:
             full_fft_report(best_symbol, current_price)
 
         if stf_results or htf_results:
+            # standard FFT report
             print_fft_report(best_symbol, label_map,
                              stf_results, stf_best,
                              htf_results, htf_best)
 
+            # φ·e·π time geometry report
             run_time_geometry(
                 best_symbol, label_map, current_price, sel_detail,
                 stf_results, htf_results
             )
 
+            # ML compound forecast
             print(f'  Running ML compound forecast on {lbl}...')
             ml_result = ml_compound_forecast(
                 best_symbol, current_price, sel_detail,
@@ -3594,49 +3560,6 @@ while True:
     else:
         print('  Could not fetch current price for FFT.\n')
 
-    # ─────────────────────────────────────────────
-    #  SNIPER ENTRY SIGNAL (scalping / immediate profit trigger)
-    #  Exhaustion + Absorption + Stop-hunt + Volume burst + Geometry
-    # ─────────────────────────────────────────────
-    print(f'  Running SNIPER confluence check on {label_map.get(best_symbol, best_symbol)}...')
-    sniper_score, sniper_d = sniper_confluence_score(best_symbol, sel_detail)
-
-    print(f'\n  {"═"*62}')
-    print(f'  ⚡ SNIPER ENTRY SIGNAL  ·  {label_map.get(best_symbol, best_symbol)}')
-    print(f'  {"═"*62}')
-
-    if sniper_score >= 70.0:
-        print(f'  🔥 STRONG SNIPER LONG TRIGGER  (score {sniper_score:.1f}/100)')
-        print(f'  Entry          : {current_price:.8f}  (NOW — live 1m close)')
-        
-        # Use ML soft stop if available, otherwise tight 0.5% stop
-        stop_price = ml_result.get('soft_stop', current_price * 0.995) if ml_result else current_price * 0.995
-        target_quick = current_price * 1.018   # quick 1.8% spike target
-        if ml_result and ml_result.get('tier_stf'):
-            target_quick = max(target_quick, ml_result['tier_stf'])
-
-        risk_pct = (current_price - stop_price) / current_price * 100
-        reward_pct = (target_quick - current_price) / current_price * 100
-        rr = reward_pct / risk_pct if risk_pct > 0 else 0
-
-        print(f'  Tight Stop     : {stop_price:.8f}  (-{risk_pct:.2f}%)')
-        print(f'  Quick Target   : {target_quick:.8f}  (+{reward_pct:.2f}%)')
-        print(f'  R:R            : 1:{rr:.1f}   ← ideal for immediate spike')
-        print(f'  Hold time      : 5–30 minutes (scalping capture)')
-        print(f'  Reason         : Exhaustion + Absorption + Stop-hunt + Vol burst + Geometry')
-        print(f'  Confidence     : HIGH — enter immediately')
-    else:
-        print(f'  Confluence score: {sniper_score:.1f}/100  → waiting for stronger trigger (need ≥70)')
-
-    print(f'  Breakdown:')
-    print(f'    Exhaustion    : {sniper_d["exhaustion"]}')
-    print(f'    Absorption    : {sniper_d["absorption"]}')
-    print(f'    Delta ratio   : {sniper_d["delta_ratio"]}')
-    print(f'    Stop-hunt     : {"✔ TRIGGER" if sniper_d["stop_hunt"] else "— no"}')
-    print(f'    Vol accel     : {sniper_d["vol_accel_ratio"]}x  ({sniper_d["vol_roc_pct"]:+.1f}%)')
-    print(f'    Geo bonus     : {sniper_d["geo_bonus"]}')
-    print(f'  {"═"*62}\n')
-
     del fp1, fp1b, fp2, fp3, fp4, thr_map, sel_pairs, sel_cmo, sel_detail
     gc.collect()
-    time.sleep(LOOP_SLEEP)
+    sys.exit(0)
