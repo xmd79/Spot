@@ -103,31 +103,77 @@ FIB_RATIOS = [
 ]
 
 # ─────────────────────────────────────────────
-#  CLIENT
+#  CLIENT - ONLY USDC SPOT TRADING PAIRS (FIXED)
 # ─────────────────────────────────────────────
 class Trader:
     def __init__(self, file):
         lines = [l.rstrip('\n') for l in open(file)]
         self.client = Client(lines[0], lines[1])
 
+    # ── Binance product/yield base assets that are NOT real spot coins ──────────
+    # These tokens appear as TRADING on exchange info but are Binance-internal
+    # yield, collateral, or pegged products with no conventional spot klines.
+    _EXCLUDED_BASES = {
+        'BFUSD', 'FDUSD', 'TUSD', 'USDP', 'USDS', 'DAI', 'FRAX',
+        'LUSD', 'USTC', 'EURS', 'EURT', 'AEUR',
+        'BBTC', 'BETH', 'BBNB', 'LDBNB', 'WBETH',
+        'LDETH', 'LDBTC', 'LDUSDT', 'LDBUSD',
+    }
+
     def get_usdc_pairs(self):
         """
-        Returns:
-          pairs      — list of raw Binance symbols e.g. ['1000BONKUSDC', 'BTCUSDC']
-          label_map  — {symbol: official_base_asset_ticker}
-                       Uses Binance's own baseAsset field — always the official
-                       coin abbreviation regardless of numeric prefix.
+        Returns only genuine USDC spot trading pairs.
+        A symbol must pass ALL gates to be included:
+
+          Gate 1  quoteAsset == USDC
+          Gate 2  status == TRADING
+          Gate 3  isSpotTradingAllowed explicitly True (default False)
+          Gate 4  SPOT in permissions / permissionSets
+          Gate 5  baseAsset NOT in _EXCLUDED_BASES (blocks BFUSD, BBTC, BETH…)
+          Gate 6  live ticker price NOT within 0.5% of $1.00
+                  (catches any stablecoin-vs-USDC pair not in the static list)
         """
-        info      = self.client.get_exchange_info()
+        info  = self.client.get_exchange_info()
+        raw   = []
+
+        for s in info['symbols']:
+            if s['quoteAsset'] != 'USDC':                      continue
+            if s['status']     != 'TRADING':                   continue
+            if s['symbol'].endswith('USD'):                    continue
+            if not s.get('isSpotTradingAllowed', False):       continue
+
+            perms     = s.get('permissions', [])
+            perm_sets = s.get('permissionSets', [])
+            flat_sets = [p for sub in perm_sets for p in sub]
+            if 'SPOT' not in perms and 'SPOT' not in flat_sets:
+                continue
+
+            base = s['baseAsset']
+            if base in self._EXCLUDED_BASES:                   continue
+
+            raw.append((s['symbol'], base))
+
+        if not raw:
+            return [], {}
+
+        # Gate 6: live price sanity — skip anything pegged near $1.00
+        try:
+            tickers   = self.client.get_all_tickers()
+            price_map = {t['symbol']: float(t['price']) for t in tickers}
+        except Exception:
+            price_map = {}
+
         pairs     = []
         label_map = {}
-        for s in info['symbols']:
-            if s['quoteAsset'] == 'USDC' and s['status'] == 'TRADING':
-                sym  = s['symbol']
-                base = s['baseAsset']
-                pairs.append(sym)
-                label_map[sym] = base
+        for sym, base in raw:
+            price = price_map.get(sym)
+            if price is not None and 0.995 <= price <= 1.005:
+                continue   # stablecoin-vs-USDC, skip
+            pairs.append(sym)
+            label_map[sym] = base
+
         return pairs, label_map
+
 
 trader = Trader(CREDENTIALS_FILE)
 
@@ -969,6 +1015,7 @@ def run_stage(fn, symbols, label):
     print()
     return out
 
+
 # ─────────────────────────────────────────────
 #  FFT + VOLUME-RESISTANCE ANALYSIS
 #  (original logic preserved; HT data added to result)
@@ -1206,6 +1253,7 @@ def full_fft_report(pair, current_price):
 
     return stf_results, stf_best, htf_results, htf_best
 
+
 # ─────────────────────────────────────────────
 #  SPIKE SCORE  (for stage tables)
 # ─────────────────────────────────────────────
@@ -1247,6 +1295,7 @@ def spike_score_and_cmo(pair):
     except Exception:
         return 0.0, None, None
 
+
 # ─────────────────────────────────────────────
 #  STAGE TABLE PRINTER
 # ─────────────────────────────────────────────
@@ -1286,6 +1335,7 @@ def print_stage_table(pairs, label_map, stage_label, show_cmo=False):
         print(f'  │  {i:>3}  {lbl:<10}  {pr_s:>13}  {sc:>9.1f}  {cmo_s:>8}  │')
 
     print(sep + '\n')
+
 
 # ─────────────────────────────────────────────
 #  FFT REPORT PRINTER
