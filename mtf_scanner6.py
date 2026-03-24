@@ -190,6 +190,96 @@ def filter3(pair, out, lock):
 
 
 # ─────────────────────────────────────────────
+#  REAL ORDER-FLOW + ABSORPTION + EXHAUSTION
+#  (NEW — added exactly as requested)
+# ─────────────────────────────────────────────
+
+def get_real_volume_flow(trader, pair, limit=1000):
+    """
+    Returns:
+        buy_vol, sell_vol,
+        delta, delta_ratio,
+        absorption_score,
+        exhaustion_score
+    """
+    try:
+        trades = trader.client.get_aggregate_trades(symbol=pair, limit=limit)
+    except Exception:
+        return None
+
+    if not trades:
+        return None
+
+    buy_vol = 0.0
+    sell_vol = 0.0
+
+    prices = []
+    qtys   = []
+
+    for t in trades:
+        qty = float(t['q'])
+        price = float(t['p'])
+
+        prices.append(price)
+        qtys.append(qty)
+
+        if t['m']:   # seller aggressor
+            sell_vol += qty
+        else:        # buyer aggressor
+            buy_vol += qty
+
+    total = buy_vol + sell_vol
+    if total == 0:
+        return None
+
+    delta = buy_vol - sell_vol
+    delta_ratio = delta / total
+
+    # ─────────────────────────────────────────────
+    # 🟡 ABSORPTION DETECTION
+    # high volume, low price movement
+    # ─────────────────────────────────────────────
+    price_range = max(prices) - min(prices) + 1e-12
+    total_volume = sum(qtys)
+
+    absorption_score = total_volume / price_range
+    # normalize (log scale safer)
+    absorption_score = np.log1p(absorption_score)
+
+    # ─────────────────────────────────────────────
+    # 🔴 EXHAUSTION DETECTION
+    # volume spike + weak continuation
+    # ─────────────────────────────────────────────
+    prices_arr = np.array(prices)
+    qtys_arr   = np.array(qtys)
+
+    # split into early vs late trades
+    mid = len(prices_arr) // 2
+
+    early_move = abs(prices_arr[mid] - prices_arr[0]) + 1e-12
+    late_move  = abs(prices_arr[-1] - prices_arr[mid]) + 1e-12
+
+    early_vol = np.sum(qtys_arr[:mid]) + 1e-12
+    late_vol  = np.sum(qtys_arr[mid:]) + 1e-12
+
+    # exhaustion: volume increases but move decreases
+    vol_ratio  = late_vol / early_vol
+    move_ratio = late_move / early_move
+
+    exhaustion_score = vol_ratio / (move_ratio + 1e-12)
+    exhaustion_score = np.log1p(exhaustion_score)
+
+    return {
+        'buy_vol': buy_vol,
+        'sell_vol': sell_vol,
+        'delta': delta,
+        'delta_ratio': delta_ratio,
+        'absorption': absorption_score,
+        'exhaustion': exhaustion_score
+    }
+
+
+# ─────────────────────────────────────────────
 #  1m DIP CONFIRMATION
 #  Two conditions must BOTH be true:
 #
@@ -222,6 +312,7 @@ def check_dip_conditions(pair):
       high_arr         — numpy array of highs
       swing_low        — min of low_arr
       swing_high       — max of high_arr
+      NEW: delta_ratio, absorption_score, exhaustion_score
     """
     try:
         klines = trader.client.get_klines(
@@ -238,15 +329,45 @@ def check_dip_conditions(pair):
     high_ = np.array([float(k[2]) for k in klines], dtype=np.float64)
     vol   = np.array([float(k[5]) for k in klines], dtype=np.float64)
 
-    # ── condition 1: bull volume dominant ───────────────────
-    bull_mask  = close >= open_
-    bull_vol   = float(vol[bull_mask].sum())
-    total_vol  = float(vol.sum())
-    if total_vol == 0:
-        return False, {}
-    bull_ratio = bull_vol / total_vol
-    bear_ratio = 1.0 - bull_ratio
-    cond_vol   = bull_ratio > 0.5
+    # ─────────────────────────────────────────────
+    # ✅ REAL ORDER FLOW + ABSORPTION + EXHAUSTION
+    # (Binance aggTrades → true buyer/seller aggressor volume)
+    # ─────────────────────────────────────────────
+    flow = get_real_volume_flow(trader, pair)
+
+    if flow:
+        buy_vol  = flow['buy_vol']
+        sell_vol = flow['sell_vol']
+        total_vol_real = buy_vol + sell_vol
+
+        bull_ratio = buy_vol / total_vol_real
+        bear_ratio = sell_vol / total_vol_real
+
+        # 🔥 enhanced condition (real buyer pressure OR absorption OR strong delta)
+        cond_vol = (
+            bull_ratio > 0.5
+            or flow['absorption'] > 5.0   # strong absorption
+            or flow['delta_ratio'] > 0.1  # real buyer pressure
+        )
+
+        absorption_score = flow['absorption']
+        exhaustion_score = flow['exhaustion']
+        delta_ratio      = flow['delta_ratio']
+
+    else:
+        # fallback to old method if API fails
+        bull_mask  = close >= open_
+        bull_vol   = float(vol[bull_mask].sum())
+        total_vol  = float(vol.sum())
+        if total_vol == 0:
+            return False, {}
+        bull_ratio = bull_vol / total_vol
+        bear_ratio = 1.0 - bull_ratio
+        cond_vol   = bull_ratio > 0.5
+
+        absorption_score = 0.0
+        exhaustion_score = 0.0
+        delta_ratio      = 0.0
 
     # ── condition 2: most recent extreme is the minima ──────
     # Use actual wick arrays across ALL 500 bars:
@@ -283,6 +404,10 @@ def check_dip_conditions(pair):
         'high_arr':        high_,
         'swing_low':       float(np.min(low_)),
         'swing_high':      float(np.max(high_)),
+        # NEW real-order-flow fields
+        'delta_ratio':      round(delta_ratio, 4),
+        'absorption_score': round(absorption_score, 4),
+        'exhaustion_score': round(exhaustion_score, 4),
     }
     passed = cond_vol and cond_ext
     return passed, detail
@@ -638,7 +763,7 @@ def _phi_e_pi_dip_score(close_arr, current_price):
         # Use TA-Lib LINEARREG for the midline (consistent with _channel_pass).
         # σ = std of residuals (channel width).
         # Z = (lower_band − price) / σ  → how many σ's below the floor.
-        # p_value = norm.cdf(Z) → statistical rarity of this dip.
+        # p_value = norm.cdf(z) where z > 0 means left tail
         period   = min(500, n)
         midline  = ta.LINEARREG(arr, timeperiod=period)
         valid_ml = ~np.isnan(midline)
