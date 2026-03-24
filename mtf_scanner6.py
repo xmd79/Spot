@@ -1792,212 +1792,324 @@ def build_feature_matrix(close, volume, high, low,
 # ── volume S/R anchored to argmin / argmax extrema ───────
 
 def compute_volume_sr(close, volume, high, low, open_,
-                      current_price, bin_pct=0.003):
+                      current_price, pair=None, lookback=100, bin_pct=0.003):
     """
-    Dynamic full-range volume S/R — NO predefined zones.
+    Real Volume S/R — unconstrained scan over last `lookback` 1m bars.
 
-    Scans ALL bars across the full price range.  After collecting every
-    bullish / bearish volume bin the top clusters are ranked purely by
-    volume significance, then each cluster is labelled with the threshold
-    zone it naturally falls into.  The bot finds the real levels; the
-    zone labels tell you WHERE they landed, not WHERE to look.
+    ── WHAT THIS FINDS ─────────────────────────────────────────────────
+    The most significant, most consistent, and growing bullish/bearish
+    volume clusters — located ANYWHERE in the full price range.
+    No "below entry only" / "above entry only" restriction.
 
-    ── SUPPORT thresholds (3 zones, below current_price) ──────────────
-      Anchored at argmin (absolute lowest wick).
-        min-threshold  : price ≤ absolute_min                (AT / BELOW argmin)
-        mid-threshold  : absolute_min < price ≤ mid_sup      (MID zone)
-        max-threshold  : mid_sup      < price <  cp          (NEAR ENTRY)
-      where  mid_sup = (absolute_min + cp) / 2
+    ── THREE SCORING DIMENSIONS ────────────────────────────────────────
+    For every price bin we compute three metrics and combine them:
 
-    ── RESISTANCE thresholds (3 zones, above current_price) ───────────
-      Anchored at argmax (absolute highest wick).
-        min-threshold  : cp           < price ≤ mid_res      (NEAR ENTRY)
-        mid-threshold  : mid_res      < price ≤ absolute_max (MID zone)
-        max-threshold  : price        > absolute_max         (AT / ABOVE argmax)
-      where  mid_res = (cp + absolute_max) / 2
+      1. RAW VOLUME  — total bull or bear volume accumulated in that bin.
+         Identifies where the most capital changed hands.
 
-    ── Scanning ────────────────────────────────────────────────────────
-      Support:    ALL bullish bars (close ≥ open) whose close < cp.
-                  Binned by close price (where buyers committed capital).
-      Resistance: ALL bearish bars (close < open) whose close > cp.
-                  Binned by close price (where sellers committed capital).
-      No wick filter.  No zone filter during collection.
-      Strongest N clusters by total volume are returned.
+      2. CONSISTENCY — how many of the last `lookback` bars touched that
+         bin.  Bins hit repeatedly are structurally significant levels.
+         consistency = n_bars_in_bin / total_bars  (0→1)
 
-    ── SR Range ────────────────────────────────────────────────────────
-      For each peak-vol bin walk outward collecting contiguous bins until
-      ≥ 70% of total volume is captured.
-        sr_floor   = bottom edge of that cluster
-        sr_ceiling = top    edge of that cluster
-        range_pct  = (sr_ceiling − sr_floor) / level × 100
+      3. MOMENTUM (vol growth) — split the window in half.
+         vol_growth = vol_second_half / (vol_first_half + ε) − 1
+         >0 = volume is increasing at that price → area building.
+         <0 = volume fading → level weakening.
 
-    Returns:
-      (support_levels, resistance_levels)
-      Each entry:
-        (level_price, vol, n_bars, sr_floor, sr_ceiling, range_pct, zone_label)
-      Sorted by vol descending.  Always non-empty if price data exists.
+      composite_score = raw_vol × (1 + consistency) × max(1, 1 + vol_growth)
+
+    The top-3 bins by composite_score are the real S/R levels.
+    No predefined zone filter.  Zone label is ADDED AFTER ranking.
+
+    ── ORDERBOOK WALLS ─────────────────────────────────────────────────
+    If `pair` is provided, fetches live orderbook (depth=50).
+    Finds the largest bid wall (support) and ask wall (resistance).
+    These are reported alongside OHLCV levels but do NOT override them.
+
+    ── VOLUME PROFILE (full window) ────────────────────────────────────
+    Total volume (all bars, typical price (H+L+C)/3):
+      POC = Point of Control — bin with most total volume
+      VAH / VAL = Value Area High/Low (70% of volume around POC)
+
+    ── MARKET PROFILE (TPO) ────────────────────────────────────────────
+    Bar count per typical-price bin:
+      mPOC / mVAH / mVAL = most time spent / 70% time cluster
+
+    ── BIAS (full window) ──────────────────────────────────────────────
+    bull_pct vs bear_pct from ALL bars in window.
+    predominance = 'BULLISH' (≥55% bull) | 'BEARISH' (≥55% bear) | 'NEUTRAL'
+
+    ── RETURNS ─────────────────────────────────────────────────────────
+    (support_levels, resistance_levels, profile)
+
+    Each level tuple (9 fields):
+      [0] price          — bin center price
+      [1] raw_vol        — total side volume at bin
+      [2] n_bars         — bar count at bin (consistency)
+      [3] sr_floor       — bottom edge of 70%-vol cluster
+      [4] sr_ceiling     — top    edge of 70%-vol cluster
+      [5] range_pct      — (ceiling-floor)/price × 100
+      [6] zone_label     — where it landed vs argmin/argmax/entry
+      [7] dist_pct       — signed % distance from current_price
+      [8] vol_pct        — % of that side's total volume
+      [9] composite      — composite score (vol × consistency × growth)
+      [10] vol_growth    — volume growth ratio (recent half vs older half)
+      [11] consistency   — n_bars / total_bars
+
+    profile dict keys:
+      vol_poc, vol_vah, vol_val, mkt_poc, mkt_vah, mkt_val,
+      bull_vol, bear_vol, total_vol, bull_pct, bear_pct, predominance,
+      vol_bins [(price,vol)…], mkt_bins [(price,count)…],
+      absolute_min, absolute_max,
+      ob_bid_wall  — (price, qty) largest bid wall or None
+      ob_ask_wall  — (price, qty) largest ask wall or None
     """
     close  = np.asarray(close,  dtype=np.float64)
     volume = np.asarray(volume, dtype=np.float64)
     high_  = np.asarray(high,   dtype=np.float64)
     low_   = np.asarray(low,    dtype=np.float64)
     open__ = np.asarray(open_,  dtype=np.float64)
-    n      = len(close)
+    n_full = len(close)
 
-    if n < 5:
-        return [], []
+    if n_full < 5:
+        return [], [], {}
+
+    # ── use last `lookback` bars for S/R scoring ──────────────
+    lb     = min(lookback, n_full)
+    half   = lb // 2
+    c      = close[-lb:];   v  = volume[-lb:]
+    h      = high_[-lb:];   lo = low_[-lb:]
+    op     = open__[-lb:]
+    n      = lb
+
+    # ── full window for bias + profile ────────────────────────
+    c_full = close;  v_full = volume
+    h_full = high_;  l_full = low_
+    o_full = open__
 
     cp           = float(current_price)
-    argmin_bar   = int(np.argmin(low_))
-    argmax_bar   = int(np.argmax(high_))
-    absolute_min = float(low_[argmin_bar])
-    absolute_max = float(high_[argmax_bar])
+    absolute_min = float(np.min(low_))
+    absolute_max = float(np.max(high_))
 
-    # ── threshold boundaries ──────────────────────────────────
-    mid_sup = (absolute_min + cp)           / 2.0   # support midpoint
-    mid_res = (cp           + absolute_max) / 2.0   # resistance midpoint
+    full_range = absolute_max - absolute_min + 1e-20
+    bs = max(full_range * bin_pct, 1e-12)
 
-    bs_sup = max(absolute_min * bin_pct, 1e-12)
-    bs_res = max(absolute_max * bin_pct, 1e-12)
+    def _bin(price):
+        return round(round(price / bs) * bs, 10)
 
-    # ── support zone classifier ───────────────────────────────
-    def _sup_zone(price):
-        if price <= absolute_min:
-            return f'min  (≤ argmin {absolute_min:.6g})'
-        elif price <= mid_sup:
-            return f'mid  ({absolute_min:.6g} – {mid_sup:.6g})'
-        else:
-            return f'max  ({mid_sup:.6g} – entry)'
+    argmin_bin = _bin(absolute_min)
+    argmax_bin = _bin(absolute_max)
+    entry_bin  = _bin(cp)
 
-    # ── resistance zone classifier ────────────────────────────
-    def _res_zone(price):
-        if price <= mid_res:
-            return f'min  (entry – {mid_res:.6g})'
-        elif price <= absolute_max:
-            return f'mid  ({mid_res:.6g} – {absolute_max:.6g})'
-        else:
-            return f'max  (≥ argmax {absolute_max:.6g})'
+    # ── zone classifiers (no restriction — pure labelling) ────
+    def _zone(price):
+        b = _bin(price)
+        if   b <  argmin_bin: pos = f'BELOW_argmin(<{absolute_min:.5g})'
+        elif b == argmin_bin: pos = f'AT_argmin(={absolute_min:.5g})'
+        elif b <  entry_bin:  pos = f'between_argmin_entry'
+        elif b == entry_bin:  pos = f'AT_entry(≈{cp:.5g})'
+        elif b <  argmax_bin: pos = f'between_entry_argmax'
+        elif b == argmax_bin: pos = f'AT_argmax(={absolute_max:.5g})'
+        else:                 pos = f'ABOVE_argmax(>{absolute_max:.5g})'
+        return pos
 
-    # ── full-range support scan ───────────────────────────────
-    # ALL bullish bars (close >= open) with close strictly below cp
-    sup_bins = {}; sup_cnt = {}
+    # ── scan lookback window — bull and bear bins ─────────────
+    # first half and second half for growth detection
+    bull_h1 = {}; bull_h2 = {}; bull_cnt = {}
+    bear_h1 = {}; bear_h2 = {}; bear_cnt = {}
+
     for i in range(n):
-        cl = float(close[i]); op = float(open__[i])
-        if cl >= cp:
-            continue
-        if cl < op:           # bearish bar — skip
-            continue
-        v = float(volume[i])
-        b = round(cl / bs_sup) * bs_sup
-        sup_bins[b] = sup_bins.get(b, 0.0) + v
-        sup_cnt[b]  = sup_cnt.get(b, 0)   + 1
+        cl_i = float(c[i]); op_i = float(op[i]); v_i = float(v[i])
+        cb   = _bin(cl_i)
+        is_bull = cl_i >= op_i
+        in_h2   = i >= half
+        if is_bull:
+            bull_cnt[cb]  = bull_cnt.get(cb, 0) + 1
+            if in_h2:  bull_h2[cb] = bull_h2.get(cb, 0.0) + v_i
+            else:      bull_h1[cb] = bull_h1.get(cb, 0.0) + v_i
+        else:
+            bear_cnt[cb]  = bear_cnt.get(cb, 0) + 1
+            if in_h2:  bear_h2[cb] = bear_h2.get(cb, 0.0) + v_i
+            else:      bear_h1[cb] = bear_h1.get(cb, 0.0) + v_i
 
-    # ── full-range resistance scan ────────────────────────────
-    # ALL bearish bars (close < open) with close strictly above cp
-    res_bins = {}; res_cnt = {}
-    for i in range(n):
-        cl = float(close[i]); op = float(open__[i])
-        if cl <= cp:
-            continue
-        if cl >= op:          # bullish bar — skip
-            continue
-        v = float(volume[i])
-        b = round(cl / bs_res) * bs_res
-        res_bins[b] = res_bins.get(b, 0.0) + v
-        res_cnt[b]  = res_cnt.get(b, 0)   + 1
+    # merge into total bins
+    all_bins_b = set(bull_h1) | set(bull_h2)
+    all_bins_r = set(bear_h1) | set(bear_h2)
+    bull_bins  = {b: bull_h1.get(b, 0.0) + bull_h2.get(b, 0.0) for b in all_bins_b}
+    bear_bins  = {b: bear_h1.get(b, 0.0) + bear_h2.get(b, 0.0) for b in all_bins_r}
 
-    # ── convert bins → ranked level tuples ───────────────────
-    def _bins_to_levels(bins, count, bs, zone_fn, strongest_n=3):
-        """
-        Rank bins by volume, build SR cluster range for each top bin,
-        classify into threshold zone.
+    total_bull_lb = sum(bull_bins.values()) + 1e-20
+    total_bear_lb = sum(bear_bins.values()) + 1e-20
 
-        Returns list of:
-          (level_price, vol, n_bars, sr_floor, sr_ceiling, range_pct, zone_label)
-        """
-        if not bins:
-            return []
-        top        = sorted(bins.items(), key=lambda x: x[1], reverse=True)[:strongest_n]
-        all_prices = sorted(bins.keys())
-        total_vol  = sum(bins.values())
-        levels     = []
+    # ── full-window bias + profile ────────────────────────────
+    vol_bins_fp = {}; mkt_bins_fp = {}
+    total_bull_fw = 0.0; total_bear_fw = 0.0
 
-        for peak_price, peak_vol in top:
-            n_bars = count.get(peak_price, count.get(round(peak_price / bs) * bs, 0))
+    for i in range(n_full):
+        cl_i = float(c_full[i]); op_i = float(o_full[i]); v_i = float(v_full[i])
+        tp_i = (float(h_full[i]) + float(l_full[i]) + cl_i) / 3.0
+        tb   = _bin(tp_i)
+        vol_bins_fp[tb] = vol_bins_fp.get(tb, 0.0) + v_i
+        mkt_bins_fp[tb] = mkt_bins_fp.get(tb, 0)   + 1
+        if cl_i >= op_i: total_bull_fw += v_i
+        else:            total_bear_fw += v_i
 
+    total_vol_fw = total_bull_fw + total_bear_fw + 1e-20
+    bull_pct_fw  = total_bull_fw / total_vol_fw * 100.0
+    bear_pct_fw  = total_bear_fw / total_vol_fw * 100.0
+    if   bull_pct_fw >= 55.0: predominance = 'BULLISH'
+    elif bear_pct_fw >= 55.0: predominance = 'BEARISH'
+    else:                      predominance = 'NEUTRAL'
+
+    # ── POC / VAH / VAL ───────────────────────────────────────
+    def _poc_va(bins):
+        if not bins: return None, None, None
+        poc  = max(bins, key=bins.get)
+        tv   = sum(bins.values()); tgt = tv * 0.70
+        cl   = {poc: bins[poc]}; cv = bins[poc]
+        ap   = sorted(bins.keys())
+        if poc not in ap: return round(poc,8), round(poc,8), round(poc,8)
+        li = ap.index(poc); hi = li
+        while cv < tgt:
+            cl_ = li > 0; ch = hi < len(ap)-1
+            if not cl_ and not ch: break
+            lv = bins.get(ap[li-1], 0.0) if cl_ else 0.0
+            hv = bins.get(ap[hi+1], 0.0) if ch  else 0.0
+            if lv >= hv and cl_:
+                li -= 1; cv += lv; cl[ap[li]] = lv
+            elif ch:
+                hi += 1; cv += hv; cl[ap[hi]] = hv
+            else: break
+        return (round(poc,8),
+                round(max(cl.keys())+bs*0.5, 8),
+                round(min(cl.keys())-bs*0.5, 8))
+
+    vol_poc, vol_vah, vol_val = _poc_va(vol_bins_fp)
+    mkt_poc, mkt_vah, mkt_val = _poc_va(mkt_bins_fp)
+
+    # ── composite scoring + level building ───────────────────
+    def _build_levels(bins, cnt, h1, h2, side_total, strongest_n=3):
+        if not bins: return []
+        all_p  = sorted(bins.keys())
+        all_vol = sum(bins.values())
+
+        scored = []
+        for price, raw_vol in bins.items():
+            n_bars      = cnt.get(price, 0)
+            consistency = n_bars / n
+            v1 = h1.get(price, 0.0); v2 = h2.get(price, 0.0)
+            vol_growth  = (v2 / (v1 + 1e-20)) - 1.0   # >0 = growing
+            composite   = raw_vol * (1.0 + consistency) * max(1.0, 1.0 + vol_growth)
+            scored.append((price, raw_vol, n_bars, consistency, vol_growth, composite))
+
+        # rank by composite score descending
+        scored.sort(key=lambda x: x[5], reverse=True)
+        top = scored[:strongest_n]
+
+        levels = []
+        for price, raw_vol, n_bars, consistency, vol_growth, composite in top:
+            vol_pct  = round(raw_vol / (side_total + 1e-20) * 100.0, 1)
+            dist_pct = round((price - cp) / (cp + 1e-20) * 100.0, 3)
+
+            # SR cluster range: walk outward from peak until 70% of side vol
             if len(bins) == 1:
-                sr_floor   = round(peak_price - bs * 0.5, 8)
-                sr_ceiling = round(peak_price + bs * 0.5, 8)
+                sr_fl = round(price - bs*0.5, 8); sr_ce = round(price + bs*0.5, 8)
             else:
-                # walk outward from peak bin collecting adjacent bins
-                # until ≥ 70% of total volume is inside the cluster
-                target  = total_vol * 0.70
-                cluster = {peak_price: peak_vol}
-                c_vol   = peak_vol
-                idx     = all_prices.index(peak_price) if peak_price in all_prices else 0
-                lo_idx  = idx
-                hi_idx  = idx
+                tgt = all_vol * 0.70
+                cl  = {price: raw_vol}; cv = raw_vol
+                idx = all_p.index(price) if price in all_p else 0
+                li = idx; hi = idx
+                while cv < tgt:
+                    can_l = li > 0; can_h = hi < len(all_p)-1
+                    if not can_l and not can_h: break
+                    lv = bins.get(all_p[li-1],0.0) if can_l else 0.0
+                    hv = bins.get(all_p[hi+1],0.0) if can_h else 0.0
+                    if lv >= hv and can_l:
+                        li -= 1; cv += lv; cl[all_p[li]] = lv
+                    elif can_h:
+                        hi += 1; cv += hv; cl[all_p[hi]] = hv
+                    else: break
+                sr_fl = round(min(cl.keys())-bs*0.5, 8)
+                sr_ce = round(max(cl.keys())+bs*0.5, 8)
 
-                while c_vol < target:
-                    expand_lo = lo_idx > 0
-                    expand_hi = hi_idx < len(all_prices) - 1
-                    if not expand_lo and not expand_hi:
-                        break
-                    lo_vol = bins.get(all_prices[lo_idx - 1], 0.0) if expand_lo else 0.0
-                    hi_vol = bins.get(all_prices[hi_idx + 1], 0.0) if expand_hi else 0.0
-                    if lo_vol >= hi_vol and expand_lo:
-                        lo_idx -= 1
-                        c_vol  += lo_vol
-                        cluster[all_prices[lo_idx]] = lo_vol
-                    elif expand_hi:
-                        hi_idx += 1
-                        c_vol  += hi_vol
-                        cluster[all_prices[hi_idx]] = hi_vol
-                    else:
-                        break
-
-                sr_floor   = round(min(cluster.keys()) - bs * 0.5, 8)
-                sr_ceiling = round(max(cluster.keys()) + bs * 0.5, 8)
-
-            range_pct  = round((sr_ceiling - sr_floor) / (peak_price + 1e-20) * 100.0, 3)
-            zone_label = zone_fn(peak_price)
+            range_pct = round((sr_ce - sr_fl) / (price + 1e-20) * 100.0, 3)
             levels.append((
-                round(peak_price, 8),
-                round(peak_vol,   2),
-                n_bars,
-                sr_floor,
-                sr_ceiling,
-                range_pct,
-                zone_label,
+                round(price,      8),   # [0] price
+                round(raw_vol,    2),   # [1] raw vol
+                n_bars,                 # [2] bar count
+                sr_fl,                  # [3] sr_floor
+                sr_ce,                  # [4] sr_ceiling
+                range_pct,              # [5] range %
+                _zone(price),           # [6] zone label
+                dist_pct,               # [7] dist % from entry
+                vol_pct,                # [8] % of side total
+                round(composite, 2),    # [9] composite score
+                round(vol_growth, 4),   # [10] volume growth
+                round(consistency, 4),  # [11] consistency
             ))
         return levels
 
-    support_levels    = _bins_to_levels(sup_bins, sup_cnt, bs_sup, _sup_zone)
-    resistance_levels = _bins_to_levels(res_bins, res_cnt, bs_res, _res_zone)
+    support_levels    = _build_levels(bull_bins, bull_cnt, bull_h1, bull_h2, total_bull_lb)
+    resistance_levels = _build_levels(bear_bins, bear_cnt, bear_h1, bear_h2, total_bear_lb)
 
-    # ── guaranteed fallback: use extrema price if scan found nothing ──
+    # ── guaranteed fallback ───────────────────────────────────
     if not support_levels:
-        support_levels = [(
-            round(absolute_min, 8), 0.0, 0,
-            round(absolute_min - bs_sup * 0.5, 8),
-            round(absolute_min + bs_sup * 0.5, 8),
-            round(bs_sup / (absolute_min + 1e-20) * 100.0, 3),
-            _sup_zone(absolute_min),
-        )]
+        support_levels = [(round(absolute_min,8),0.0,0,
+            round(absolute_min-bs*0.5,8), round(absolute_min+bs*0.5,8),
+            round(bs/(absolute_min+1e-20)*100,3), _zone(absolute_min),
+            round((absolute_min-cp)/(cp+1e-20)*100,3), 0.0, 0.0, 0.0, 0.0)]
     if not resistance_levels:
-        resistance_levels = [(
-            round(absolute_max, 8), 0.0, 0,
-            round(absolute_max - bs_res * 0.5, 8),
-            round(absolute_max + bs_res * 0.5, 8),
-            round(bs_res / (absolute_max + 1e-20) * 100.0, 3),
-            _res_zone(absolute_max),
-        )]
+        resistance_levels = [(round(absolute_max,8),0.0,0,
+            round(absolute_max-bs*0.5,8), round(absolute_max+bs*0.5,8),
+            round(bs/(absolute_max+1e-20)*100,3), _zone(absolute_max),
+            round((absolute_max-cp)/(cp+1e-20)*100,3), 0.0, 0.0, 0.0, 0.0)]
 
-    # enforce price-side correctness
-    support_levels    = [s for s in support_levels    if s[0] < cp] or support_levels
-    resistance_levels = [r for r in resistance_levels if r[0] > cp] or resistance_levels
+    # ── orderbook walls ───────────────────────────────────────
+    ob_bid_wall = None; ob_ask_wall = None
+    if pair:
+        try:
+            ob = trader.client.get_order_book(symbol=pair, limit=50)
+            # bids: [[price, qty], …] — largest single qty = wall
+            bids = [(float(b[0]), float(b[1])) for b in ob.get('bids', [])]
+            asks = [(float(a[0]), float(a[1])) for a in ob.get('asks', [])]
+            if bids:
+                ob_bid_wall = max(bids, key=lambda x: x[1])
+            if asks:
+                ob_ask_wall = max(asks, key=lambda x: x[1])
+        except Exception:
+            pass
 
-    return support_levels, resistance_levels
+    profile = {
+        # volume profile
+        'vol_poc':      vol_poc,
+        'vol_vah':      vol_vah,
+        'vol_val':      vol_val,
+        # market profile
+        'mkt_poc':      mkt_poc,
+        'mkt_vah':      mkt_vah,
+        'mkt_val':      mkt_val,
+        # bias (full window)
+        'bull_vol':     round(total_bull_fw, 2),
+        'bear_vol':     round(total_bear_fw, 2),
+        'total_vol':    round(total_vol_fw,  2),
+        'bull_pct':     round(bull_pct_fw,   2),
+        'bear_pct':     round(bear_pct_fw,   2),
+        'predominance': predominance,
+        # charts
+        'vol_bins':     sorted(vol_bins_fp.items()),
+        'mkt_bins':     sorted(mkt_bins_fp.items()),
+        # range info
+        'absolute_min': absolute_min,
+        'absolute_max': absolute_max,
+        # orderbook
+        'ob_bid_wall':  ob_bid_wall,
+        'ob_ask_wall':  ob_ask_wall,
+        # scan window
+        'lookback':     lb,
+    }
+
+    return support_levels, resistance_levels, profile
+
 
 
 # ── random walk Monte Carlo ───────────────────────────────
@@ -2315,10 +2427,9 @@ def ml_compound_forecast(pair, current_price, sel_detail,
     # Anchored to true argmin/argmax extrema of the 500-bar window.
     # Support  = peak BULLISH volume in the lowest-low zone.
     # Resistance = peak BEARISH volume in the highest-high zone.
-    sup_levels, res_levels = compute_volume_sr(
-        close[-ML_LOOKBACK:], volume[-ML_LOOKBACK:],
-        high[-ML_LOOKBACK:],  low[-ML_LOOKBACK:],
-        open_[-ML_LOOKBACK:], current_price
+    sup_levels, res_levels, vol_profile = compute_volume_sr(
+        close, volume, high, low, open_,
+        current_price, pair=pair, lookback=100
     )
 
     # ── argmin / argmax on 1m, 3m, 5m ────────────────────────
@@ -2540,6 +2651,7 @@ def ml_compound_forecast(pair, current_price, sel_detail,
         'reg_channel':     reg_ch,
         'sup_levels':      sup_levels,
         'res_levels':      res_levels,
+        'vol_profile':     vol_profile,
         'argmin_data':     argmin_data,
         'fitted_models':   fitted,
         'metrics':         metrics,
@@ -2652,45 +2764,148 @@ def print_ml_report(ml_result, label_map):
     print(f'  └{"─"*w}┘')
     print()
 
-    # ── 3. Volume S/R ─────────────────────────────────────────
+    # ── 3. Volume & Market Profile + S/R ─────────────────────
     sups = ml_result.get('sup_levels', [])
     ress = ml_result.get('res_levels', [])
-    print(f'  ┌─ 3. VOLUME S/R  full-range dynamic scan  {"─"*22}┐')
-    print(f'  │  Support    = most significant BULLISH vol anywhere below entry       │')
-    print(f'  │  Resistance = most significant BEARISH vol anywhere above entry       │')
-    print(f'  │  Zone label = which threshold it landed in (min/mid/max)              │')
+    vp   = ml_result.get('vol_profile', {})
+    lb   = vp.get('lookback', 100)
+
+    # ── ASCII dual-profile chart ──────────────────────────────
+    def _ascii_vp(vol_bins_list, mkt_bins_list, poc, vah, val,
+                  mpoc, mvah, mval, entry, sups_p, ress_p, width=18):
+        if not vol_bins_list:
+            return []
+        prices  = sorted(set([b[0] for b in vol_bins_list] +
+                              [b[0] for b in mkt_bins_list]), reverse=True)
+        vd = dict(vol_bins_list); md = dict(mkt_bins_list)
+        max_v  = max(vd.values()) if vd else 1.0
+        max_m  = max(md.values()) if md else 1.0
+        pr_rng = abs(prices[0] - prices[-1]) if len(prices) > 1 else 1.0
+        tol    = pr_rng * 0.025
+        step   = max(1, len(prices) // 28)
+        lines  = []
+        for pr in prices[::step]:
+            v_bar = int(vd.get(pr, 0.0) / max_v * width)
+            m_bar = int(md.get(pr, 0.0) / max_m * width)
+            mk = []
+            if poc  is not None and abs(pr-poc)  < tol: mk.append('P')
+            if mpoc is not None and abs(pr-mpoc) < tol: mk.append('p')
+            if entry is not None and abs(pr-entry)< tol: mk.append('E')
+            if vah  is not None and abs(pr-vah)  < tol: mk.append('▲')
+            if val  is not None and abs(pr-val)  < tol: mk.append('▼')
+            if any(abs(pr-sp) < tol for sp in sups_p): mk.append('S')
+            if any(abs(pr-rp) < tol for rp in ress_p): mk.append('R')
+            mk_s  = ''.join(mk)[:3].ljust(3)
+            v_str = '█' * v_bar + '░' * (width - v_bar)
+            m_str = '█' * m_bar + '░' * (width - m_bar)
+            lines.append(f'  │  {pf(pr):>12} {mk_s} {v_str} {m_str}  │')
+        return lines
+
+    # ── S/R row formatter (uses new tuple fields) ─────────────
+    def _sr_row(item, side):
+        price  = item[0];  raw_v = item[1];  n_b   = item[2]
+        sr_fl  = item[3];  sr_ce = item[4];  rng_p = item[5]
+        zone   = item[6] if len(item) > 6 else '—'
+        dist   = item[7] if len(item) > 7 else (price - cp) / (cp+1e-20) * 100.0
+        vpct   = item[8] if len(item) > 8 else 0.0
+        comp   = item[9] if len(item) > 9 else 0.0
+        grow   = item[10] if len(item) > 10 else 0.0
+        cons   = item[11] if len(item) > 11 else 0.0
+        sign   = 'above' if dist > 0 else 'below'
+        grow_s = f'▲{grow:+.1%}' if grow > 0 else f'▼{grow:+.1%}'
+        tag    = 'bull_vol' if side == 'sup' else 'bear_vol'
+        return (
+            f'  │    {pf(price)}  {tag}={raw_v:>14.0f}  bars={n_b:>4}'
+            f'  dist={abs(dist):.2f}%{sign}  {vpct:.1f}%side'
+            f'  score={comp:.0f}  growth={grow_s}  consist={cons:.0%}'
+            f'  zone={zone}'
+            f'  [{pf(sr_fl)}–{pf(sr_ce)} ±{rng_p}%]'
+        )
+
+    # ── computed scalars ──────────────────────────────────────
+    best_sup_p   = sups[0][0] if sups else None
+    best_res_p   = ress[0][0] if ress else None
+    sr_range_pct = round((best_res_p - best_sup_p) / (cp+1e-20) * 100.0, 2) \
+                   if (best_sup_p and best_res_p) else None
+    sups_prices  = [s[0] for s in sups]
+    ress_prices  = [r[0] for r in ress]
+
+    bull_pct_vp = vp.get('bull_pct', 0.0)
+    bear_pct_vp = vp.get('bear_pct', 0.0)
+    predom      = vp.get('predominance', '—')
+    bias_len    = 30
+    bull_bar    = int(bull_pct_vp / 100.0 * bias_len)
+    bear_bar    = bias_len - bull_bar
+    bias_str    = '▲' * bull_bar + '▼' * bear_bar
+    bias_icon   = '🟢' if predom == 'BULLISH' else ('🔴' if predom == 'BEARISH' else '⚪')
+
+    # orderbook walls
+    ob_bid = vp.get('ob_bid_wall')
+    ob_ask = vp.get('ob_ask_wall')
+
+    print(f'  ┌─ 3. VOLUME & MARKET PROFILE + REAL S/R  (last {lb} 1m bars) {"─"*10}┐')
+    print(f'  │  Bull/bear vol: ALL bars scanned, NO side filter, scored by:           │')
+    print(f'  │    raw vol × (1+consistency) × max(1, 1+growth)  → composite score    │')
+    print(f'  │  Markers: P=vol POC  p=mkt POC  E=entry  ▲/▼=VAH/VAL  S=sup  R=res   │')
     print(f'  │  {"─"*62}│')
-    print(f'  │  SUPPORTS  ── ranked by bull volume ──                                │')
+
+    # bias
+    print(f'  │  1m BIAS  {bias_icon} {predom:<8}'
+          f'  bull={bull_pct_vp:.1f}%  bear={bear_pct_vp:.1f}%  [{bias_str}]  │')
+    print(f'  │  Total={vp.get("total_vol",0):.0f}'
+          f'  bull={vp.get("bull_vol",0):.0f}'
+          f'  bear={vp.get("bear_vol",0):.0f}                              │')
+
+    # orderbook walls
+    if ob_bid or ob_ask:
+        bid_s = f'bid wall @ {pf(ob_bid[0])}  qty={ob_bid[1]:.2f}' if ob_bid else 'no bid wall'
+        ask_s = f'ask wall @ {pf(ob_ask[0])}  qty={ob_ask[1]:.2f}' if ob_ask else 'no ask wall'
+        print(f'  │  ORDERBOOK: {bid_s}  │  {ask_s}  │')
+
+    print(f'  │  {"─"*62}│')
+    print(f'  │  Vol  POC={pf(vp.get("vol_poc"))}  VAH={pf(vp.get("vol_vah"))}  VAL={pf(vp.get("vol_val"))}    │')
+    print(f'  │  Mkt  POC={pf(vp.get("mkt_poc"))}  VAH={pf(vp.get("mkt_vah"))}  VAL={pf(vp.get("mkt_val"))}    │')
+    print(f'  │  Entry={pf(cp)}  argmin={pf(vp.get("absolute_min"))}  argmax={pf(vp.get("absolute_max"))}  │')
+    print(f'  │  {"─"*62}│')
+    print(f'  │  {"Price":>12} Mk  {"─VOL PROFILE─":^18} {"─MKT PROFILE─":^18}  │')
+    print(f'  │  {"─"*62}│')
+
+    for ln in _ascii_vp(
+        vp.get('vol_bins', []), vp.get('mkt_bins', []),
+        vp.get('vol_poc'), vp.get('vol_vah'), vp.get('vol_val'),
+        vp.get('mkt_poc'), vp.get('mkt_vah'), vp.get('mkt_val'),
+        cp, sups_prices, ress_prices
+    ):
+        print(ln)
+
+    print(f'  │  {"─"*62}│')
+    print(f'  │  SUPPORT LEVELS  (most significant bullish vol — anywhere, ranked)     │')
+    print(f'  │  score = raw_vol × (1+consistency) × max(1, 1+growth)                 │')
     if sups:
         for item in sups[:3]:
-            price  = item[0]; vol_w = item[1]; n_b = item[2]
-            sr_fl  = item[3] if len(item) > 3 else None
-            sr_ce  = item[4] if len(item) > 4 else None
-            rng_p  = item[5] if len(item) > 5 else None
-            zone   = item[6] if len(item) > 6 else '—'
-            dist   = (cp - price) / cp * 100.0 if price < cp else 0.0
-            rng_s  = f'  [{pf(sr_fl)} – {pf(sr_ce)}  ±{rng_p}%]' if sr_fl else ''
-            print(f'  │    {pf(price)}  bull_vol={vol_w:>14.0f}  bars={n_b:>4}'
-                  f'  ({dist:.2f}% below)  zone={zone}{rng_s}')
+            print(_sr_row(item, 'sup'))
     else:
-        print(f'  │    (none found)')
+        print(f'  │    (none found in last {lb} bars)')
+
     print(f'  │  {"─"*62}│')
-    print(f'  │  RESISTANCES  ── ranked by bear volume ──                             │')
+    print(f'  │  RESISTANCE LEVELS  (most significant bearish vol — anywhere, ranked)  │')
     if ress:
         for item in ress[:3]:
-            price  = item[0]; vol_w = item[1]; n_b = item[2]
-            sr_fl  = item[3] if len(item) > 3 else None
-            sr_ce  = item[4] if len(item) > 4 else None
-            rng_p  = item[5] if len(item) > 5 else None
-            zone   = item[6] if len(item) > 6 else '—'
-            dist   = (price - cp) / cp * 100.0 if price > cp else 0.0
-            rng_s  = f'  [{pf(sr_fl)} – {pf(sr_ce)}  ±{rng_p}%]' if sr_fl else ''
-            print(f'  │    {pf(price)}  bear_vol={vol_w:>14.0f}  bars={n_b:>4}'
-                  f'  ({dist:.2f}% above)  zone={zone}{rng_s}')
+            print(_sr_row(item, 'res'))
     else:
-        print(f'  │    (none found)')
+        print(f'  │    (none found in last {lb} bars)')
+
+    print(f'  │  {"─"*62}│')
+    if sr_range_pct is not None:
+        print(f'  │  S→R spread: {pf(best_sup_p)} → {pf(best_res_p)}'
+              f'  = {sr_range_pct:+.2f}% of entry price               │')
+    if ob_bid and ob_ask:
+        ob_spread = round((ob_ask[0] - ob_bid[0]) / (cp+1e-20) * 100.0, 3)
+        print(f'  │  OB wall spread: {pf(ob_bid[0])} bid → {pf(ob_ask[0])} ask'
+              f'  = {ob_spread:+.3f}%                    │')
     print(f'  └{"─"*w}┘')
     print()
+
 
     # ── 4. Backtest metrics ───────────────────────────────────
     mets = ml_result.get('metrics', {})
