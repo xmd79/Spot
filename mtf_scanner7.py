@@ -7,6 +7,12 @@ from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
+try:
+    from scipy.signal import argrelextrema as _argrelextrema
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
+
 # ── sklearn ML imports ────────────────────────────────────
 try:
     from sklearn.linear_model    import Ridge, Lasso, BayesianRidge, LinearRegression
@@ -3309,6 +3315,495 @@ def print_ml_report(ml_result, label_map):
     print(f'  {"═"*w}\n')
 
 
+# ═════════════════════════════════════════════════════════════
+#  φ-REVERSAL FORECAST BLOCK
+#
+#  Fuses the three φ·e·π layers with argmin/argmax extrema
+#  detection to produce a standalone reversal call for the
+#  MTF winner:
+#
+#  Layer 1 — φ DECAY BANDS  (negative exponential powers)
+#    PHI^-1 … PHI^-7  = [0.618, 0.382, 0.236, 0.146, 0.090, 0.056, 0.034]
+#    and extensions PHI^+1=1.618, PHI^+2=2.618
+#    Scored by how close current price sits to any band.
+#
+#  Layer 2 — GOLDEN TRIANGLE TARGETS
+#    Isosceles apex=36°, base-angles=72°, leg/base = φ
+#    apex height  = bar_range × sin(72°) / (2×sin(36°))
+#    gnomon leg   = bar_range × φ²  (sub-triangle recursion)
+#    T1 = current ± apex_height   (primary)
+#    T2 = current ± gnomon        (extended, φ² move)
+#
+#  Layer 3 — GOLDEN SPIRAL TIMING
+#    r(θ) = A·e^(b·θ)  where b = ln(φ)/(π/2) = GOLDEN_B
+#    After each π/2 turn radius ×φ → discrete windows:
+#    anchor + round(φ^k) for k=1…7 = [2,3,4,7,11,18,29] bars
+#    spiral_ok = current bar within ±order bars of any window
+#
+#  EXTREMA DETECTION
+#    argrelextrema(low_arr,  np.less,    order=N) → swing lows
+#    argrelextrema(high_arr, np.greater, order=N) → swing highs
+#    Direction: argmin_idx > argmax_idx → BUY setup
+#               argmax_idx > argmin_idx → SELL setup
+#
+#  CONFIDENCE  (three-layer composite)
+#    0.50 × φ_band_proximity  (how close price is to a φ level)
+#    0.30 × spiral_timing     (is bar inside a spiral window?)
+#    0.20 × extremum_score    (how close the detected extremum
+#                               itself sits to a φ band)
+#
+#  OUTPUT
+#    trend          : 'UP' | 'DOWN' | 'NEUTRAL'
+#    forecast_price : median of all φ-aligned target levels
+#    target_T1      : golden-triangle primary target
+#    target_T2      : golden-triangle φ² gnomon target
+#    phi_band_label : nearest φ band name
+#    phi_band_level : exact φ level price
+#    confidence     : composite 0–1
+#    direction      : 'BUY' | 'SELL'
+# ═════════════════════════════════════════════════════════════
+
+PHI_NEG_POWERS  = np.array([PHI ** -n for n in range(1, 8)])
+# [0.6180, 0.3820, 0.2361, 0.1459, 0.0902, 0.0557, 0.0344]
+PHI_NEG_LABELS  = [f'φ⁻{n} ({PHI**-n:.4f})' for n in range(1, 8)]
+PHI_EXT_POWERS  = [(PHI,  'φ¹  (1.618 ext)'),
+                   (PHI2, 'φ²  (2.618 ext)')]
+# Golden-triangle geometry
+_GT_BASE_ANG    = 72.0
+_GT_APEX_ANG    = 36.0
+_GT_HEIGHT_MULT = np.sin(np.radians(_GT_BASE_ANG)) / (
+                      2.0 * np.sin(np.radians(_GT_APEX_ANG)))  # ≈ 0.9511
+
+
+def _phi_bands_all(swing_low, swing_high, direction='up'):
+    """
+    Return list of (label, ratio, price) for ALL φ bands
+    (retracements φ⁻¹…φ⁻⁷ and extensions φ¹ φ²).
+    """
+    span = swing_high - swing_low
+    if span <= 0 or swing_low <= 0:
+        return []
+    bands = []
+    for n, label in enumerate(PHI_NEG_LABELS, start=1):
+        ratio = PHI ** -n
+        if direction == 'up':
+            price = swing_low + ratio * span
+        else:
+            price = swing_high - ratio * span
+        bands.append((label, ratio, round(float(price), 8)))
+    for ratio, label in PHI_EXT_POWERS:
+        if direction == 'up':
+            price = swing_low + ratio * span
+        else:
+            price = swing_high - ratio * span
+        bands.append((label, ratio, round(float(price), 8)))
+    return bands
+
+
+def _nearest_phi_band(current, bands):
+    """Return (label, ratio, level, dist_pct) of closest φ band."""
+    if not bands:
+        return None, None, None, 999.0
+    best = min(bands, key=lambda b: abs(b[2] - current))
+    dist = abs(best[2] - current) / (current + 1e-20) * 100.0
+    return best[0], best[1], best[2], dist
+
+
+def _golden_triangle_targets(pivot, bar_range, direction='up'):
+    """
+    T1 = pivot ± apex_height  (primary)
+    T2 = pivot ± φ² × bar_range  (gnomon / extended)
+    T1_ret = pivot ∓ apex_height  (retracement stop reference)
+    """
+    apex_h = bar_range * _GT_HEIGHT_MULT
+    gnomon = bar_range * PHI2
+    sign   = 1.0 if direction == 'up' else -1.0
+    return {
+        'T1_primary':  round(pivot + sign * apex_h,  8),
+        'T2_gnomon':   round(pivot + sign * gnomon,   8),
+        'T1_retrace':  round(pivot - sign * apex_h,  8),
+    }
+
+
+def _spiral_windows(anchor_bar, n=7):
+    """Bar indices where golden spiral completes a π/2 quarter-turn from anchor."""
+    return np.array([anchor_bar + round(PHI ** k) for k in range(1, n + 1)],
+                    dtype=int)
+
+
+def _in_spiral_window(bar, windows, tol=1):
+    return bool(np.any(np.abs(windows.astype(int) - int(bar)) <= tol))
+
+
+def phi_reversal_forecast(pair, current_price, sel_detail,
+                           order=7, phi_band_tol_pct=1.2, min_confidence=0.25):
+    """
+    Full φ·e·π reversal forecast for the MTF winner.
+
+    Uses 1m data already in sel_detail when available; re-fetches if needed.
+    Returns a comprehensive result dict — never raises.
+    """
+    result = {
+        'pair':           pair,
+        'current_price':  current_price,
+        'trend':          'NEUTRAL',
+        'direction':      '—',
+        'forecast_price': None,
+        'target_T1':      None,
+        'target_T2':      None,
+        'phi_band_label': '—',
+        'phi_band_level': None,
+        'phi_score':      0.0,
+        'spiral_ok':      False,
+        'confidence':     0.0,
+        'argmin_bar':     None,
+        'argmax_bar':     None,
+        'swing_low':      None,
+        'swing_high':     None,
+        'phi_bands_above': [],
+        'phi_bands_below': [],
+        'all_signals':    [],
+        'n_extrema':      0,
+        'error':          None,
+    }
+
+    try:
+        d         = sel_detail.get(pair, {})
+        close_arr = d.get('close_arr')
+        low_arr   = d.get('low_arr')
+        high_arr  = d.get('high_arr')
+
+        # ── fetch 1m data if not already in sel_detail ───────────
+        if close_arr is None or len(close_arr) < 50:
+            try:
+                klines = trader.client.get_klines(
+                    symbol=pair, interval='1m', limit=EXTREMA_LOOKBACK
+                )
+                close_arr = np.array([float(k[4]) for k in klines], dtype=np.float64)
+                low_arr   = np.array([float(k[3]) for k in klines], dtype=np.float64)
+                high_arr  = np.array([float(k[2]) for k in klines], dtype=np.float64)
+            except Exception as ex:
+                result['error'] = str(ex); return result
+
+        close_arr = np.asarray(close_arr, dtype=np.float64)
+        low_arr   = np.asarray(low_arr  if low_arr  is not None else close_arr, dtype=np.float64)
+        high_arr  = np.asarray(high_arr if high_arr is not None else close_arr, dtype=np.float64)
+        n         = len(close_arr)
+
+        # ── swing anchors ────────────────────────────────────────
+        swing_low  = d.get('swing_low')  or float(np.min(low_arr))
+        swing_high = d.get('swing_high') or float(np.max(high_arr))
+        result['swing_low']  = round(swing_low,  8)
+        result['swing_high'] = round(swing_high, 8)
+
+        # ── EXTREMA DETECTION (argmin/argmax + argrelextrema) ────
+        # Global argmin/argmax (same logic as multi_tf_argmin_check)
+        global_amin = int(np.argmin(low_arr))
+        global_amax = int(np.argmax(high_arr))
+        result['argmin_bar'] = global_amin
+        result['argmax_bar'] = global_amax
+
+        # Direction: most recent extreme determines bias
+        if global_amin > global_amax:
+            base_dir = 'up'    # deepest low is MORE recent → mean-reversion BUY
+        elif global_amax > global_amin:
+            base_dir = 'down'  # highest high is MORE recent → mean-reversion SELL
+        else:
+            base_dir = 'up'   # tie → default bullish (we only run on confirmed dips)
+
+        # Local extrema via argrelextrema for richer signal set
+        signals = []
+        if SCIPY_AVAILABLE and n >= order * 3:
+            local_lows  = _argrelextrema(low_arr,   np.less,    order=order)[0]
+            local_highs = _argrelextrema(high_arr,  np.greater, order=order)[0]
+            result['n_extrema'] = len(local_lows) + len(local_highs)
+
+            # Build (bar, price, kind) pairs from local extrema
+            extrema = (
+                [(int(i), float(low_arr[i]),  'low')  for i in local_lows]  +
+                [(int(i), float(high_arr[i]), 'high') for i in local_highs]
+            )
+            extrema.sort(key=lambda x: x[0])
+
+            # Score each consecutive pair as a potential reversal
+            for i in range(1, len(extrema)):
+                prev_bar, prev_px, prev_kind = extrema[i - 1]
+                curr_bar, curr_px, curr_kind = extrema[i]
+                lo = min(prev_px, curr_px)
+                hi = max(prev_px, curr_px)
+                if hi <= lo:
+                    continue
+
+                # --- signal direction ---
+                if curr_kind == 'low':
+                    sig_dir  = 'BUY'
+                    phi_dir  = 'up'
+                    pivot    = curr_px
+                else:
+                    sig_dir  = 'SELL'
+                    phi_dir  = 'down'
+                    pivot    = curr_px
+
+                # --- Layer 1: φ decay bands ---
+                bands = _phi_bands_all(lo, hi, direction=phi_dir)
+                lbl, ratio, level, dist_pct = _nearest_phi_band(curr_px, bands)
+                if dist_pct > phi_band_tol_pct or lbl is None:
+                    continue
+
+                phi_score = max(0.0, 1.0 - dist_pct / phi_band_tol_pct)
+
+                # --- Layer 2: Golden triangle ---
+                bar_range = hi - lo
+                gt        = _golden_triangle_targets(pivot, bar_range, phi_dir)
+
+                # --- Layer 3: Golden spiral timing ---
+                windows   = _spiral_windows(prev_bar, n=7)
+                spiral_ok = _in_spiral_window(curr_bar, windows, tol=order)
+
+                # --- Composite confidence ---
+                band_score   = max(0.0, 1.0 - dist_pct / 1.0)
+                spiral_score = 1.0 if spiral_ok else 0.0
+                confidence   = round(
+                    0.50 * band_score + 0.30 * spiral_score + 0.20 * phi_score, 4
+                )
+                if confidence < min_confidence:
+                    continue
+
+                signals.append({
+                    'bar':            curr_bar,
+                    'price':          curr_px,
+                    'direction':      sig_dir,
+                    'phi_band_label': lbl,
+                    'phi_band_level': level,
+                    'phi_score':      round(phi_score, 4),
+                    'spiral_ok':      spiral_ok,
+                    'T1_primary':     gt['T1_primary'],
+                    'T2_gnomon':      gt['T2_gnomon'],
+                    'T1_retrace':     gt['T1_retrace'],
+                    'confidence':     confidence,
+                })
+        else:
+            result['n_extrema'] = 0
+
+        result['all_signals'] = sorted(signals, key=lambda s: s['bar'])
+
+        # ── Determine trend direction from global argmin/argmax ──
+        # (consistent with the main mtf argmin>argmax logic)
+        result['direction'] = 'BUY' if base_dir == 'up' else 'SELL'
+        result['trend']     = 'UP'  if base_dir == 'up' else 'DOWN'
+
+        # ── φ bands from global swing for the full price range ───
+        all_bands   = _phi_bands_all(swing_low, swing_high, direction=base_dir)
+        above_bands = sorted(
+            [(lbl2, lvl) for lbl2, _, lvl in all_bands if lvl > current_price * 1.001],
+            key=lambda x: x[1]
+        )
+        below_bands = sorted(
+            [(lbl2, lvl) for lbl2, _, lvl in all_bands if lvl < current_price * 0.999],
+            key=lambda x: x[1], reverse=True
+        )
+        result['phi_bands_above'] = above_bands[:4]
+        result['phi_bands_below'] = below_bands[:4]
+
+        # ── Nearest φ band to current price ─────────────────────
+        lbl_now, _, lvl_now, dist_now = _nearest_phi_band(current_price, all_bands)
+        result['phi_band_label'] = lbl_now or '—'
+        result['phi_band_level'] = lvl_now
+        result['phi_score']      = round(max(0.0, 1.0 - dist_now / phi_band_tol_pct), 4)
+
+        # ── Golden triangle from global swing ────────────────────
+        bar_range_global = swing_high - swing_low
+        gt_global = _golden_triangle_targets(current_price, bar_range_global, base_dir)
+        result['target_T1'] = gt_global['T1_primary']
+        result['target_T2'] = gt_global['T2_gnomon']
+
+        # ── Spiral check for current bar ─────────────────────────
+        anchor_bar = global_amin if base_dir == 'up' else global_amax
+        windows_now = _spiral_windows(anchor_bar, n=7)
+        result['spiral_ok'] = _in_spiral_window(n - 1, windows_now, tol=order)
+
+        # ── Composite confidence on current price ────────────────
+        band_s = max(0.0, 1.0 - dist_now / 1.0)
+        spi_s  = 1.0 if result['spiral_ok'] else 0.0
+        result['confidence'] = round(0.50 * band_s + 0.30 * spi_s +
+                                     0.20 * result['phi_score'], 4)
+
+        # ── Forecast price: median of nearest 3 φ bands above ────
+        # (for BUY) or below (for SELL) the current price
+        if base_dir == 'up' and above_bands:
+            targets = [lvl for _, lvl in above_bands[:3]]
+        elif base_dir == 'down' and below_bands:
+            targets = [lvl for _, lvl in below_bands[:3]]
+        else:
+            targets = []
+
+        if targets:
+            result['forecast_price'] = round(float(np.median(targets)), 8)
+        else:
+            # fall back to T1 if no φ bands found
+            result['forecast_price'] = result['target_T1']
+
+    except Exception as ex:
+        result['error'] = f'{type(ex).__name__}: {ex}'
+
+    return result
+
+
+def print_phi_reversal_block(rev, label_map):
+    """
+    Print the φ-Reversal forecast block for the MTF winner.
+    Appears after print_ml_report() in the main loop.
+    """
+    if not rev:
+        return
+
+    pair = rev.get('pair', '?')
+    lbl  = label_map.get(pair, pair.replace('USDC', ''))
+    cp   = rev.get('current_price') or 0.0
+    w    = 66
+
+    def pf(v):
+        if v is None: return '—'
+        return f'{v:.6f}' if abs(v) < 1 else f'{v:.4f}'
+
+    def pp(v):
+        if v is None: return '—'
+        pct = (v - cp) / (cp + 1e-20) * 100.0
+        arrow = '▲' if pct > 0 else '▼'
+        return f'{pf(v)}  ({arrow}{pct:+.2f}%)'
+
+    trend     = rev.get('trend', 'NEUTRAL')
+    direction = rev.get('direction', '—')
+    conf      = rev.get('confidence', 0.0)
+    spiral_ok = rev.get('spiral_ok', False)
+    phi_score = rev.get('phi_score', 0.0)
+    n_ext     = rev.get('n_extrema', 0)
+    err       = rev.get('error')
+
+    # trend label + icon
+    if   trend == 'UP':      trend_icon = '▲ UP  (BUY reversal setup)'
+    elif trend == 'DOWN':    trend_icon = '▼ DOWN (SELL reversal setup)'
+    else:                    trend_icon = '→ NEUTRAL'
+
+    # confidence bar
+    conf_bar = '█' * int(conf * 20) + '░' * (20 - int(conf * 20))
+
+    print(f'\n  {"═"*w}')
+    print(f'  ◈  φ-REVERSAL FORECAST  ·  {lbl}  ({pair})')
+    print(f'  {"═"*w}')
+
+    if err:
+        print(f'  [WARN] {err}')
+
+    # ── Header: trend / direction / confidence ────────────────────
+    print(f'  ┌─ TREND & REVERSAL DIRECTION {"─"*36}┐')
+    print(f'  │  Entry price    : {pf(cp)}')
+    print(f'  │  Swing low      : {pf(rev.get("swing_low"))}   '
+          f'argmin@bar {rev.get("argmin_bar","—")}')
+    print(f'  │  Swing high     : {pf(rev.get("swing_high"))}   '
+          f'argmax@bar {rev.get("argmax_bar","—")}')
+    print(f'  │  TREND          : {trend_icon}')
+    print(f'  │  Extrema found  : {n_ext} local swing points')
+    print(f'  └{"─"*w}┘')
+    print()
+
+    # ── φ decay bands ─────────────────────────────────────────────
+    print(f'  ┌─ φ DECAY BANDS  (negative exponential powers of φ) {"─"*12}┐')
+    print(f'  │  φ⁻¹…φ⁻⁷ = {np.round(PHI_NEG_POWERS, 4).tolist()}')
+    print(f'  │  Nearest band   : {rev.get("phi_band_label","—")}')
+    print(f'  │  Band level     : {pf(rev.get("phi_band_level"))}')
+    print(f'  │  φ score        : {phi_score:.4f}  (1.0 = exactly on band)')
+    if rev.get('phi_bands_above'):
+        print(f'  │  ── φ levels ABOVE entry (targets) ───────────────────────')
+        for band_lbl, band_lvl in rev['phi_bands_above']:
+            print(f'  │    {band_lbl:<32}  {pp(band_lvl)}')
+    if rev.get('phi_bands_below'):
+        print(f'  │  ── φ levels BELOW entry (support / stop ref) ─────────────')
+        for band_lbl, band_lvl in rev['phi_bands_below']:
+            print(f'  │    {band_lbl:<32}  {pp(band_lvl)}')
+    print(f'  └{"─"*w}┘')
+    print()
+
+    # ── Golden Triangle targets ───────────────────────────────────
+    print(f'  ┌─ GOLDEN TRIANGLE TARGETS  (apex=36°  base=72°  leg/base=φ) {"─"*4}┐')
+    print(f'  │  T1 primary  (apex height)      : {pp(rev.get("target_T1"))}')
+    print(f'  │  T2 gnomon   (φ² × bar range)   : {pp(rev.get("target_T2"))}')
+    print(f'  └{"─"*w}┘')
+    print()
+
+    # ── Golden Spiral timing ──────────────────────────────────────
+    spi_str = '✔  YES — price bar is inside a φ-spiral timing window' \
+              if spiral_ok else '✗  No   — bar outside spiral windows'
+    print(f'  ┌─ GOLDEN SPIRAL TIMING  (r = A·e^(b·θ), b = ln(φ)/(π/2)) {"─"*4}┐')
+    print(f'  │  Spiral windows from argmin/argmax anchor:')
+    anchor_bar = rev.get('argmin_bar') if trend == 'UP' else rev.get('argmax_bar')
+    if anchor_bar is not None:
+        wins = _spiral_windows(int(anchor_bar), n=7)
+        wins_str = ', '.join(str(w2) for w2 in wins)
+        print(f'  │    anchor bar {anchor_bar} → windows at [{wins_str}]')
+    print(f'  │  Current in window : {spi_str}')
+    print(f'  └{"─"*w}┘')
+    print()
+
+    # ── Individual reversal signals from argrelextrema ────────────
+    sigs = rev.get('all_signals', [])
+    if sigs:
+        print(f'  ┌─ φ-REVERSAL SIGNALS  ({len(sigs)} signals, conf≥{0.25}) {"─"*24}┐')
+        hdr_s = (f'  │  {"Bar":>5}  {"Price":>12}  {"Dir":>4}  '
+                 f'{"φ Band":<24}  {"T1 target":>12}  {"T2 target":>12}  {"Conf":>6}  │')
+        sep_s = '  │' + '─' * (len(hdr_s) - 4) + '│'
+        print(sep_s); print(hdr_s); print(sep_s)
+        # show top-5 by confidence
+        top5 = sorted(sigs, key=lambda s: s['confidence'], reverse=True)[:5]
+        for s in top5:
+            sp_tag = '✔' if s['spiral_ok'] else '·'
+            print(f'  │  {s["bar"]:>5}  {pf(s["price"]):>12}  {s["direction"]:>4}  '
+                  f'{s["phi_band_label"][:24]:<24}  '
+                  f'{pf(s["T1_primary"]):>12}  '
+                  f'{pf(s["T2_gnomon"]):>12}  '
+                  f'{s["confidence"]:>5.3f}{sp_tag}  │')
+        print(sep_s)
+        print(f'  └{"─"*w}┘')
+        print()
+
+    # ── FINAL REVERSAL SUMMARY ────────────────────────────────────
+    fc_p  = rev.get('forecast_price')
+    t1_p  = rev.get('target_T1')
+    t2_p  = rev.get('target_T2')
+
+    if fc_p:
+        fc_pct = (fc_p - cp) / (cp + 1e-20) * 100.0
+        fc_arr = '▲' if fc_pct > 0 else '▼'
+    else:
+        fc_pct = 0.0; fc_arr = ''
+
+    print(f'  {"═"*w}')
+    print(f'  ★★★  φ-REVERSAL DECISION  ·  {lbl}')
+    print(f'  {"═"*w}')
+    print(f'  ▶  ENTRY               : {pf(cp)}')
+    print(f'  ▶  TREND               : {trend_icon}')
+    print()
+    print(f'  ▶  φ FORECAST TARGET   : {pf(fc_p)}  '
+          f'({fc_arr}{fc_pct:+.2f}%)  [median of nearest φ bands]')
+    print(f'  ▶  T1  (triangle)      : {pp(t1_p)}  [apex·height = bar_range × {_GT_HEIGHT_MULT:.4f}]')
+    print(f'  ▶  T2  (φ² gnomon)    : {pp(t2_p)}  [bar_range × φ² = {PHI2:.4f}]')
+    print()
+    print(f'  ▶  CONFIDENCE          : {conf:.4f}  [{conf_bar}]')
+    print(f'     φ band proximity    : {rev.get("phi_score",0.0):.4f} × 0.50')
+    print(f'     spiral timing       : {"1.00" if spiral_ok else "0.00"} × 0.30')
+    print(f'     extremum score      : (from argrelextrema signals)')
+    print()
+
+    # grade
+    if   conf >= 0.75: grade = 'STRONG REVERSAL SETUP ★★★'
+    elif conf >= 0.55: grade = 'MODERATE SETUP ★★'
+    elif conf >= 0.35: grade = 'WEAK SETUP ★'
+    else:              grade = 'LOW CONFIDENCE — wait for better alignment'
+    print(f'  ▶  GRADE               : {grade}')
+    print()
+    print(f'  {"═"*w}\n')
+
+
 # ─────────────────────────────────────────────
 #  MAIN LOOP
 # ─────────────────────────────────────────────
@@ -3555,6 +4050,15 @@ while True:
                 stf_results, htf_results, thr_map=thr_map
             )
             print_ml_report(ml_result, label_map)
+
+            # ── φ-Reversal forecast (argmin/argmax + φ decay bands
+            #    + golden triangle + golden spiral timing) ─────────
+            print(f'  Running φ-Reversal forecast on {lbl}...')
+            phi_rev = phi_reversal_forecast(
+                best_symbol, current_price, sel_detail,
+                order=7, phi_band_tol_pct=1.2, min_confidence=0.25
+            )
+            print_phi_reversal_block(phi_rev, label_map)
         else:
             print('  FFT: insufficient data for forecast.\n')
     else:
