@@ -3610,23 +3610,306 @@ def _assign_quadrant(angle_deg):
     else:           return 'Q4'
 
 
-def _quadrature_bars(anchor_bar, dominant_period):
+def _sinusoid_price_at_bar(bar_idx, A, phi0, slope, intercept, dominant_period):
     """
-    Return the four quadrature bar positions in a full 360° circuit.
-    Q1_start=anchor, Q2_start=anchor+T/4, Q3_start=anchor+T/2, Q4_start=anchor+3T/4
+    Project sinusoidal price at any bar using the fitted model:
+      P(t) = A·sin(2π/T·t + φ₀) + slope·t + intercept
     """
-    T = float(dominant_period)
-    return {
-        'Q1_start': int(anchor_bar),
-        'Q2_start': int(anchor_bar + T / 4.0),
-        'Q3_start': int(anchor_bar + T / 2.0),
-        'Q4_start': int(anchor_bar + 3.0 * T / 4.0),
-        'next_Q1':  int(anchor_bar + T),
+    t     = float(bar_idx)
+    T     = float(dominant_period)
+    trend = slope * t + intercept
+    osc   = A * np.sin(TAU / T * t + phi0)
+    return float(trend + osc)
+
+
+def _quadrature_bars(anchor_bar, dominant_period, cycle_dir='UP',
+                     A=None, phi0=None, slope=None, intercept=None,
+                     swing_low=None, swing_high=None):
+    """
+    Return the four quadrature bar positions in a full 360° circuit,
+    with sinusoidal price projections and cycle-aware labels.
+
+    For UP cycle (anchor = argmin = trough):
+      Q1_start = trough        (0°   — ENTRY / support)
+      Q2_start = anchor + T/4  (90°  — rising midline)
+      Q3_start = anchor + T/2  (180° — ★ RESISTANCE TOP / reversal target)
+      Q4_start = anchor + 3T/4 (270° — post-reversal decline begins)
+      next_trough = anchor + T (360° — next trough, new cycle)
+
+    For DOWN cycle (anchor = argmax = peak):
+      Q3_start = peak           (180° — ENTRY / resistance)
+      Q4_start = anchor + T/4  (270° — early collapse)
+      Q1_start = anchor + T/2  (0°   — ★ SUPPORT DIP / reversal target)
+      Q2_start = anchor + 3T/4 (90°  — post-reversal accumulation)
+      next_peak = anchor + T   (180° — next peak, new cycle)
+    """
+    T  = float(dominant_period)
+    has_fit = (A is not None and phi0 is not None
+               and slope is not None and intercept is not None)
+
+    def _proj(bar):
+        if not has_fit:
+            return None
+        raw = _sinusoid_price_at_bar(bar, A, phi0, slope, intercept, T)
+        # clamp to plausible range if swing anchors are available
+        if swing_low is not None and swing_high is not None:
+            raw = max(swing_low * 0.99, min(swing_high * 1.01, raw))
+        return round(float(raw), 8)
+
+    if cycle_dir == 'UP':
+        b_q1  = int(anchor_bar)
+        b_q2  = int(anchor_bar + T / 4.0)
+        b_q3  = int(anchor_bar + T / 2.0)
+        b_q4  = int(anchor_bar + 3.0 * T / 4.0)
+        b_end = int(anchor_bar + T)
+        return {
+            'cycle_dir':    cycle_dir,
+            'Q1_start':     b_q1,   'Q1_price': _proj(b_q1),   'Q1_label': 'TROUGH  (entry / support)',
+            'Q2_start':     b_q2,   'Q2_price': _proj(b_q2),   'Q2_label': 'rising midline (90°)',
+            'Q3_start':     b_q3,   'Q3_price': _proj(b_q3),   'Q3_label': '★ RESISTANCE TOP — reversal target',
+            'Q4_start':     b_q4,   'Q4_price': _proj(b_q4),   'Q4_label': 'post-reversal decline (270°)',
+            'next_trough':  b_end,  'next_trough_price': _proj(b_end), 'next_trough_label': 'next TROUGH / cycle restart',
+        }
+    else:  # DOWN
+        b_q3  = int(anchor_bar)
+        b_q4  = int(anchor_bar + T / 4.0)
+        b_q1  = int(anchor_bar + T / 2.0)
+        b_q2  = int(anchor_bar + 3.0 * T / 4.0)
+        b_end = int(anchor_bar + T)
+        return {
+            'cycle_dir':   cycle_dir,
+            'Q3_start':    b_q3,   'Q3_price': _proj(b_q3),   'Q3_label': 'PEAK  (entry / resistance)',
+            'Q4_start':    b_q4,   'Q4_price': _proj(b_q4),   'Q4_label': 'early collapse (270°)',
+            'Q1_start':    b_q1,   'Q1_price': _proj(b_q1),   'Q1_label': '★ SUPPORT DIP — reversal target',
+            'Q2_start':    b_q2,   'Q2_price': _proj(b_q2),   'Q2_label': 'post-reversal accumulation (90°)',
+            'next_peak':   b_end,  'next_peak_price': _proj(b_end),  'next_peak_label': 'next PEAK / cycle restart',
+        }
+
+
+
+# ── MTF Sinusoidal Circuit: per-timeframe runner + ML ensemble ────────────────
+_MTF_CIRCUIT_TFS = [
+    ('1m',  60 * 16,  1.0),   # (interval, limit, weight)  1m  — primary
+    ('3m',  60 *  8,  0.9),   # 3m
+    ('5m',  60 *  5,  0.85),  # 5m
+    ('15m', 60 *  3,  0.75),  # 15m
+    ('30m', 60 *  2,  0.65),  # 30m
+    ('2h',  60 *  1,  0.50),  # 2h — HTF context, lower weight
+]
+
+
+def _run_circuit_on_tf(pair, tf, limit, current_price):
+    """
+    Fetch klines for `tf`, fit sinusoidal circuit, return a compact
+    result dict (same schema as sinusoidal_circuit_engine but without
+    the external stf/htf_results dependency).
+    Never raises.
+    """
+    r = {
+        'tf': tf, 'pair': pair, 'current_price': current_price,
+        'cycle_dir': None, 'current_angle_deg': None,
+        'current_quadrant': None, 'quadrant_label': '—',
+        'dominant_period': None, 'sinusoid_r2': None,
+        'reversal_type': '—', 'reversal_target': None,
+        'reversal_pct': None, 'reversal_target_fft': None,
+        'reversal_target_swing': None,
+        'phi_target_ext': None, 'bars_to_reversal': None,
+        'swing_low': None, 'swing_high': None,
+        'fft_amplitude': None, 'quadrature_bars': {},
+        'error': None,
     }
+    try:
+        klines    = trader.client.get_klines(symbol=pair, interval=tf, limit=limit)
+        close_arr = np.array([float(k[4]) for k in klines], dtype=np.float64)
+        low_arr   = np.array([float(k[3]) for k in klines], dtype=np.float64)
+        high_arr  = np.array([float(k[2]) for k in klines], dtype=np.float64)
+        n         = len(close_arr)
+        if n < 64:
+            r['error'] = 'insufficient data'; return r
+
+        swing_low  = float(np.min(low_arr))
+        swing_high = float(np.max(high_arr))
+        r['swing_low']  = round(swing_low,  8)
+        r['swing_high'] = round(swing_high, 8)
+
+        global_amin = int(np.argmin(low_arr))
+        global_amax = int(np.argmax(high_arr))
+        r['argmin_bar'] = global_amin
+        r['argmax_bar'] = global_amax
+
+        cycle_dir = 'UP' if global_amin > global_amax else 'DOWN'
+        r['cycle_dir'] = cycle_dir
+        anchor_bar  = global_amin if cycle_dir == 'UP' else global_amax
+        current_bar = n - 1
+
+        # FFT dominant period
+        _dtr, _ = _detrend(close_arr)
+        _sp     = np.fft.rfft(_dtr)
+        _fr     = np.fft.rfftfreq(n)
+        _pw     = np.abs(_sp); _pw[0] = 0
+        _vm     = (_fr > 0) & (_fr <= 0.25)
+        if np.any(_vm):
+            _pw2 = _pw.copy(); _pw2[~_vm] = 0
+            _dom = int(np.argmax(_pw2))
+            _df  = float(_fr[_dom])
+            dominant_period = max(8, int(round(1.0 / _df))) if _df > 0 else 20
+        else:
+            dominant_period = 20
+        dominant_period = min(dominant_period, n // 2)
+        r['dominant_period'] = dominant_period
+
+        A_fit, phi0, slope, intercept, r2_fit, _ = \
+            _fit_sinusoid_to_price(close_arr, dominant_period)
+        r['sinusoid_r2']   = round(r2_fit,        4)
+        r['fft_amplitude'] = round(float(A_fit),  8)
+
+        # Circuit angle
+        angle_deg = _circuit_angle_from_fft(current_bar, dominant_period, anchor_bar)
+        if cycle_dir == 'DOWN':
+            down_angle = _circuit_angle_from_fft(current_bar, dominant_period, global_amax)
+            angle_deg  = (down_angle + 180.0) % 360.0
+        r['current_angle_deg'] = round(angle_deg, 1)
+        quadrant = _assign_quadrant(angle_deg)
+        r['current_quadrant'] = quadrant
+        r['quadrant_label']   = (_CQ_LABEL_UP if cycle_dir == 'UP' else _CQ_LABEL_DN).get(quadrant, '—')
+
+        # Quadrature bars + prices
+        r['quadrature_bars'] = _quadrature_bars(
+            anchor_bar, dominant_period, cycle_dir=cycle_dir,
+            A=A_fit, phi0=phi0, slope=slope, intercept=intercept,
+            swing_low=swing_low, swing_high=swing_high
+        )
+
+        # Consistent reversal target
+        T      = float(dominant_period)
+        rev_bar = int(round(anchor_bar + T / 2.0))
+        fft_proj  = _sinusoid_price_at_bar(rev_bar, A_fit, phi0, slope, intercept, T)
+        r['reversal_target_fft'] = round(float(fft_proj), 8)
+
+        if cycle_dir == 'UP':
+            r['reversal_type']   = 'RESISTANCE TOP'
+            emp_price  = float(high_arr[global_amax])
+            raw_target = 0.40 * swing_high + 0.40 * fft_proj + 0.20 * emp_price
+            raw_target = max(current_price, min(swing_high * 1.05, raw_target))
+            r['reversal_target_swing'] = round(swing_high, 8)
+            span = swing_high - swing_low
+            r['phi_target_ext'] = round(swing_high + PHI_INV * span, 8)
+        else:
+            r['reversal_type']   = 'SUPPORT DIP'
+            emp_price  = float(low_arr[global_amin])
+            raw_target = 0.40 * swing_low + 0.40 * fft_proj + 0.20 * emp_price
+            raw_target = min(current_price, max(swing_low * 0.95, raw_target))
+            r['reversal_target_swing'] = round(swing_low, 8)
+            span = swing_high - swing_low
+            r['phi_target_ext'] = round(swing_low - PHI_INV * span, 8)
+
+        r['reversal_target']  = round(float(raw_target), 8)
+        r['reversal_pct']     = round((raw_target - current_price) / (current_price + 1e-20) * 100.0, 4)
+        r['bars_to_reversal'] = max(0, rev_bar - current_bar)
+        r['reversal_bar_est'] = rev_bar
+
+    except Exception as ex:
+        r['error'] = f'{type(ex).__name__}: {ex}'
+    return r
+
+
+def sinusoidal_circuit_mtf(pair, current_price, sel_detail,
+                             stf_results=None, htf_results=None):
+    """
+    Run sinusoidal circuit on every MTF_CIRCUIT_TFS timeframe in parallel,
+    then aggregate targets via weighted ML ensemble.
+
+    Returns:
+      tf_results  : list of per-TF result dicts
+      mtf_summary : aggregated/ML summary dict
+    """
+    tf_results = []
+    with ThreadPoolExecutor(max_workers=len(_MTF_CIRCUIT_TFS)) as ex:
+        futs = {
+            ex.submit(_run_circuit_on_tf, pair, tf, lim, current_price): (tf, w)
+            for tf, lim, w in _MTF_CIRCUIT_TFS
+        }
+        for fut in as_completed(futs):
+            tf, w = futs[fut]
+            try:
+                res = fut.result()
+                res['weight'] = w
+                tf_results.append(res)
+            except Exception:
+                pass
+
+    # sort by TF order
+    tf_order = {tf: i for i, (tf, _, _) in enumerate(_MTF_CIRCUIT_TFS)}
+    tf_results.sort(key=lambda r: tf_order.get(r.get('tf'), 99))
+
+    # ── ML ensemble: weighted aggregation of reversal targets ────────
+    # Only use TFs with valid targets + R² > 0.3 for reliability
+    valid = [r for r in tf_results
+             if r.get('reversal_target') is not None
+             and (r.get('sinusoid_r2') or 0) > 0.2
+             and r.get('error') is None]
+
+    mtf_summary = {
+        'n_valid_tfs':        len(valid),
+        'mtf_target':         None,
+        'mtf_target_pct':     None,
+        'mtf_phi_ext':        None,
+        'mtf_confidence':     0.0,
+        'dominant_cycle_dir': None,
+        'dominant_quadrant':  None,
+        'target_range_low':   None,
+        'target_range_high':  None,
+        'best_r2_tf':         None,
+    }
+
+    if valid:
+        # weighted mean target (R² × TF-weight)
+        weights  = np.array([r['sinusoid_r2'] * r['weight'] for r in valid], dtype=np.float64)
+        targets  = np.array([r['reversal_target'] for r in valid], dtype=np.float64)
+        phi_exts = np.array([r['phi_target_ext'] for r in valid
+                             if r.get('phi_target_ext') is not None], dtype=np.float64)
+
+        w_sum    = weights.sum()
+        if w_sum > 0:
+            mtf_target = float(np.average(targets, weights=weights))
+        else:
+            mtf_target = float(np.median(targets))
+
+        mtf_summary['mtf_target']     = round(mtf_target,  8)
+        mtf_summary['mtf_target_pct'] = round(
+            (mtf_target - current_price) / (current_price + 1e-20) * 100.0, 4)
+        mtf_summary['target_range_low']  = round(float(np.min(targets)),  8)
+        mtf_summary['target_range_high'] = round(float(np.max(targets)),  8)
+
+        if len(phi_exts) > 0:
+            mtf_summary['mtf_phi_ext'] = round(float(np.average(phi_exts,
+                weights=weights[:len(phi_exts)])), 8)
+
+        # dominant cycle direction (majority vote weighted by R²)
+        up_w   = sum(r['sinusoid_r2'] * r['weight'] for r in valid if r.get('cycle_dir') == 'UP')
+        dn_w   = sum(r['sinusoid_r2'] * r['weight'] for r in valid if r.get('cycle_dir') == 'DOWN')
+        mtf_summary['dominant_cycle_dir'] = 'UP' if up_w >= dn_w else 'DOWN'
+
+        # dominant quadrant (mode)
+        from collections import Counter
+        q_votes = Counter(r.get('current_quadrant') for r in valid if r.get('current_quadrant'))
+        mtf_summary['dominant_quadrant'] = q_votes.most_common(1)[0][0] if q_votes else None
+
+        # overall MTF confidence: mean R² of valid TFs × agreement fraction
+        mean_r2   = float(np.mean([r['sinusoid_r2'] for r in valid]))
+        agree_frac = max(up_w, dn_w) / (up_w + dn_w + 1e-12)
+        mtf_summary['mtf_confidence'] = round(min(1.0, mean_r2 * agree_frac * 1.5), 4)
+
+        # best TF by R²
+        best_r2_tf = max(valid, key=lambda r: r.get('sinusoid_r2', 0))
+        mtf_summary['best_r2_tf'] = best_r2_tf.get('tf')
+
+    return tf_results, mtf_summary
 
 
 def sinusoidal_circuit_engine(pair, current_price, sel_detail,
                                stf_results=None, htf_results=None):
+
     """
     360° Sinusoidal Circuit Engine.
 
@@ -3826,27 +4109,44 @@ def sinusoidal_circuit_engine(pair, current_price, sel_detail,
             result['quadrant_label'] = _CQ_LABEL_DN.get(quadrant, '—')
             result['cycle_label']    = 'DOWN cycle (argmax most recent → RESISTANCE TOP confirmed)'
 
-        # ── 8. Quadrature bars ───────────────────────────────────
-        result['quadrature_bars'] = _quadrature_bars(anchor_bar, dominant_period)
+        # ── 8. Quadrature bars (with sinusoid price projections) ─────
+        result['quadrature_bars'] = _quadrature_bars(
+            anchor_bar, dominant_period, cycle_dir=cycle_dir,
+            A=A_fit, phi0=phi0, slope=slope, intercept=intercept,
+            swing_low=swing_low, swing_high=swing_high
+        )
 
         # ── 9. Reversal target + type ────────────────────────────
-        # The next reversal target is the OPPOSITE extremum:
-        # UP  cycle → price heading to RESISTANCE TOP (swing_high or FFT projection)
-        # DOWN cycle → price heading to SUPPORT DIP  (swing_low  or FFT projection)
+        # Consistent target: weighted blend of
+        #   (a) historical swing extremum  — structural reference
+        #   (b) FFT sinusoid projection at reversal bar — dynamic model
+        #   (c) actual argmax/argmin price — empirical anchor
+        # Weight: 0.40 × swing  +  0.40 × fft_proj  +  0.20 × argmin/max price
         T   = float(dominant_period)
         half_T = T / 2.0
 
         if cycle_dir == 'UP':
             result['reversal_type']   = 'RESISTANCE TOP'
-            # raw target: swing_high
-            raw_target = swing_high
-            # bars from anchor to argmax = global_amax − global_amin
-            # next reversal bar = anchor_bar + half_T (projected)
             rev_bar    = int(round(anchor_bar + half_T))
+            # FFT projection at reversal bar
+            fft_proj   = _sinusoid_price_at_bar(rev_bar, A_fit, phi0, slope, intercept, T)
+            # empirical: price at argmax bar
+            emp_price  = float(high_arr[global_amax])
+            # consistent blend
+            raw_target = (0.40 * swing_high + 0.40 * fft_proj + 0.20 * emp_price)
+            # clamp: never below current_price or above swing_high * 1.05
+            raw_target = max(current_price, min(swing_high * 1.05, raw_target))
         else:
             result['reversal_type']   = 'SUPPORT DIP'
-            raw_target = swing_low
             rev_bar    = int(round(anchor_bar + half_T))
+            fft_proj   = _sinusoid_price_at_bar(rev_bar, A_fit, phi0, slope, intercept, T)
+            emp_price  = float(low_arr[global_amin])
+            raw_target = (0.40 * swing_low + 0.40 * fft_proj + 0.20 * emp_price)
+            raw_target = min(current_price, max(swing_low * 0.95, raw_target))
+
+        result['reversal_target_fft']   = round(float(fft_proj),   8)
+        result['reversal_target_swing'] = round(float(swing_high if cycle_dir == 'UP' else swing_low), 8)
+        result['reversal_target_emp']   = round(float(emp_price),   8)
 
         # bars remaining until reversal
         bars_to_rev = max(0, rev_bar - current_bar)
@@ -3975,10 +4275,11 @@ def sinusoidal_circuit_engine(pair, current_price, sel_detail,
     return result
 
 
-def print_circuit_block(circ, label_map):
+def print_circuit_block(circ, label_map, mtf_tf_results=None, mtf_summary=None):
     """
     Print the full 360° sinusoidal circuit block.
     Called after print_phi_reversal_block() in the main loop.
+    Includes: cycle quadrature with prices, per-TF circuit table, MTF ML targets.
     """
     if not circ:
         return
@@ -3997,7 +4298,7 @@ def print_circuit_block(circ, label_map):
         base = ref if ref is not None else cp
         pct  = (v - base) / (base + 1e-20) * 100.0
         arr  = '▲' if pct > 0 else '▼'
-        return f'{pf(v)}  ({arr}{pct:+.2f}%)'
+        return f'{pf(v)}  ({arr}{abs(pct):.2f}%)'
 
     err       = circ.get('error')
     cycle_dir = circ.get('cycle_dir', 'NEUTRAL')
@@ -4008,6 +4309,9 @@ def print_circuit_block(circ, label_map):
 
     rev_type  = circ.get('reversal_type', '—')
     rev_tgt   = circ.get('reversal_target')
+    rev_tgt_fft   = circ.get('reversal_target_fft')
+    rev_tgt_swing = circ.get('reversal_target_swing')
+    rev_tgt_emp   = circ.get('reversal_target_emp')
     rev_pct   = circ.get('reversal_pct')
     rev_bar   = circ.get('reversal_bar_est')
     bars_rem  = circ.get('bars_to_reversal')
@@ -4032,8 +4336,6 @@ def print_circuit_block(circ, label_map):
     else:                        dir_icon = '→ NEUTRAL'
 
     # quadrant display in the arc diagram
-    # ASCII 360° arc: [Q1·····Q2·····|·····Q3·····Q4]
-    # Mark current quadrant with ▶
     def _arc(cur_q, cdir):
         """ASCII sinusoidal arc showing current quadrant."""
         labels = ['Q1', 'Q2', 'Q3', 'Q4']
@@ -4076,8 +4378,8 @@ def print_circuit_block(circ, label_map):
     print(f'  │    Q3 180°–270°  Distribution past peak /  Decline from peak')
     print(f'  │    Q4 270°–360°  Exhaustion near trough /  Collapse from peak')
     print(f'  │')
-    print(f'  │  UP cycle  Q sequence : Q1 → Q2 → Q3 → Q4 → [reversal at Q4/0°]')
-    print(f'  │  DOWN cycle Q sequence: Q4 → Q3 → Q2 → Q1 → [reversal at Q1/180°]')
+    print(f'  │  UP cycle  Q sequence : Q1 → Q2 → Q3[REVERSAL TOP] → Q4 → next trough')
+    print(f'  │  DOWN cycle Q sequence: Q3 → Q4 → Q1[REVERSAL DIP] → Q2 → next peak')
     print(f'  └{"─"*w}┘')
     print()
 
@@ -4091,18 +4393,59 @@ def print_circuit_block(circ, label_map):
     print(f'  │  Sinusoid fit R²    : {r2}   '
           f'({"clean cycle ✔" if (r2 or 0) > 0.5 else "noisy — interpret with caution"})')
     print(f'  │')
-    print(f'  │  QUADRATURE BARS  (T/4 = {round(T/4.0, 1) if T else "?"} bars each segment)')
-    for k, v in qbars.items():
-        print(f'  │    {k:<12}: bar {v}')
+
+    # ── Quadrature with prices and cycle-aware labeling ──────────────
+    q_seg = round(T/4.0, 1) if T else '?'
+    print(f'  │  QUADRATURE BARS  (T/4 = {q_seg} bars each segment)  [{cycle_dir} CYCLE]')
+    if qbars:
+        cdir_q = qbars.get('cycle_dir', cycle_dir)
+        if cdir_q == 'UP':
+            _q_order = [
+                ('Q1_start',    'Q1_price',         'Q1_label',          '  0°  — TROUGH / entry'),
+                ('Q2_start',    'Q2_price',         'Q2_label',          ' 90°  — rising midline'),
+                ('Q3_start',    'Q3_price',         'Q3_label',          '180°  — ★ REVERSAL TOP'),
+                ('Q4_start',    'Q4_price',         'Q4_label',          '270°  — post-top decline'),
+                ('next_trough', 'next_trough_price','next_trough_label', '360°  — next trough / new cycle'),
+            ]
+        else:
+            _q_order = [
+                ('Q3_start', 'Q3_price', 'Q3_label', '180°  — PEAK / entry'),
+                ('Q4_start', 'Q4_price', 'Q4_label', '270°  — early collapse'),
+                ('Q1_start', 'Q1_price', 'Q1_label', '360°  — ★ REVERSAL DIP'),
+                ('Q2_start', 'Q2_price', 'Q2_label', ' 90°  — post-dip accumulation'),
+                ('next_peak', 'next_peak_price', 'next_peak_label', '180°  — next peak / new cycle'),
+            ]
+        for bk, pk, lk, ang_hint in _q_order:
+            bar_v  = qbars.get(bk)
+            pr_v   = qbars.get(pk)
+            lbl_v  = qbars.get(lk, '')
+            cur_mk = ' ◄ NOW' if (bar_v is not None
+                                  and angle is not None
+                                  and _assign_quadrant(angle) == bk.split('_')[0]
+                                  and bk.startswith('Q')) else ''
+            pr_s   = pf(pr_v) if pr_v else '—'
+            print(f'  │    {ang_hint}  bar {bar_v:<6}  price {pr_s}{cur_mk}')
     print(f'  └{"─"*w}┘')
     print()
 
-    # ── Section 4: Reversal forecast ─────────────────────────────────
+    # ── Section 4: Reversal forecast (consistent targets) ────────────
     rev_arr = '▲' if (rev_pct or 0) > 0 else '▼'
     print(f'  ┌─ REVERSAL FORECAST  (next circuit extremum) {"─"*22}┐')
     print(f'  │  Reversal type      : {rev_type}')
-    print(f'  │  Reversal target    : {pf(rev_tgt)}  ({rev_arr}{rev_pct:+.2f}%)'
-          if rev_pct is not None else f'  │  Reversal target    : {pf(rev_tgt)}')
+    # consistent target breakdown
+    if rev_tgt is not None:
+        rpct_s = f'{rev_arr}{rev_pct:+.2f}%' if rev_pct is not None else ''
+        print(f'  │  ── CONSISTENT TARGET (blended) ──────────────────────────')
+        print(f'  │  Reversal target    : {pf(rev_tgt)}  ({rpct_s})')
+        print(f'  │    ├ Swing extremum : {pf(rev_tgt_swing)}'
+              f'  ({round((rev_tgt_swing - cp)/(cp+1e-20)*100,2):+.2f}%)'
+              if rev_tgt_swing else '')
+        print(f'  │    ├ FFT projection : {pf(rev_tgt_fft)}'
+              f'  ({round((rev_tgt_fft - cp)/(cp+1e-20)*100,2):+.2f}%)'
+              if rev_tgt_fft else '')
+        print(f'  │    └ Empirical bar  : {pf(rev_tgt_emp)}'
+              f'  ({round((rev_tgt_emp - cp)/(cp+1e-20)*100,2):+.2f}%)'
+              if rev_tgt_emp else '')
     print(f'  │  At bar est.        : {rev_bar}  ({bars_rem} bars remaining)')
     print(f'  │  φ-extension target : {phi_lbl}')
     print(f'  │    [{pp(phi_ext)}]')
@@ -4145,7 +4488,78 @@ def print_circuit_block(circ, label_map):
     print(f'  └{"─"*w}┘')
     print()
 
+    # ── Section 7: Per-timeframe circuit table ────────────────────────
+    if mtf_tf_results:
+        print(f'  ┌─ MTF CIRCUIT TABLE  (all timeframes) {"─"*30}┐')
+        hdr = (f'  │  {"TF":<5}  {"Dir":<5}  {"Q":<3}  {"Angle":>7}  '
+               f'{"R²":>6}  {"T-bars":>7}  {"Target":>12}  '
+               f'{"Δ%":>7}  {"φ-Ext":>12}  {"BarsLeft":>8}')
+        print(hdr)
+        print(f'  │  {"─"*90}')
+        for r in mtf_tf_results:
+            tf_s   = r.get('tf', '—')
+            cdir_s = r.get('cycle_dir') or '—'
+            q_s    = r.get('current_quadrant') or '—'
+            ang_s  = f'{r.get("current_angle_deg",0.0):.1f}°' if r.get('current_angle_deg') is not None else '—'
+            r2_s   = f'{r.get("sinusoid_r2",0.0):.3f}' if r.get('sinusoid_r2') is not None else '—'
+            T_s    = str(r.get('dominant_period') or '—')
+            tgt_s  = pf(r.get('reversal_target'))
+            pct_s  = (f'{r.get("reversal_pct",0.0):+.2f}%'
+                      if r.get('reversal_pct') is not None else '—')
+            ext_s  = pf(r.get('phi_target_ext'))
+            bleft  = str(r.get('bars_to_reversal') or '—')
+            err_s  = f'  [!{r.get("error","")[:20]}]' if r.get('error') else ''
+            # mark current cycle direction
+            dir_mk = '▲' if cdir_s == 'UP' else ('▼' if cdir_s == 'DOWN' else '→')
+            rev_mk = '★' if q_s in ('Q3','Q4') and cdir_s == 'UP' else \
+                     ('★' if q_s in ('Q1','Q2') and cdir_s == 'DOWN' else ' ')
+            print(f'  │  {tf_s:<5}  {dir_mk}{cdir_s:<4}  {rev_mk}{q_s:<2}  {ang_s:>7}  '
+                  f'{r2_s:>6}  {T_s:>7}  {tgt_s:>12}  '
+                  f'{pct_s:>7}  {ext_s:>12}  {bleft:>8}{err_s}')
+        print(f'  └{"─"*w}┘')
+        print()
+
+    # ── Section 8: MTF ML aggregate targets ──────────────────────────
+    if mtf_summary and mtf_summary.get('mtf_target') is not None:
+        ms     = mtf_summary
+        mtgt   = ms['mtf_target']
+        mtpct  = ms.get('mtf_target_pct', 0.0)
+        mext   = ms.get('mtf_phi_ext')
+        mconf  = ms.get('mtf_confidence', 0.0)
+        mdir   = ms.get('dominant_cycle_dir', '—')
+        mq     = ms.get('dominant_quadrant', '—')
+        nv     = ms.get('n_valid_tfs', 0)
+        rlo    = ms.get('target_range_low')
+        rhi    = ms.get('target_range_high')
+        best_r2_tf = ms.get('best_r2_tf', '—')
+        mconf_bar  = '█' * int(mconf * 20) + '░' * (20 - int(mconf * 20))
+        marr   = '▲' if (mtpct or 0) > 0 else '▼'
+
+        if   mconf >= 0.65: mgrade = 'HIGH MTF AGREEMENT ★★★'
+        elif mconf >= 0.45: mgrade = 'MODERATE MTF AGREEMENT ★★'
+        elif mconf >= 0.25: mgrade = 'WEAK MTF AGREEMENT ★'
+        else:               mgrade = 'LOW MTF CONFIDENCE'
+
+        print(f'  ┌─ MTF ML AGGREGATE TARGET  ({nv} valid TFs) {"─"*25}┐')
+        print(f'  │  Dominant direction : {mdir}  (dominant quadrant: {mq})')
+        print(f'  │  Best R² timeframe  : {best_r2_tf}')
+        print(f'  │  ──────────────────────────────────────────────────────────────')
+        print(f'  │  ★ MTF TARGET        : {pf(mtgt)}  ({marr}{mtpct:+.2f}%)')
+        print(f'  │    Target range     : {pf(rlo)}  →  {pf(rhi)}')
+        if mext:
+            mext_pct = (mext - cp) / (cp + 1e-20) * 100.0
+            print(f'  │    φ-Ext MTF target : {pf(mext)}  ({marr}{mext_pct:+.2f}%)')
+        print(f'  │  MTF Confidence     : {mconf:.4f}  [{mconf_bar}]  {mgrade}')
+        print(f'  └{"─"*w}┘')
+        print()
+
     # ── FINAL SUMMARY ───────────────────────────────────────────────
+    # Use MTF ML target if available, else fall back to 1m circuit target
+    summary_tgt     = (mtf_summary.get('mtf_target') if mtf_summary else None) or rev_tgt
+    summary_tgt_pct = (mtf_summary.get('mtf_target_pct') if mtf_summary else None) or rev_pct
+    summary_ext     = (mtf_summary.get('mtf_phi_ext') if mtf_summary else None) or phi_ext
+    s_arr = '▲' if (summary_tgt_pct or 0) > 0 else '▼'
+
     print(f'  {"═"*w}')
     print(f'  ★★★  360° CIRCUIT DECISION  ·  {lbl}')
     print(f'  {"═"*w}')
@@ -4154,10 +4568,14 @@ def print_circuit_block(circ, label_map):
     print(f'  ▶  REVERSAL TYPE      : {rev_type}')
     print(f'  ▶  REVERSAL TARGET    : {pf(rev_tgt)}'
           + (f'  ({rev_arr}{rev_pct:+.2f}%)' if rev_pct is not None else ''))
-    print(f'  ▶  φ-EXT TARGET       : {pf(phi_ext)}  [{phi_lbl}]')
+    print(f'  ▶  MTF ML TARGET      : {pf(summary_tgt)}'
+          + (f'  ({s_arr}{summary_tgt_pct:+.2f}%)' if summary_tgt_pct is not None else ''))
+    print(f'  ▶  φ-EXT TARGET (MTF) : {pf(summary_ext)}')
     print(f'  ▶  BARS TO REVERSAL   : ~{bars_rem}  (bar {rev_bar} est)')
     print(f'  ▶  VOLUME SIGNAL      : {vol_lbl}')
     print(f'  ▶  CONFIDENCE         : {conf:.4f}  [{cgrade}]')
+    if mtf_summary:
+        print(f'  ▶  MTF CONFIDENCE     : {mtf_summary.get("mtf_confidence",0.0):.4f}')
     print()
     print(f'  {"═"*w}\n')# [0.6180, 0.3820, 0.2361, 0.1459, 0.0902, 0.0557, 0.0344]
 PHI_NEG_LABELS  = [f'φ⁻{n} ({PHI**-n:.4f})' for n in range(1, 8)]
@@ -4860,12 +5278,21 @@ while True:
             #  maps current price to circuit angle + quadrant, and
             #  forecasts the incoming reversal target (support dip
             #  or resistance top) with volume cause-effect rules.
+            #  Also runs across ALL timeframes and produces MTF ML targets.
             print(f'  Running 360° Sinusoidal Circuit Engine on {lbl}...')
             circ = sinusoidal_circuit_engine(
                 best_symbol, current_price, sel_detail,
                 stf_results=stf_results, htf_results=htf_results
             )
-            print_circuit_block(circ, label_map)
+            # ── MTF multi-timeframe circuit ───────────────────────
+            print(f'  Running MTF Sinusoidal Circuit across all timeframes...')
+            mtf_tf_results, mtf_summary = sinusoidal_circuit_mtf(
+                best_symbol, current_price, sel_detail,
+                stf_results=stf_results, htf_results=htf_results
+            )
+            print_circuit_block(circ, label_map,
+                                 mtf_tf_results=mtf_tf_results,
+                                 mtf_summary=mtf_summary)
         else:
             print('  FFT: insufficient data for forecast.\n')
     else:
