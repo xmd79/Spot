@@ -3720,11 +3720,32 @@ def _run_circuit_on_tf(pair, tf, limit, current_price):
     }
     try:
         klines    = trader.client.get_klines(symbol=pair, interval=tf, limit=limit)
-        close_arr = np.array([float(k[4]) for k in klines], dtype=np.float64)
-        low_arr   = np.array([float(k[3]) for k in klines], dtype=np.float64)
-        high_arr  = np.array([float(k[2]) for k in klines], dtype=np.float64)
-        n         = len(close_arr)
-        if n < 64:
+        close_raw = np.array([float(k[4]) for k in klines], dtype=np.float64)
+        low_raw   = np.array([float(k[3]) for k in klines], dtype=np.float64)
+        high_raw  = np.array([float(k[2]) for k in klines], dtype=np.float64)
+
+        # If the initial fetch came back short, retry with the maximum allowed
+        # limit so we use every available bar on the exchange for this TF.
+        if len(close_raw) < 64:
+            klines    = trader.client.get_klines(symbol=pair, interval=tf, limit=1000)
+            close_raw = np.array([float(k[4]) for k in klines], dtype=np.float64)
+            low_raw   = np.array([float(k[3]) for k in klines], dtype=np.float64)
+            high_raw  = np.array([float(k[2]) for k in klines], dtype=np.float64)
+
+        # Strip zero and NaN values — keep only rows where all three arrays
+        # are finite and strictly positive (i.e. real traded candles).
+        _valid = (
+            np.isfinite(close_raw) & (close_raw > 0) &
+            np.isfinite(low_raw)   & (low_raw   > 0) &
+            np.isfinite(high_raw)  & (high_raw  > 0)
+        )
+        close_arr = close_raw[_valid]
+        low_arr   = low_raw[_valid]
+        high_arr  = high_raw[_valid]
+
+        n = len(close_arr)
+        # Hard floor: need at least 16 bars for a meaningful FFT + sinusoid fit
+        if n < 16:
             r['error'] = 'insufficient data'; return r
 
         swing_low  = float(np.min(low_arr))
