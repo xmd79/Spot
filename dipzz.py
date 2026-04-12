@@ -1,3 +1,4 @@
+import gc
 from binance.client import Client
 import numpy as np
 import talib as ta
@@ -77,7 +78,6 @@ class Trader:
         return []
 
     def get_klines_extended(self, symbol: str, interval: str, total: int = 1200):
-        """Fetch up to 1200 klines via multiple API calls."""
         MAX = 1000
         if total <= MAX:
             return self.get_klines(symbol, interval, limit=total, return_raw=True)
@@ -122,7 +122,6 @@ def linear_regression_dip(close: List[float], deviation: float = 0.01) -> bool:
     trend = slope * x + intercept
     lower_band = trend * (1 - deviation)
     return close[-1] < lower_band[-1]
-
 
 def has_bullish_rejection_volume(raw_klines: list, window: int = 10) -> Tuple[bool, float]:
     if not raw_klines or len(raw_klines) < window:
@@ -251,7 +250,6 @@ def volume_profile_at_level(level_price: float, raw_klines: list,
     total = bull_vol + bear_vol
     bp = bull_vol / total if total > 0 else 0.5
 
-    # Exhaustion: compare first half vs second half volume
     exh = 0.0
     exh_detail = "N/A"
     if len(vol_seq) >= 6:
@@ -293,7 +291,6 @@ def volume_profile_at_level(level_price: float, raw_klines: list,
 
 def detect_extreme_exhaustion(extreme_price: float, direction: str,
                                raw_klines: list, zone_pct: float = 0.04) -> Dict:
-    n = len(raw_klines)
     if direction == 'high':
         z_lo = extreme_price * (1 - zone_pct)
         z_hi = extreme_price * (1 + zone_pct * 0.5)
@@ -410,7 +407,6 @@ def estimate_eta(dist_pct: float, range_pct: float, vol_bias: float) -> str:
 def analyze_lookback(raw_klines: list, close: np.ndarray, highs: np.ndarray,
                       lows: np.ndarray, current_price: float, lookback: int,
                       avg_range_pct: float, vol_bias: float) -> Dict:
-    """Full structural analysis for one lookback window."""
     ext = get_structural_extremes(close, highs, lows, lookback)
 
     if ext['range_pct'] < 0.1:
@@ -422,7 +418,6 @@ def analyze_lookback(raw_klines: list, close: np.ndarray, highs: np.ndarray,
     tolerance = max(ext['range_size'] * 0.025,
                     avg_range_pct / 100 * current_price * 1.5)
 
-    # Slice klines to match lookback
     n = len(close)
     start = max(0, n - lookback)
     klines_slice = raw_klines[start:]
@@ -482,7 +477,6 @@ def analyze_lookback(raw_klines: list, close: np.ndarray, highs: np.ndarray,
 
 
 def get_sr_targets(raw_klines: list, current_price: float) -> Dict:
-    """Run structural analysis for 500, 800, and 1200 lookbacks."""
     if len(raw_klines) < 100:
         return {'lookbacks': [], 'vol_bias': 0.5, 'avg_range': 0}
 
@@ -494,7 +488,6 @@ def get_sr_targets(raw_klines: list, current_price: float) -> Dict:
     candle_ranges = (highs - lows) / (closes + 1e-12) * 100.0
     avg_range = float(np.mean(candle_ranges[-50:]))
 
-    # Volume bias from last 20 CLOSED candles (skip unclosed)
     closed_vols = [v for v in volumes[-21:-1] if v > 0]
     if closed_vols:
         rec = raw_klines[-21:-1]
@@ -516,23 +509,12 @@ def get_sr_targets(raw_klines: list, current_price: float) -> Dict:
 
 
 # ==========================================
-# CONCURRENT FILTER FUNCTIONS
+# CONCURRENT FILTER FUNCTIONS (ALL USE SAME LOGIC)
 # ==========================================
 
 def check_tf_dip(trader, symbol, interval):
     close = trader.get_klines(symbol, interval, limit=300)
     return (symbol, linear_regression_dip(close, 0.01))
-
-
-def check_5m_rejection(trader, symbol):
-    klines = trader.get_klines(symbol, '5m', limit=300, return_raw=True)
-    if not klines:
-        return (symbol, False, 0.0)
-    close = [float(k[4]) for k in klines]
-    if linear_regression_dip(close, 0.01):
-        ok, ratio = has_bullish_rejection_volume(klines, window=10)
-        return (symbol, ok, ratio)
-    return (symbol, False, 0.0)
 
 
 def check_1m_final(trader, symbol):
@@ -546,7 +528,6 @@ def check_1m_final(trader, symbol):
     cmo = ta.CMO(np.asarray(close), timeperiod=14)
     cmo_val = float(cmo[-1]) if not np.isnan(cmo[-1]) else 0.0
 
-    # Use last CLOSED candle for vol ratio (skip unclosed candle with vol=0)
     closed_vols = [v for v in volumes[:-1] if v > 0]
     if closed_vols:
         avg_vol = np.mean(closed_vols[-50:])
@@ -560,9 +541,8 @@ def check_1m_final(trader, symbol):
     prob = ml_spike_probability(metrics["R"], metrics["C"], metrics["E"],
                                 bull_ratio, cmo_val, vratio)
 
-    is_strong = ((cmo_val < -50) and is_rej and
-                 (metrics["C"] > np.mean([v for v in volumes[-50:] if v > 0] or [1])) and
-                 (prob > 0.65))
+    is_strong = linear_regression_dip(close, 0.01)
+    
     return (symbol, cmo_val, vratio, is_strong, bull_ratio, prob)
 
 
@@ -607,26 +587,6 @@ def run_tf_filter(trader, symbols, interval, max_workers=20):
     return passed
 
 
-def run_5m_filter(trader, symbols, max_workers=15):
-    passed, best = [], 0.0
-    tracker = ProgressTracker(len(symbols), "5m+Rej filter")
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(check_5m_rejection, trader, s): s for s in symbols}
-        for f in as_completed(futures):
-            try:
-                sym, ok, ratio = f.result()
-                if ok:
-                    passed.append(sym)
-                    if ratio > best:
-                        best = ratio
-                tracker.update(passed=ok)
-                print(tracker.get_stats(), end="", flush=True)
-            except:
-                tracker.update()
-    print(f"\r{tracker.get_stats()}" + " " * 20)
-    return passed, best
-
-
 def run_1m_filter(trader, symbols, max_workers=15):
     results = []
     tracker = ProgressTracker(len(symbols), "1m filter")
@@ -663,12 +623,11 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
     print(f"  Entry Price    : {current_price:.10f}")
     print(f"  1m CMO         : {cmo_val:+.2f}  (< -50 = oversold)")
     print(f"  Vol Ratio      : x{vratio:.2f}")
-    print(f"  Bull Rej Vol   : {bull_ratio*100:.1f}%  (>65% = confirmed)")
+    print(f"  Bull Rej Vol   : {bull_ratio*100:.1f}%")
     print(f"  ML Spike Prob  : {ml_prob*100:.1f}%")
     print(f"  1m Vol Bias    : {bias_lbl}  ({bp_pct:.1f}% bull / {100-bp_pct:.1f}% bear)")
     print(f"  Avg 1m Range   : {avg_r:.4f}%")
 
-    # Per-TF volume breakdown
     print("-" * W)
     print("  📊  VOLUME BREAKDOWN BY TIMEFRAME")
     for tf, vd in tf_volumes.items():
@@ -678,9 +637,8 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
         bar = "🟢" * bull_len + "🔴" * bear_len
         print(f"  {tf:>4s}  [{bar}]  Bull: {vd['bull_pct']:.1f}%  Bear: {vd['bear_pct']:.1f}%")
 
-    # Per-lookback analysis
+    # ONLY TRACK SIGNALS NOW
     all_signals = []
-    all_warnings = []
 
     for lb_data in sr['lookbacks']:
         lb = lb_data['lookback']
@@ -700,7 +658,6 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
         print(f"  More Recent     : {ext['mr_label']}")
         print(f"  Min Target Dist : {min_d:.3f}%")
 
-        # Position bar
         pos_pct = pos * 100
         blen = 40
         bpos = int(pos * blen)
@@ -709,13 +666,10 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
                    'near HIGH' if pos > 0.75 else 'mid-range')
         print(f"  Position        : [{pbar}]  {pos_pct:.1f}%  ({pos_txt})")
 
-        # Exhaustion
         print(f"\n  🫁  Exhaustion at HIGH: ", end="")
         if exh_h.get('exhaustion', 0) > 0.5:
             print(f"🔴 {exh_h['pattern']} ({exh_h['exhaustion']:.2f})")
             print(f"     {exh_h['detail']}")
-            if pos > 0.5:
-                all_warnings.append(f"[{lb}] Buying exhaustion at high")
         elif exh_h.get('exhaustion', 0) > 0.2:
             print(f"🟡 {exh_h['pattern']} ({exh_h['exhaustion']:.2f})")
             print(f"     {exh_h['detail']}")
@@ -736,13 +690,11 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
             print(f"⚪ {exh_l.get('pattern', 'NONE')} ({exh_l.get('exhaustion', 0):.2f})")
             print(f"     {exh_l.get('detail', '')}")
 
-        # Recency-based bias
         if ext['more_recent'] == 'ARGMIN':
             all_signals.append(f"[{lb}] ARGMIN more recent → recent floor")
         elif ext['more_recent'] == 'ARGMAX':
-            all_warnings.append(f"[{lb}] ARGMAX more recent → recent ceiling")
+            all_signals.append(f"[{lb}] ARGMAX more recent → recent ceiling")
 
-        # Fib grid compact
         grid = lb_data['grid']
         if grid:
             print(f"\n  📊  Fibonacci Grid (volume profile)")
@@ -756,7 +708,6 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
                       f"{g['bull_pct']*100:>5.0f}% {g['touches']:>4} {g['total_rej']:>4} "
                       f"{g['exhaustion']:>4.2f} {g['verdict']:<10} {st}")
 
-        # Targets UP
         up = lb_data['targets_up']
         if up:
             print(f"\n  📈  RESISTANCE TARGETS ({lb} bars)\n")
@@ -781,7 +732,6 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
         else:
             print(f"\n  📈  No resistance targets beyond {min_d:.3f}% minimum.\n")
 
-        # Targets DOWN
         dn = lb_data['targets_down']
         if dn:
             print(f"  📉  SUPPORT LEVELS ({lb} bars)\n")
@@ -806,14 +756,10 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
         else:
             print(f"  📉  No support levels beyond {min_d:.3f}% minimum.\n")
 
-    # ========================================
-    # CONSOLIDATED TRADE BIAS
-    # ========================================
     print("=" * W)
     print("  ⚡  CONSOLIDATED TRADE BIAS")
     print("=" * W)
 
-    # Check recency across all lookbacks
     argmin_count = sum(1 for lb in sr['lookbacks']
                        if lb['extremes']['more_recent'] == 'ARGMIN')
     argmax_count = sum(1 for lb in sr['lookbacks']
@@ -826,30 +772,19 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
 
     if argmin_count > argmax_count:
         all_signals.append(f"ARGMIN dominant across lookbacks ({argmin_count}/{total_lb})")
-    elif argmax_count > argmin_count:
-        all_warnings.append(f"ARGMAX dominant across lookbacks ({argmax_count}/{total_lb})")
 
-    # Volume bias
     if vb > 0.55:
         all_signals.append(f"1m Bullish vol bias ({vb*100:.0f}%)")
-    elif vb < 0.45:
-        all_warnings.append(f"1m Bearish vol bias ({vb*100:.0f}%)")
 
-    # CMO
     if cmo_val < -50:
         all_signals.append(f"CMO oversold ({cmo_val:.0f})")
-    elif cmo_val > 50:
-        all_warnings.append(f"CMO overbought ({cmo_val:.0f})")
 
-    # Rejection
     if bull_ratio > 0.65:
         all_signals.append(f"Bull rejection vol ({bull_ratio*100:.0f}%)")
 
-    # ML
     if ml_prob > 0.65:
         all_signals.append(f"ML spike prob ({ml_prob*100:.0f}%)")
 
-    # Best target/stop from widest lookback
     best_up = best_dn = None
     for lb in reversed(sr['lookbacks']):
         if not best_up and lb['targets_up']:
@@ -868,125 +803,241 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
         print(f"  R:R         : {rr:.2f}x")
         if rr >= 1.5:
             all_signals.append(f"R:R favorable ({rr:.1f}x)")
-        elif rr < 1.0:
-            all_warnings.append(f"R:R unfavorable ({rr:.1f}x)")
     elif best_up:
         print(f"\n  Target only : {best_up['label']:5s}  {best_up['price']:.10f}  "
               f"({best_up['dist_pct']:+.3f}%)")
-        all_warnings.append("No structural stop found")
     elif best_dn:
         print(f"\n  Support only: {best_dn['label']:5s}  {best_dn['price']:.10f}  "
               f"({best_dn['dist_pct']:+.3f}%)")
-        all_warnings.append("No structural target found")
     else:
         print("\n  No structural levels found.")
-        all_warnings.append("No targets in any lookback")
 
-    print(f"\n  Signals ({len(all_signals)}):")
+    # ONLY PRINT SIGNALS (WARNINGS COMPLETELY REMOVED)
+    ns = len(all_signals)
+    print(f"\n  Structural Signals ({ns}):")
     for s in all_signals:
         print(f"    ✅  {s}")
-    if all_warnings:
-        print(f"  Warnings ({len(all_warnings)}):")
-        for w in all_warnings:
-            print(f"    ⚠️   {w}")
 
-    ns, nw = len(all_signals), len(all_warnings)
     print()
-    if ns >= 4 and nw == 0:
-        v = "✅  STRONG LONG  —  Multiple structural confirmations"
-    elif ns >= 3 and nw <= 1:
-        v = "✅  LONG  —  Good structural alignment"
-    elif ns >= 2 and nw <= 1:
-        v = "⏳  PROBABLE LONG  —  Awaiting final confirmation"
-    elif nw >= 2:
-        v = "⛔  SKIP  —  Structural warnings present"
-    elif ns >= 1:
-        v = "⏳  WEAK SIGNAL  —  Insufficient confirmation"
-    else:
-        v = "⚪  NEUTRAL  —  No clear structural bias"
+    if ns >= 4: v = "✅  STRONG LONG  —  Multiple structural confirmations"
+    elif ns >= 3: v = "✅  LONG  —  Good structural alignment"
+    elif ns >= 2: v = "⏳  PROBABLE LONG  —  Awaiting final confirmation"
+    elif ns >= 1: v = "⏳  WEAK SIGNAL  —  Insufficient confirmation"
+    else: v = "⚪  NEUTRAL  —  No clear structural bias"
 
     print(f"  VERDICT : {v}")
     print("=" * W + "\n")
+    
+    return v, ns
+
+
+def print_rescan_banner(scan_count: int, reason: str):
+    W = 78
+    print("\n" + "╔" + "═" * W + "╗")
+    print("║" + " " * W + "║")
+    print("║" + f"  🔄  RESCAN #{scan_count} INITIATED".ljust(W) + "║")
+    print("║" + " " * W + "║")
+    print("║" + f"  Reason: {reason}".ljust(W)[:W] + "║")
+    print("║" + " " * W + "║")
+    print("║" + "  ⏰  Clearing memory & fetching fresh data in 5s...".ljust(W) + "║")
+    print("║" + " " * W + "║")
+    print("╚" + "═" * W + "╝")
+
+
+def print_scan_header(scan_count: int):
+    W = 78
+    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+    print("\n" + "╔" + "═" * W + "╗")
+    print("║" + " " * W + "║")
+    print("║" + f"  🔍  MTF SCANNER  —  SCAN #{scan_count}".ljust(W) + "║")
+    print("║" + f"  📅  {timestamp}".ljust(W) + "║")
+    print("║" + " " * W + "║")
+    print("║" + "  Multi-Lookback Structural Range Engine".ljust(W) + "║")
+    print("║" + "  (500 / 800 / 1200 bar argmin·argmax · fib grid · exhaustion)".ljust(W) + "║")
+    print("║" + " " * W + "║")
+    print("╚" + "═" * W + "╝\n")
 
 
 # ==========================================
-# MAIN
+# MAIN WITH WHILE LOOP RESCAN & GC CLEANUP
 # ==========================================
 
 def main():
-    start_time = time.time()
-    trader = Trader('credentials.txt')
-    trading_pairs = trader.get_usdc_pairs()
+    total_start_time = time.time()
+    scan_count = 0
+    
+    RESCAN_INTERVAL_SECONDS = 5  
 
-    W = 74
+    W = 78
     print("=" * W)
-    print("  MTF SCANNER  +  MULTI-LOOKBACK STRUCTURAL RANGE ENGINE")
-    print("  (500 / 800 / 1200 bar argmin·argmax · fib grid · exhaustion)")
-    print("=" * W + "\n")
-
-    filtered1 = run_tf_filter(trader, trading_pairs, '2h', 20)
-    if not filtered1:
-        print("No 2h dips. Exiting.")
-        sys.exit(0)
-
-    filtered2 = run_tf_filter(trader, filtered1, '15m', 15)
-    if not filtered2:
-        print("No 15m dips. Exiting.")
-        sys.exit(0)
-
-    filtered3, _ = run_5m_filter(trader, filtered2, 15)
-    if not filtered3:
-        print("\nNo 5m dips with Bullish Rejection Volume. Exiting.")
-        sys.exit(0)
-
-    results_1m = run_1m_filter(trader, filtered3, 15)
-
-    strong = [r for r in results_1m if r[3] is True]
-    if strong:
-        final = max(strong, key=lambda x: (x[5], -x[1]))
-        mode = "STRONG + ML ENERGY"
-    elif results_1m:
-        final = min(results_1m, key=lambda x: x[1])
-        mode = "FALLBACK (Best CMO)"
-    else:
-        print("\nFailed to fetch 1m data. Exiting.")
-        sys.exit(0)
-
-    sym, cmo_val, vratio, _, live_bull_ratio, ml_prob = final
-
-    print("\n" + "-" * W)
-    print(f"  SELECTED SYMBOL : {sym}")
-    print(f"  SELECTION MODE  : {mode}")
-    print(f"  1m CMO          : {cmo_val:.4f}")
-    print(f"  1m Vol Ratio    : x{vratio:.4f}")
-    print(f"  Bull Rej Vol    : {live_bull_ratio*100:.2f}%")
-    print(f"  ML Spike Prob   : {ml_prob*100:.2f}%")
-    print("-" * W)
-
-    # Per-TF volume breakdown
-    print("\nFetching volume breakdown per timeframe...")
-    tf_volumes = {}
-    for tf in ['1m', '5m', '15m', '1h', '2h']:
-        tf_volumes[tf] = get_volume_breakdown(trader, sym, tf, limit=100)
-
-    # Fetch up to 1200 1m klines
-    print("Fetching up to 1200 1m klines for multi-lookback analysis...")
-    klines_1m = trader.get_klines_extended(sym, '1m', total=1200)
-    if not klines_1m:
-        print("Could not fetch 1m klines. Exiting.")
-        sys.exit(0)
-    print(f"Retrieved {len(klines_1m)} klines")
-
-    current_price = float(klines_1m[-1][4])
-
-    # Run multi-lookback structural engine
-    sr = get_sr_targets(klines_1m, current_price)
-
-    # Print
-    format_sr_output(sym, sr, current_price,
-                     cmo_val, vratio, live_bull_ratio, ml_prob, tf_volumes)
-
-    print(f"Total Execution Time: {time.time() - start_time:.1f}s")
+    print("  🚀  MTF DIP SCANNER  —  CONTINUOUS MODE")
+    print("  Scans until valid MTF dip is found, then EXITS")
+    print("=" * W)
+    print(f"\n  Configuration:")
+    print(f"    Rescan Interval    : {RESCAN_INTERVAL_SECONDS}s (Aggressive)")
+    print(f"    Memory Management  : Forced GC + Fresh Client per iteration")
+    print(f"    Filter Logic       : Uniform 'linear_regression_dip' across all TFs")
+    print(f"    Exit Logic         : Instant exit on MTF dip (No Warnings checked)")
+    print(f"\n  Bot will keep rescanning until a dip is found.")
+    print(f"  Press Ctrl+C to manually exit.\n")
+    
+    while True:
+        scan_count += 1
+        scan_start_time = time.time()
+        
+        print_scan_header(scan_count)
+        
+        trader = None
+        trading_pairs = None
+        filtered1 = None
+        filtered2 = None
+        filtered3 = None
+        results_1m = None
+        tf_volumes = None
+        klines_1m = None
+        sr = None
+        
+        try:
+            trader = Trader('credentials.txt')
+            trading_pairs = trader.get_usdc_pairs()
+            
+            filtered1 = run_tf_filter(trader, trading_pairs, '2h', 20)
+            if not filtered1:
+                reason = "No 2h dips found"
+                print(f"\n  ⚠️  {reason}")
+                print_rescan_banner(scan_count, reason)
+                
+                del trader, trading_pairs, filtered1
+                gc.collect()
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
+            
+            filtered2 = run_tf_filter(trader, filtered1, '15m', 15)
+            if not filtered2:
+                reason = f"No 15m dips found (from {len(filtered1)} 2h dips)"
+                print(f"\n  ⚠️  {reason}")
+                print_rescan_banner(scan_count, reason)
+                
+                del trader, trading_pairs, filtered1, filtered2
+                gc.collect()
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
+            
+            filtered3 = run_tf_filter(trader, filtered2, '5m', 15)
+            if not filtered3:
+                reason = f"No 5m dips found (from {len(filtered2)} 15m dips)"
+                print(f"\n  ⚠️  {reason}")
+                print_rescan_banner(scan_count, reason)
+                
+                del trader, trading_pairs, filtered1, filtered2, filtered3
+                gc.collect()
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
+            
+            results_1m = run_1m_filter(trader, filtered3, 15)
+            
+            if not results_1m:
+                reason = "Failed to fetch 1m data for final filtering"
+                print(f"\n  ⚠️  {reason}")
+                print_rescan_banner(scan_count, reason)
+                
+                del trader, trading_pairs, filtered1, filtered2, filtered3, results_1m
+                gc.collect()
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
+            
+            strong = [r for r in results_1m if r[3] is True]
+            if strong:
+                final = max(strong, key=lambda x: (x[5], -x[1]))
+                mode = "STRONG + ML ENERGY"
+            else:
+                final = min(results_1m, key=lambda x: x[1])
+                mode = "FALLBACK (Best CMO)"
+            
+            sym, cmo_val, vratio, is_strong_1m, live_bull_ratio, ml_prob = final
+            
+            print("\n" + "-" * W)
+            print(f"  SELECTED SYMBOL : {sym}")
+            print(f"  SELECTION MODE  : {mode}")
+            print(f"  1m CMO          : {cmo_val:.4f}")
+            print(f"  1m Vol Ratio    : x{vratio:.4f}")
+            print(f"  Bull Rej Vol    : {live_bull_ratio*100:.2f}%")
+            print(f"  ML Spike Prob   : {ml_prob*100:.2f}%")
+            print(f"  1m Strong       : {'YES' if is_strong_1m else 'NO'}")
+            print("-" * W)
+            
+            tf_volumes = {}
+            for tf in ['1m', '5m', '15m', '1h', '2h']:
+                tf_volumes[tf] = get_volume_breakdown(trader, sym, tf, limit=100)
+            
+            klines_1m = trader.get_klines_extended(sym, '1m', total=1200)
+            if not klines_1m:
+                reason = f"Could not fetch 1m klines for {sym}"
+                print(f"\n  ⚠️  {reason}")
+                print_rescan_banner(scan_count, reason)
+                
+                del trader, trading_pairs, filtered1, filtered2, filtered3, results_1m, tf_volumes
+                gc.collect()
+                time.sleep(RESCAN_INTERVAL_SECONDS)
+                continue
+            print(f"Retrieved {len(klines_1m)} klines")
+            
+            current_price = float(klines_1m[-1][4])
+            
+            sr = get_sr_targets(klines_1m, current_price)
+            
+            verdict, num_signals = format_sr_output(
+                sym, sr, current_price,
+                cmo_val, vratio, live_bull_ratio, ml_prob, tf_volumes
+            )
+            
+            # ==========================================
+            # MTF DIP FOUND -> EXIT IMMEDIATELY 
+            # ==========================================
+            total_time = time.time() - total_start_time
+            print("\n" + "╔" + "═" * W + "╗")
+            print("║" + " " * W + "║")
+            print("║" + "  🎯🎯🎯  MTF DIP FOUND — BOT EXITING  🎯🎯🎯".ljust(W) + "║")
+            print("║" + " " * W + "║")
+            print("║" + f"  Symbol: {sym}".ljust(W) + "║")
+            print("║" + f"  Verdict: {verdict}".ljust(W)[:W] + "║")
+            print("║" + " " * W + "║")
+            print("║" + f"  Total Scans: {scan_count}".ljust(W) + "║")
+            print("║" + f"  Total Time: {total_time:.1f}s ({total_time/60:.1f} min)".ljust(W) + "║")
+            print("║" + " " * W + "║")
+            print("╚" + "═" * W + "╝\n")
+            
+            sys.exit(0)
+                
+        except KeyboardInterrupt:
+            total_time = time.time() - total_start_time
+            print("\n\n" + "╔" + "═" * W + "╗")
+            print("║" + " " * W + "║")
+            print("║" + "  ⛔  BOT STOPPED BY USER (Ctrl+C)".ljust(W) + "║")
+            print("║" + " " * W + "║")
+            print("║" + f"  Total Scans Completed: {scan_count}".ljust(W) + "║")
+            print("║" + f"  Total Runtime: {total_time:.1f}s ({total_time/60:.1f} min)".ljust(W) + "║")
+            print("║" + " " * W + "║")
+            print("╚" + "═" * W + "╝\n")
+            sys.exit(0)
+            
+        except Exception as e:
+            error_msg = str(e)[:60]
+            print(f"\n  ❌  Error during scan #{scan_count}: {error_msg}")
+            
+            if trader: del trader
+            if trading_pairs: del trading_pairs
+            if filtered1: del filtered1
+            if filtered2: del filtered2
+            if filtered3: del filtered3
+            if results_1m: del results_1m
+            if tf_volumes: del tf_volumes
+            if klines_1m: del klines_1m
+            if sr: del sr
+            
+            gc.collect()
+            time.sleep(RESCAN_INTERVAL_SECONDS)
+            continue
 
 
 if __name__ == "__main__":
