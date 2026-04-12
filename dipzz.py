@@ -10,7 +10,6 @@ from collections import deque
 
 
 class RateLimiter:
-    """Token bucket rate limiter to avoid API bans"""
     def __init__(self, requests_per_second: float = 15, burst: int = 25):
         self.rate = requests_per_second
         self.burst = burst
@@ -25,7 +24,6 @@ class RateLimiter:
                 elapsed = now - self.last_update
                 self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
                 self.last_update = now
-                
                 if self.tokens >= 1:
                     self.tokens -= 1
                     return
@@ -54,22 +52,22 @@ class Trader:
         print(f"Found {len(pairs)} USDC trading pairs")
         return pairs
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 500, return_volume: bool = False):
+    def get_klines(self, symbol: str, interval: str, limit: int = 500, return_raw: bool = False):
+        """Fetch klines. return_raw=True returns full kline list for OHLCV analysis."""
         self.rate_limiter.acquire()
         for attempt in range(3):
             try:
                 klines = self.client.get_klines(symbol=symbol, interval=interval, limit=limit)
+                if return_raw:
+                    return klines
                 close = [float(k[4]) for k in klines]
-                if return_volume:
-                    volume = [float(k[5]) for k in klines]
-                    return close, volume
                 return close
             except Exception as e:
                 if 'rate limit' in str(e).lower():
                     time.sleep(2 ** attempt * 2)
                 else:
                     time.sleep(0.5)
-        return [] if not return_volume else ([], [])
+        return [] if not return_raw else []
 
 
 # ==========================================
@@ -77,8 +75,7 @@ class Trader:
 # ==========================================
 
 def linear_regression_dip(close: List[float], deviation: float = 0.01) -> bool:
-    if len(close) < 20:
-        return False
+    if len(close) < 20: return False
     x = np.arange(len(close))
     slope, intercept = np.polyfit(x, close, 1)
     trend = slope * x + intercept
@@ -87,8 +84,7 @@ def linear_regression_dip(close: List[float], deviation: float = 0.01) -> bool:
 
 
 def has_pre_spike_volume_infusion(volumes: List[float], window: int = 50, threshold: float = 2.0) -> bool:
-    if len(volumes) < window + 10:
-        return False
+    if len(volumes) < window + 10: return False
     avg_volume = np.mean(volumes[-window-1:-1])
     last_volume = volumes[-1]
     recent_5_avg = np.mean(volumes[-6:-1]) if len(volumes) > 6 else last_volume
@@ -97,11 +93,42 @@ def has_pre_spike_volume_infusion(volumes: List[float], window: int = 50, thresh
     return spike and build_up
 
 
-def fft_ht_sine_forecast(close: List[float], volumes: List[float]) -> Optional[Dict]:
+def has_bullish_rejection_volume(raw_klines: list, window: int = 10) -> Tuple[bool, float]:
+    """
+    NEW FILTER: Confirms if volume at the dip zone is structurally bullish.
+    Returns (is_rejection_confirmed, bull_volume_ratio)
+    """
+    if not raw_klines or len(raw_klines) < window:
+        return False, 0.0
+    
+    recent_klines = raw_klines[-window:]
+    bull_vol = 0.0
+    bear_vol = 0.0
+    
+    for k in recent_klines:
+        o, c, v = float(k[1]), float(k[4]), float(k[5])
+        if c > o:      # Green candle (Bullish)
+            bull_vol += v
+        elif c < o:    # Red candle (Bearish)
+            bear_vol += v
+        # Dojis are ignored as they represent indecision, not directional volume
+            
+    total_dir_vol = bull_vol + bear_vol
+    if total_dir_vol == 0:
+        return False, 0.0
+        
+    bull_ratio = bull_vol / total_dir_vol
+    
+    # Rule: At least 65% of the directional volume must be bullish (green candles)
+    # This proves buyers are aggressively stepping in, rejecting the dip.
+    is_confirmed = bull_ratio > 0.65
+    return is_confirmed, bull_ratio
+
+
+def fft_ht_sine_forecast(close: List[float], volumes: List[float], bull_rejection_ratio: float) -> Optional[Dict]:
     """
     PURE DATA-DRIVEN Post-Dip Cycle Forecaster.
-    Zero hardcoded percentages. Target is derived strictly from Argmin/Argmax Hi-Lo Range
-    scaled dynamically by real volume ratios at those exact reversal points.
+    Target scales dynamically using the Bull Rejection Ratio instead of hardcoded %.
     """
     if len(close) < 500 or len(volumes) < 500:
         return None
@@ -112,9 +139,8 @@ def fft_ht_sine_forecast(close: List[float], volumes: List[float]) -> Optional[D
     try:
         sine, leadsine = ta.HT_SINE(data_close)
     except Exception:
-        return None
+        return False
         
-    # TA-Lib prepends NaNs. Align volume exactly with valid sine wave data.
     valid_idx = ~np.isnan(sine)
     if np.sum(valid_idx) < 100:
         return None
@@ -124,24 +150,19 @@ def fft_ht_sine_forecast(close: List[float], volumes: List[float]) -> Optional[D
     close_clean = data_close[valid_idx]
     vol_clean = data_vol[valid_idx]
     
-    # 1. Locate exact Argmin (Bottom) and Argmax (Top) of the sine wave
     idx_min = np.argmin(sine_clean)  
     idx_max = np.argmax(sine_clean)  
     
     cycle_low = close_clean[idx_min]
     cycle_high = close_clean[idx_max]
     
-    # 2. Extract REAL VOLUME at those exact structural points (5-candle average for stability)
     def get_vol_at_idx(arr, idx):
-        start = max(0, idx - 2)
-        end = min(len(arr), idx + 3)
+        start, end = max(0, idx - 2), min(len(arr), idx + 3)
         return np.mean(arr[start:end])
 
-    vol_at_cycle_bottom = get_vol_at_idx(vol_clean, idx_min)
     vol_at_cycle_top = get_vol_at_idx(vol_clean, idx_max)
     current_vol = vol_clean[-1]
     
-    # 3. FFT to find the dominant cycle period
     fft_vals = np.fft.rfft(sine_clean)
     if len(fft_vals) > 1:
         fft_magnitudes = np.abs(fft_vals[1:])
@@ -157,40 +178,37 @@ def fft_ht_sine_forecast(close: List[float], volumes: List[float]) -> Optional[D
     leadsine_crossed_up = leadsine_clean[-1] > sine_clean[-1]
     at_recent_bottom = distance_from_bottom <= (dominant_period * 1.2)
 
-    # --- PURE DATA TARGET CALCULATION ---
-    # Base target is exactly the Argmax price. No 75% bullshit.
     base_target = cycle_high
     
-    # Dynamic Volume Scaling: If current volume exceeds the volume that formed the last top,
-    # the cycle has more kinetic energy. Scale the target by that exact real-world ratio.
-    if vol_at_cycle_top > 0:
-        volume_momentum_ratio = current_vol / vol_at_cycle_top
-    else:
-        volume_momentum_ratio = 1.0
+    # --- DYNAMIC SCALING BASED STRICTLY ON STRUCTURAL DATA ---
+    # 1. Volume Momentum vs Old Top
+    vol_top_ratio = (current_vol / vol_at_cycle_top) if vol_at_cycle_top > 0 else 1.0
+    
+    # 2. Bullish Rejection Ratio (e.g., 0.85 means 85% of volume was green candles)
+    # We normalize this to a scale factor (0.85 -> 1.7x multiplier)
+    rejection_momentum = bull_rejection_ratio * 2.0 
+
+    # Combine the two real-world data points for the final scale
+    dynamic_scale = vol_top_ratio * rejection_momentum
 
     if leadsine_crossed_up:
         phase_status = "🚀 REVERSAL UP"
-        # If momentum ratio > 1.0, target mathematically exceeds the old Argmax
-        forecast_target = base_target * volume_momentum_ratio
+        forecast_target = base_target * dynamic_scale
     elif at_recent_bottom:
         phase_status = "⚡ EXHAUSTION DIP"
-        # Sitting at the bottom. Project to Argmax, scaled by current rejection volume vs top volume
-        forecast_target = base_target * volume_momentum_ratio
+        forecast_target = base_target * dynamic_scale
     else:
         phase_status = "🔄 ACCUMULATING"
-        # Far from bottom. Project mean-reversion exactly halfway between Argmin and Argmax
         mid_cycle_point = cycle_low + ((cycle_high - cycle_low) / 2)
         forecast_target = mid_cycle_point
         
-    # Safety check: never project a target lower than current price in a dip scenario
     forecast_target = max(forecast_target, current_price)
         
     return {
         'cycle_low': cycle_low,
         'cycle_high': cycle_high,
-        'vol_at_bottom': vol_at_cycle_bottom,
         'vol_at_top': vol_at_cycle_top,
-        'volume_momentum_ratio': volume_momentum_ratio,
+        'dynamic_scale': dynamic_scale,
         'dominant_period': dominant_period,
         'phase_status': phase_status,
         'forecast_target': forecast_target,
@@ -204,24 +222,47 @@ def fft_ht_sine_forecast(close: List[float], volumes: List[float]) -> Optional[D
 # ==========================================
 
 def check_tf_dip(trader: Trader, symbol: str, interval: str) -> Tuple[str, bool]:
+    """Standard dip check for higher timeframes (2h, 15m)"""
     close = trader.get_klines(symbol, interval, limit=300)
+    return (symbol, linear_regression_dip(close, 0.01))
+
+
+def check_5m_rejection(trader: Trader, symbol: str) -> Tuple[str, bool, float]:
+    """5m Filter: Must be a dip AND show Bullish Rejection Volume"""
+    klines = trader.get_klines(symbol, '5m', limit=300, return_raw=True)
+    if not klines: return (symbol, False, 0.0)
+    
+    close = [float(k[4]) for k in klines]
     is_dip = linear_regression_dip(close, 0.01)
-    return (symbol, is_dip)
-
-
-def check_1m_momentum_volume(trader: Trader, symbol: str) -> Tuple[str, float, float, bool]:
-    close, volumes = trader.get_klines(symbol, '1m', limit=200, return_volume=True)
-    if len(close) < 50 or len(volumes) < 50:
-        return (symbol, 0.0, 0.0, False)
+    
+    if is_dip:
+        is_rejection, ratio = has_bullish_rejection_volume(klines, window=10)
+        return (symbol, is_rejection, ratio)
         
+    return (symbol, False, 0.0)
+
+
+def check_1m_final(trader: Trader, symbol: str) -> Tuple[str, float, float, bool, float]:
+    """1m Filter: CMO, Pre-spike volume, AND Bullish Rejection"""
+    klines = trader.get_klines(symbol, '1m', limit=200, return_raw=True)
+    if not klines or len(klines) < 50:
+        return (symbol, 0.0, 0.0, False, 0.0)
+        
+    close = [float(k[4]) for k in klines]
+    volumes = [float(k[5]) for k in klines]
+    
     cmo = ta.CMO(np.asarray(close), timeperiod=14)
     cmo_val = cmo[-1] if not np.isnan(cmo[-1]) else 0.0
     
     avg_vol = np.mean(volumes[-51:-1]) if len(volumes) > 51 else np.mean(volumes[:-1])
     vratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
     
-    is_strong = (cmo_val < -50) and has_pre_spike_volume_infusion(volumes)
-    return (symbol, cmo_val, vratio, is_strong)
+    is_rejection, bull_ratio = has_bullish_rejection_volume(klines, window=10)
+    
+    # STRICT: All three conditions must be true for a "Strong" pass
+    is_strong = (cmo_val < -50) and has_pre_spike_volume_infusion(volumes) and is_rejection
+    
+    return (symbol, cmo_val, vratio, is_strong, bull_ratio)
 
 
 class ProgressTracker:
@@ -266,12 +307,34 @@ def run_tf_filter_concurrent(trader: Trader, symbols: List[str], interval: str, 
     return passed_symbols
 
 
-def run_1m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: int = 15) -> List[Tuple[str, float, float, bool]]:
+def run_5m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: int = 15) -> Tuple[List[str], float]:
+    """Returns (passed_symbols, best_bull_ratio)"""
+    passed_symbols = []
+    best_ratio = 0.0
+    tracker = ProgressTracker(len(symbols), "5m+Rej filter")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(check_5m_rejection, trader, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            try:
+                sym, passed, ratio = future.result()
+                if passed: 
+                    passed_symbols.append(sym)
+                    if ratio > best_ratio: best_ratio = ratio
+                tracker.update(passed=passed)
+                print(tracker.get_stats(), end="", flush=True)
+            except: tracker.update()
+            
+    print(f"\r{tracker.get_stats()}" + " " * 20)
+    return passed_symbols, best_ratio
+
+
+def run_1m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: int = 15) -> List[Tuple[str, float, float, bool, float]]:
     results = []
     tracker = ProgressTracker(len(symbols), "1m filter")
     
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(check_1m_momentum_volume, trader, sym): sym for sym in symbols}
+        futures = {executor.submit(check_1m_final, trader, sym): sym for sym in symbols}
         for future in as_completed(futures):
             try:
                 res = future.result()
@@ -284,22 +347,32 @@ def run_1m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: in
     return results
 
 
-def get_multi_tf_forecast(trader: Trader, symbol: str) -> Dict[str, Optional[Dict]]:
-    """Fetches 500 candles + VOLUME for 4 timeframes for pure data forecasting."""
+def get_multi_tf_forecast(trader: Trader, symbol: str, best_bull_ratio: float) -> Dict[str, Optional[Dict]]:
     timeframes = ['2h', '15m', '5m', '1m']
     forecasts = {}
     
     for tf in timeframes:
-        # MUST GET VOLUME NOW
-        close, volumes = trader.get_klines(symbol, tf, limit=500, return_volume=True)
-        forecasts[tf] = fft_ht_sine_forecast(close, volumes)
+        klines = trader.get_klines(symbol, tf, limit=500, return_raw=True)
+        if klines:
+            close = [float(k[4]) for k in klines]
+            volumes = [float(k[5]) for k in klines]
+            
+            # For the active timeframes (5m, 1m), recalculate exact live rejection ratio
+            if tf in ['5m', '1m']:
+                _, live_ratio = has_bullish_rejection_volume(klines, window=10)
+                forecasts[tf] = fft_ht_sine_forecast(close, volumes, live_ratio)
+            else:
+                # Higher timeframes rely on the 5m/1m rejection ratio for scaling
+                forecasts[tf] = fft_ht_sine_forecast(close, volumes, best_bull_ratio)
+        else:
+            forecasts[tf] = None
         
     return forecasts
 
 
 def format_forecast_output(symbol: str, forecasts: Dict[str, Optional[Dict]], current_price_1m: float):
     print("\n" + "="*60)
-    print(f"  ★ PURE DATA CYCLE FORECAST: {symbol} ★")
+    print(f"  ★ STRUCTURAL REJECTION CYCLE FORECAST: {symbol} ★")
     print("="*60)
     
     weights = {'2h': 0.10, '15m': 0.20, '5m': 0.30, '1m': 0.40}
@@ -314,16 +387,14 @@ def format_forecast_output(symbol: str, forecasts: Dict[str, Optional[Dict]], cu
             total_weight += w
             
             change = ((f['forecast_target'] - f['current_price']) / f['current_price']) * 100
-            mom_ratio = f['volume_momentum_ratio']
             
             print(f"  [{tf.upper():4}] Data Range: ${f['cycle_low']:.4f} (argmin) -> ${f['cycle_high']:.4f} (argmax)")
-            print(f"         Vol @ Bottom: {f['vol_at_bottom']:.1f} | Vol @ Top: {f['vol_at_top']:.1f}")
-            print(f"         Current Vol Momentum vs Top: x{mom_ratio:.2f}")
+            print(f"         Dynamic Scale Factor: x{f['dynamic_scale']:.2f} (Vol vs Top * Bull Rejection)")
             print(f"         Dominant Period: {f['dominant_period']} candles | Candles Since Bottom: {f['distance_from_bottom']}")
             print(f"         Phase: {f['phase_status']}")
             print(f"         Data-Driven Target: ${f['forecast_target']:.4f} ({change:+.2f}%)\n")
         else:
-            print(f"  [{tf.upper():4}] Insufficient data for FFT/HT_SINE\n")
+            print(f"  [{tf.upper():4}] Insufficient data\n")
             
     if total_weight > 0:
         final_target = weighted_target / total_weight
@@ -344,18 +415,23 @@ def main():
     trading_pairs = trader.get_usdc_pairs()
 
     print("=" * 60)
-    print("  MTF SCANNER + PURE DATA FFT/VOLUME FORECASTER")
+    print("  MTF SCANNER + OHLCV REJECTION FORECASTER")
     print("=" * 60 + "\n")
 
+    # Higher TF structural dips (Close only)
     filtered1 = run_tf_filter_concurrent(trader, trading_pairs, '2h', 20)
     if not filtered1: print("No 2h dips. Exiting."), sys.exit(0)
 
     filtered2 = run_tf_filter_concurrent(trader, filtered1, '15m', 15)
     if not filtered2: print("No 15m dips. Exiting."), sys.exit(0)
 
-    filtered3 = run_tf_filter_concurrent(trader, filtered2, '5m', 15)
-    if not filtered3: print("No 5m dips. Exiting."), sys.exit(0)
+    # 5m Dip + NEW Bullish Rejection Volume Filter (Requires OHLCV)
+    filtered3, best_5m_ratio = run_5m_filter_concurrent(trader, filtered2, 15)
+    if not filtered3: 
+        print("\nNo 5m dips with Bullish Rejection Volume. Exiting.")
+        sys.exit(0)
 
+    # 1m CMO + Pre-Spike + NEW Bullish Rejection Volume Filter
     results_1m = run_1m_filter_concurrent(trader, filtered3, 15)
     
     strong_candidates = [r for r in results_1m if r[3] is True]
@@ -363,27 +439,32 @@ def main():
     mode = "NONE"
 
     if strong_candidates:
-        final_choice = max(strong_candidates, key=lambda x: (-x[1], x[2]))
-        mode = "STRONG (CMO < -50 + Volume Infusion)"
+        # Absolute best: Passed CMO, Volume Spike, AND OHLCV Bull Rejection
+        final_choice = max(strong_candidates, key=lambda x: (-x[1], x[4])) # Sorted by CMO, then Bull Ratio
+        mode = "STRONG (CMO + Spike + OHLCV Bull Rejection)"
+        live_bull_ratio = final_choice[4]
     else:
+        # Fallback: Passed 5m rejection, but 1m rejection wasn't perfect
         if results_1m:
             final_choice = min(results_1m, key=lambda x: x[1]) 
-            mode = "FALLBACK (Best available 1m CMO from 5m dips)"
+            mode = "FALLBACK (Best CMO, 1m Rejection weak)"
+            live_bull_ratio = final_choice[4]
         else:
             print("\nFailed to fetch 1m data. Exiting.")
             sys.exit(0)
 
-    sym, cmo_val, vratio, _ = final_choice
+    sym, cmo_val, vratio, _, live_bull_ratio = final_choice
     
     print("\n" + "-"*60)
     print(f"  SELECTED SYMBOL: {sym}")
     print(f"  SELECTION MODE:  {mode}")
     print(f"  1m CMO:          {cmo_val:.2f}")
     print(f"  1m Volume Ratio: x{vratio:.1f}")
+    print(f"  1m BULL REJ VOL: {live_bull_ratio*100:.1f}% (Green Candle Vol)")
     print("-"*60)
     
     print("\nCalculating Pure-Data FFT Targets...")
-    forecasts = get_multi_tf_forecast(trader, sym)
+    forecasts = get_multi_tf_forecast(trader, sym, live_bull_ratio)
     
     current_1m_close = trader.get_klines(sym, '1m', limit=1)
     current_price = current_1m_close[-1] if current_1m_close else 0.0
