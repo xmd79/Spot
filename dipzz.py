@@ -112,6 +112,55 @@ def has_bullish_rejection_volume(raw_klines: list, window: int = 10) -> Tuple[bo
     return is_confirmed, bull_ratio
 
 
+def calculate_effort_result_metrics(close: List[float], volumes: List[float], window: int = 20) -> Dict:
+    if len(close) < window + 2:
+        return {"R": 0, "C": 0, "E": 0}
+
+    close_arr = np.array(close[-window:], dtype='float64')
+    vol_arr = np.array(volumes[-window:], dtype='float64')
+
+    # Price change (absolute net movement)
+    delta_p = abs(close_arr[-1] - close_arr[0])
+
+    # Total volume in window
+    total_vol = np.sum(vol_arr)
+
+    epsilon = 1e-9
+
+    # Effort vs Result
+    R = total_vol / (delta_p + epsilon)
+
+    # Compression
+    C = total_vol / (np.std(close_arr) + epsilon)
+
+    # Energy (rate-based)
+    delta_t = window
+    E = total_vol / ((delta_p * delta_t) + epsilon)
+
+    return {"R": R, "C": C, "E": E}
+
+
+def ml_spike_probability(R: float, C: float, E: float, bull_ratio: float, cmo: float, vratio: float) -> float:
+    # Normalize inputs (log scaling to stabilize)
+    Rn = np.log1p(R)
+    Cn = np.log1p(C)
+    En = np.log1p(E)
+
+    # Weighted logistic model
+    score = (
+        0.30 * Rn +
+        0.25 * Cn +
+        0.20 * En +
+        0.15 * bull_ratio +
+        0.05 * (-cmo / 100.0) +    # oversold boost
+        0.05 * min(vratio / 5.0, 1.0)
+    )
+
+    # Sigmoid
+    prob = 1 / (1 + np.exp(-score))
+    return prob
+
+
 def fft_ht_sine_forecast(close: List[float], volumes: List[float], bull_rejection_ratio: float) -> Optional[Dict]:
     if len(close) < 500 or len(volumes) < 500:
         return None
@@ -237,18 +286,40 @@ def check_5m_rejection(trader: Trader, symbol: str) -> Tuple[str, bool, float]:
         return (symbol, is_rejection, ratio)
     return (symbol, False, 0.0)
 
-def check_1m_final(trader: Trader, symbol: str) -> Tuple[str, float, float, bool, float]:
+def check_1m_final(trader: Trader, symbol: str) -> Tuple[str, float, float, bool, float, float]:
     klines = trader.get_klines(symbol, '1m', limit=200, return_raw=True)
-    if not klines or len(klines) < 50: return (symbol, 0.0, 0.0, False, 0.0)
+    if not klines or len(klines) < 50:
+        return (symbol, 0.0, 0.0, False, 0.0, 0.0)
+
     close = [float(k[4]) for k in klines]
     volumes = [float(k[5]) for k in klines]
+
     cmo = ta.CMO(np.asarray(close), timeperiod=14)
     cmo_val = cmo[-1] if not np.isnan(cmo[-1]) else 0.0
+
     avg_vol = np.mean(volumes[-51:-1]) if len(volumes) > 51 else np.mean(volumes[:-1])
     vratio = volumes[-1] / avg_vol if avg_vol > 0 else 0.0
+
     is_rejection, bull_ratio = has_bullish_rejection_volume(klines, window=10)
-    is_strong = (cmo_val < -50) and has_pre_spike_volume_infusion(volumes) and is_rejection
-    return (symbol, cmo_val, vratio, is_strong, bull_ratio)
+
+    # Effort vs Result metrics
+    metrics = calculate_effort_result_metrics(close, volumes, window=20)
+
+    # ML spike probability
+    prob = ml_spike_probability(
+        metrics["R"], metrics["C"], metrics["E"],
+        bull_ratio, cmo_val, vratio
+    )
+
+    # Final signal: CMO oversold + bullish rejection + compression above avg + ML confirms
+    is_strong = (
+        (cmo_val < -50) and
+        is_rejection and
+        (metrics["C"] > np.mean(volumes[-50:])) and
+        (prob > 0.65)
+    )
+
+    return (symbol, cmo_val, vratio, is_strong, bull_ratio, prob)
 
 class ProgressTracker:
     def __init__(self, total: int, label: str):
@@ -299,7 +370,7 @@ def run_5m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: in
     print(f"\r{tracker.get_stats()}" + " " * 20)
     return passed_symbols, best_ratio
 
-def run_1m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: int = 15) -> List[Tuple[str, float, float, bool, float]]:
+def run_1m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: int = 15) -> List[Tuple[str, float, float, bool, float, float]]:
     results = []
     tracker = ProgressTracker(len(symbols), "1m filter")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -358,11 +429,11 @@ def format_forecast_output(symbol: str, forecasts: Dict[str, Optional[Dict]], cu
             
             change = ((f['forecast_target'] - f['current_price']) / f['current_price']) * 100
             
-            print(f"  [{tf.upper():4}] True Cycle Low:  ${f['cycle_low']:.4f}")
-            print(f"         True Cycle High: ${f['cycle_high']:.4f}")
+            print(f"  [{tf.upper():4}] True Cycle Low:  {f['cycle_low']:.25f}")
+            print(f"         True Cycle High: {f['cycle_high']:.25f}")
             print(f"         Dominant Period: {f['dominant_period']} candles | Since Bottom: {f['distance_from_bottom']}")
-            print(f"         Dynamic Scale:   x{f['dynamic_scale']:.2f} | Phase: {f['phase_status']}")
-            print(f"         Projected Target: ${f['forecast_target']:.4f} ({change:+.2f}%)\n")
+            print(f"         Dynamic Scale:   x{f['dynamic_scale']:.25f} | Phase: {f['phase_status']}")
+            print(f"         Projected Target: {f['forecast_target']:.25f} ({change:+.25f}%)\n")
         else:
             print(f"  [{tf.upper():4}] Insufficient data\n")
             
@@ -370,8 +441,8 @@ def format_forecast_output(symbol: str, forecasts: Dict[str, Optional[Dict]], cu
         final_target = weighted_target / total_weight
         total_change = ((final_target - current_price_1m) / current_price_1m) * 100
         print("  " + "-"*56)
-        print(f"  🎯 7-TF CONSENSUS TARGET: ${final_target:.4f} ({total_change:+.2f}%)")
-        print(f"  📍 Current Entry Price:   ${current_price_1m:.4f}")
+        print(f"  🎯 7-TF CONSENSUS TARGET: {final_target:.25f} ({total_change:+.25f}%)")
+        print(f"  📍 Current Entry Price:   {current_price_1m:.25f}")
     print("="*60 + "\n")
 
 
@@ -406,8 +477,8 @@ def main():
     mode = "NONE"
 
     if strong_candidates:
-        final_choice = max(strong_candidates, key=lambda x: (-x[1], x[4]))
-        mode = "STRONG (CMO + Spike + OHLCV Bull Rejection)"
+        final_choice = max(strong_candidates, key=lambda x: (x[5], -x[1]))  # prob + CMO
+        mode = "STRONG + ML ENERGY CONFIRMATION"
         live_bull_ratio = final_choice[4]
     else:
         if results_1m:
@@ -418,14 +489,15 @@ def main():
             print("\nFailed to fetch 1m data. Exiting.")
             sys.exit(0)
 
-    sym, cmo_val, vratio, _, live_bull_ratio = final_choice
+    sym, cmo_val, vratio, _, live_bull_ratio, ml_prob = final_choice
     
     print("\n" + "-"*60)
     print(f"  SELECTED SYMBOL: {sym}")
     print(f"  SELECTION MODE:  {mode}")
-    print(f"  1m CMO:          {cmo_val:.2f}")
-    print(f"  1m Volume Ratio: x{vratio:.1f}")
-    print(f"  Bull Rej Vol:    {live_bull_ratio*100:.1f}% (Green Candles)")
+    print(f"  1m CMO:          {cmo_val:.25f}")
+    print(f"  1m Volume Ratio: x{vratio:.25f}")
+    print(f"  Bull Rej Vol:    {live_bull_ratio*100:.25f}% (Green Candles)")
+    print(f"  ML Spike Prob:   {ml_prob*100:.25f}%")
     print("-"*60)
     
     forecasts = get_multi_tf_forecast(trader, sym, live_bull_ratio)
