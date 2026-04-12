@@ -73,7 +73,7 @@ class Trader:
 
 
 # ==========================================
-# INDICATORS & FORECASTING ENGINE
+# INDICATORS & PURE DATA FORECASTING ENGINE
 # ==========================================
 
 def linear_regression_dip(close: List[float], deviation: float = 0.01) -> bool:
@@ -97,43 +97,53 @@ def has_pre_spike_volume_infusion(volumes: List[float], window: int = 50, thresh
     return spike and build_up
 
 
-def fft_ht_sine_forecast(close: List[float]) -> Optional[Dict]:
+def fft_ht_sine_forecast(close: List[float], volumes: List[float]) -> Optional[Dict]:
     """
-    FFT Forecast using HT_SINE between most negative and most positive frequencies.
-    Maps argmin/argmax of the sinusoidal wave to actual price Hi-Los to find cycle target.
+    PURE DATA-DRIVEN Post-Dip Cycle Forecaster.
+    Zero hardcoded percentages. Target is derived strictly from Argmin/Argmax Hi-Lo Range
+    scaled dynamically by real volume ratios at those exact reversal points.
     """
-    if len(close) < 500:
+    if len(close) < 500 or len(volumes) < 500:
         return None
     
-    data = np.array(close[-500:], dtype='float64')
+    data_close = np.array(close[-500:], dtype='float64')
+    data_vol = np.array(volumes[-500:], dtype='float64')
     
     try:
-        # Get Hilbert Transform Sine Wave
-        sine, leadsine = ta.HT_SINE(data)
+        sine, leadsine = ta.HT_SINE(data_close)
     except Exception:
         return None
         
-    # Remove NaNs from TA-Lib output
+    # TA-Lib prepends NaNs. Align volume exactly with valid sine wave data.
     valid_idx = ~np.isnan(sine)
     if np.sum(valid_idx) < 100:
         return None
         
     sine_clean = sine[valid_idx]
     leadsine_clean = leadsine[valid_idx]
-    close_clean = data[valid_idx]
+    close_clean = data_close[valid_idx]
+    vol_clean = data_vol[valid_idx]
     
-    # 1. Find Argmin and Argmax of the Sine Wave (Rejection/Reversal points)
-    idx_min = np.argmin(sine_clean)
-    idx_max = np.argmax(sine_clean)
+    # 1. Locate exact Argmin (Bottom) and Argmax (Top) of the sine wave
+    idx_min = np.argmin(sine_clean)  
+    idx_max = np.argmax(sine_clean)  
     
     cycle_low = close_clean[idx_min]
     cycle_high = close_clean[idx_max]
-    amplitude = abs(cycle_high - cycle_low)
     
-    # 2. FFT to find dominant frequency (most significant cycle)
+    # 2. Extract REAL VOLUME at those exact structural points (5-candle average for stability)
+    def get_vol_at_idx(arr, idx):
+        start = max(0, idx - 2)
+        end = min(len(arr), idx + 3)
+        return np.mean(arr[start:end])
+
+    vol_at_cycle_bottom = get_vol_at_idx(vol_clean, idx_min)
+    vol_at_cycle_top = get_vol_at_idx(vol_clean, idx_max)
+    current_vol = vol_clean[-1]
+    
+    # 3. FFT to find the dominant cycle period
     fft_vals = np.fft.rfft(sine_clean)
     if len(fft_vals) > 1:
-        # Ignore DC component (index 0)
         fft_magnitudes = np.abs(fft_vals[1:])
         dominant_idx = np.argmax(fft_magnitudes) + 1 
         freqs = np.fft.rfftfreq(len(sine_clean))
@@ -143,26 +153,49 @@ def fft_ht_sine_forecast(close: List[float]) -> Optional[Dict]:
         dominant_period = len(sine_clean)
         
     current_price = close_clean[-1]
+    distance_from_bottom = len(sine_clean) - 1 - idx_min
+    leadsine_crossed_up = leadsine_clean[-1] > sine_clean[-1]
+    at_recent_bottom = distance_from_bottom <= (dominant_period * 1.2)
+
+    # --- PURE DATA TARGET CALCULATION ---
+    # Base target is exactly the Argmax price. No 75% bullshit.
+    base_target = cycle_high
     
-    # Phase check: Standard HT_Sine leading crossover
-    is_rising = sine_clean[-1] > leadsine_clean[-1]
-    
-    # 3. Forecast Target based on Hi-Lo range
-    if is_rising:
-        # Cycle turning up: Target is current price + full amplitude of the dominant cycle
-        forecast_target = current_price + amplitude
+    # Dynamic Volume Scaling: If current volume exceeds the volume that formed the last top,
+    # the cycle has more kinetic energy. Scale the target by that exact real-world ratio.
+    if vol_at_cycle_top > 0:
+        volume_momentum_ratio = current_vol / vol_at_cycle_top
     else:
-        # Still dipping: Project half amplitude recovery as initial target
-        forecast_target = current_price + (amplitude * 0.5)
+        volume_momentum_ratio = 1.0
+
+    if leadsine_crossed_up:
+        phase_status = "🚀 REVERSAL UP"
+        # If momentum ratio > 1.0, target mathematically exceeds the old Argmax
+        forecast_target = base_target * volume_momentum_ratio
+    elif at_recent_bottom:
+        phase_status = "⚡ EXHAUSTION DIP"
+        # Sitting at the bottom. Project to Argmax, scaled by current rejection volume vs top volume
+        forecast_target = base_target * volume_momentum_ratio
+    else:
+        phase_status = "🔄 ACCUMULATING"
+        # Far from bottom. Project mean-reversion exactly halfway between Argmin and Argmax
+        mid_cycle_point = cycle_low + ((cycle_high - cycle_low) / 2)
+        forecast_target = mid_cycle_point
+        
+    # Safety check: never project a target lower than current price in a dip scenario
+    forecast_target = max(forecast_target, current_price)
         
     return {
         'cycle_low': cycle_low,
         'cycle_high': cycle_high,
-        'amplitude': amplitude,
+        'vol_at_bottom': vol_at_cycle_bottom,
+        'vol_at_top': vol_at_cycle_top,
+        'volume_momentum_ratio': volume_momentum_ratio,
         'dominant_period': dominant_period,
-        'is_rising': is_rising,
+        'phase_status': phase_status,
         'forecast_target': forecast_target,
-        'current_price': current_price
+        'current_price': current_price,
+        'distance_from_bottom': distance_from_bottom
     }
 
 
@@ -177,7 +210,6 @@ def check_tf_dip(trader: Trader, symbol: str, interval: str) -> Tuple[str, bool]
 
 
 def check_1m_momentum_volume(trader: Trader, symbol: str) -> Tuple[str, float, float, bool]:
-    """Returns (symbol, cmo, volume_ratio, is_strong_pass)"""
     close, volumes = trader.get_klines(symbol, '1m', limit=200, return_volume=True)
     if len(close) < 50 or len(volumes) < 50:
         return (symbol, 0.0, 0.0, False)
@@ -253,21 +285,21 @@ def run_1m_filter_concurrent(trader: Trader, symbols: List[str], max_workers: in
 
 
 def get_multi_tf_forecast(trader: Trader, symbol: str) -> Dict[str, Optional[Dict]]:
-    """Fetches 500 candles for 4 timeframes and runs FFT/HT_SINE forecast on each."""
+    """Fetches 500 candles + VOLUME for 4 timeframes for pure data forecasting."""
     timeframes = ['2h', '15m', '5m', '1m']
     forecasts = {}
     
-    # Sequential here is fine, it's only 4 API calls for ONE final symbol
     for tf in timeframes:
-        close = trader.get_klines(symbol, tf, limit=500)
-        forecasts[tf] = fft_ht_sine_forecast(close)
+        # MUST GET VOLUME NOW
+        close, volumes = trader.get_klines(symbol, tf, limit=500, return_volume=True)
+        forecasts[tf] = fft_ht_sine_forecast(close, volumes)
         
     return forecasts
 
 
 def format_forecast_output(symbol: str, forecasts: Dict[str, Optional[Dict]], current_price_1m: float):
     print("\n" + "="*60)
-    print(f"  ★ CYCLE FORECAST: {symbol} ★")
+    print(f"  ★ PURE DATA CYCLE FORECAST: {symbol} ★")
     print("="*60)
     
     weights = {'2h': 0.10, '15m': 0.20, '5m': 0.30, '1m': 0.40}
@@ -281,12 +313,15 @@ def format_forecast_output(symbol: str, forecasts: Dict[str, Optional[Dict]], cu
             weighted_target += f['forecast_target'] * w
             total_weight += w
             
-            phase = "🟢 RISING" if f['is_rising'] else "🔴 FALLING"
             change = ((f['forecast_target'] - f['current_price']) / f['current_price']) * 100
+            mom_ratio = f['volume_momentum_ratio']
             
-            print(f"  [{tf.upper():4}] Cycle Range: ${f['cycle_low']:.4f} -> ${f['cycle_high']:.4f}")
-            print(f"         Amplitude: ${f['amplitude']:.4f} | Dominant Period: {f['dominant_period']} candles | Phase: {phase}")
-            print(f"         Local Target: ${f['forecast_target']:.4f} ({change:+.2f}%)\n")
+            print(f"  [{tf.upper():4}] Data Range: ${f['cycle_low']:.4f} (argmin) -> ${f['cycle_high']:.4f} (argmax)")
+            print(f"         Vol @ Bottom: {f['vol_at_bottom']:.1f} | Vol @ Top: {f['vol_at_top']:.1f}")
+            print(f"         Current Vol Momentum vs Top: x{mom_ratio:.2f}")
+            print(f"         Dominant Period: {f['dominant_period']} candles | Candles Since Bottom: {f['distance_from_bottom']}")
+            print(f"         Phase: {f['phase_status']}")
+            print(f"         Data-Driven Target: ${f['forecast_target']:.4f} ({change:+.2f}%)\n")
         else:
             print(f"  [{tf.upper():4}] Insufficient data for FFT/HT_SINE\n")
             
@@ -294,8 +329,8 @@ def format_forecast_output(symbol: str, forecasts: Dict[str, Optional[Dict]], cu
         final_target = weighted_target / total_weight
         total_change = ((final_target - current_price_1m) / current_price_1m) * 100
         print("  " + "-"*56)
-        print(f"  🎯 CONSENSUS WEIGHTED TARGET: ${final_target:.4f} ({total_change:+.2f}%)")
-        print(f"  📍 Current 1m Price:         ${current_price_1m:.4f}")
+        print(f"  🎯 CONSENSUS TARGET: ${final_target:.4f} ({total_change:+.2f}%)")
+        print(f"  📍 Current Price:    ${current_price_1m:.4f}")
     print("="*60 + "\n")
 
 
@@ -309,10 +344,9 @@ def main():
     trading_pairs = trader.get_usdc_pairs()
 
     print("=" * 60)
-    print("  MTF DIP SCANNER + FFT/HT_SINE CYCLE FORECASTER")
+    print("  MTF SCANNER + PURE DATA FFT/VOLUME FORECASTER")
     print("=" * 60 + "\n")
 
-    # MTF Filters
     filtered1 = run_tf_filter_concurrent(trader, trading_pairs, '2h', 20)
     if not filtered1: print("No 2h dips. Exiting."), sys.exit(0)
 
@@ -322,25 +356,21 @@ def main():
     filtered3 = run_tf_filter_concurrent(trader, filtered2, '5m', 15)
     if not filtered3: print("No 5m dips. Exiting."), sys.exit(0)
 
-    # 1m Momentum/Volume Filter
     results_1m = run_1m_filter_concurrent(trader, filtered3, 15)
     
     strong_candidates = [r for r in results_1m if r[3] is True]
-    
     final_choice = None
     mode = "NONE"
 
     if strong_candidates:
-        # Strict mode passed
         final_choice = max(strong_candidates, key=lambda x: (-x[1], x[2]))
         mode = "STRONG (CMO < -50 + Volume Infusion)"
     else:
-        # FALLBACK: Choose best candidate from the 5m dip list even if 1m conditions aren't perfect
         if results_1m:
-            final_choice = min(results_1m, key=lambda x: x[1]) # Lowest CMO available
+            final_choice = min(results_1m, key=lambda x: x[1]) 
             mode = "FALLBACK (Best available 1m CMO from 5m dips)"
         else:
-            print("\nFailed to fetch 1m data for fallback. Exiting.")
+            print("\nFailed to fetch 1m data. Exiting.")
             sys.exit(0)
 
     sym, cmo_val, vratio, _ = final_choice
@@ -352,11 +382,9 @@ def main():
     print(f"  1m Volume Ratio: x{vratio:.1f}")
     print("-"*60)
     
-    # Run Multi-Timeframe FFT Forecasting on the chosen asset
-    print("\nCalculating FFT Dominant Cycles & HT_SINE Reversals...")
+    print("\nCalculating Pure-Data FFT Targets...")
     forecasts = get_multi_tf_forecast(trader, sym)
     
-    # Get current accurate 1m price for final calculation
     current_1m_close = trader.get_klines(sym, '1m', limit=1)
     current_price = current_1m_close[-1] if current_1m_close else 0.0
     
