@@ -1666,453 +1666,1096 @@ def get_sr_targets(raw_klines: list, current_price: float) -> Dict:
             'avg_range': avg_range, 'dom_cycle': _dom_cycle}
 
 
-# ==========================================
-# CONCURRENT FILTER FUNCTIONS
-# ==========================================
+# ══════════════════════════════════════════════════════════════════════════════
+# HT_SINE + FFT FORECAST ENGINE  —  dipzz28
+# ══════════════════════════════════════════════════════════════════════════════
+#
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HT_SINE + FFT FORECAST ENGINE  —  dipzz28
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# THREE MANDATORY HARD-GATE CONDITIONS (any failure → immediate reject):
+#
+#  CONDITION A — LOCAL DIP ABOVE GLOBAL FLOOR
+#    The "local dip low" is defined as the lowest close within the most
+#    recent dominant-cycle window, confirmed as a swing low (at least one
+#    higher close follows it).  This is NOT current_close — it is the
+#    actual bottom of the current local dip.
+#    Gate:  local_dip_low > global_argmin_price
+#    Why:   If the local dip undercuts the global floor, the asset is
+#           printing new structural lows.  No floor exists.  Reject.
+#
+#  CONDITION B — ARGMIN MORE RECENT THAN ARGMAX (global, full window)
+#    Gate:  argmin_idx > argmax_idx
+#    Why:   The most recent extreme must be a low, not a high.  If the
+#           most recent extreme is a high, price peaked after the last low —
+#           we are buying into a downswing from peak.  Reject.
+#
+#  CONDITION C — FFT DOMINANT-CYCLE FORECAST POINTS UP
+#    Gate:  fft_forecast_next_bar > current_close
+#    Why:   If the top-5 dominant frequencies reconstructed from the full
+#           1000-bar 1m series predict the next bar will be lower than the
+#           current close, the cycle is still pointed down.  Reject.
+#
+# HT_SINE ANALYSIS (display + ranking, not a hard gate by itself)
+#    ta.HT_SINE applied to the FULL close array (up to 1000 bars).
+#    Values extracted at: global argmin bar, global argmax bar, current bar.
+#    Midpoint price = (argmin_price + argmax_price) / 2.
+#    ht_bull_signal = leadsine > sine AND sine < -0.5 AND cond_A AND cond_B.
+#    This is the strongest possible HT_SINE confirmation — used to boost
+#    the exhaustion resonance score when true.
 
 
-# ==========================================
-# MICRO-TF DIP QUALITY ENGINE  (NEW — dipzz25)
-# ==========================================
-#
-# These five functions implement the exact sorting criteria requested
-# for choosing the BEST MTF dip candidate after 1D+4H+2H confirmation:
-#
-#  1. argmin_more_recent_than_argmax(closes)
-#       The most recent extreme in the series is a LOW, not a HIGH.
-#       This is the "floor just formed" signal — same rule used for
-#       major-TF screening, now applied to 1m, 5m, and 15m.
-#       Insight: when ALL THREE micro TFs agree the last event was a
-#       low, you are seeing a synchronized micro bottom — the market
-#       has been pressing down through all short cycles simultaneously,
-#       which historically precedes sharp reversals.
-#
-#  2. lowest_rsi_1m(closes)
-#       RSI(14) on 1m closes.  The asset with the lowest RSI among all
-#       major-TF-confirmed candidates is the most oversold at the micro
-#       level — maximum "coiled spring" energy.
-#       Insight: combining RSI depth with argmin recency filters out
-#       assets that are "oversold but still falling" (RSI low, argmax
-#       recent) from ones that are "oversold and flooring" (RSI low,
-#       argmin recent).
-#
-#  3. price_vs_time_geometry_1m(closes) / _5m(closes)
-#       OLS linear regression of close vs bar-index.
-#       angle_deg  : slope angle — negative = downtrend (dip)
-#       below_trend: price is below the regression line (stretched down)
-#       curvature  : second derivative of quadratic fit
-#                    POSITIVE curvature = concave up = bowl shape forming
-#       Insight: a concave-up price trajectory on 1m means the selling
-#       rate is decelerating — the classic geometry of an imminent bounce.
-#       Negative angle + below trend + positive curvature = ideal dip.
-#
-#  4. bull_vol_dominance_1m(raw_klines)
-#       Bull volume (close >= open) vs total volume across ALL available
-#       1m candles.  bull_pct > 50% means buyers are absorbing the dip.
-#       Insight: even in a falling price, if candles are closing green
-#       on the 1m, accumulation is happening.  This divergence between
-#       price (falling) and volume (bullish) is a classic Wyckoff
-#       absorption signal — the most reliable precursor to a spike.
-#
-#  5. micro_dip_composite_score(symbol, trader)
-#       Combines all four signals into one 0-1 sort key.
-#       Used as the PRIMARY sort dimension for best-candidate selection.
-#       The existing score_15m_candidate score becomes a SECONDARY
-#       tiebreaker — preserving the φ/wavelet/cyclic logic while
-#       ensuring the micro structure is the final arbiter.
-
-def argmin_more_recent_than_argmax(closes: list) -> bool:
+def _find_local_dip_low(arr: np.ndarray, cycle_bars: int) -> tuple:
     """
-    Returns True when the most recent price extreme is a minimum (low),
-    not a maximum (high).  Applies to any timeframe.
+    Find the most recent confirmed local dip low in the last `cycle_bars` bars.
 
-    Logic:
-      argmin_idx > argmax_idx → the most recent extreme was a low
-      → a floor has been established more recently than a ceiling
-      → bias toward upward reversal
+    A confirmed local dip low requires:
+      1. It is the minimum close within the lookback window.
+      2. At least one bar AFTER it closes HIGHER (recovery has begun).
+
+    If no confirmed swing low found (still falling), slides window back
+    up to 3 times.  Falls back to global argmin if all attempts fail.
+
+    Returns (local_dip_price: float, local_dip_idx: int)
+    where local_dip_idx is the index in the FULL array.
     """
-    if len(closes) < 4:
-        return False
-    arr = np.array(closes, dtype=float)
-    return int(np.argmin(arr)) > int(np.argmax(arr))
+    n = len(arr)
+    lookback = max(cycle_bars, 10)
+    for attempt in range(4):
+        start = max(0, n - lookback - attempt * (lookback // 2))
+        window = arr[start:]
+        if len(window) < 4:
+            break
+        local_min_pos = int(np.argmin(window))
+        local_min_val = float(window[local_min_pos])
+        # Check recovery: at least one bar after local min is higher
+        post = window[local_min_pos + 1:]
+        if len(post) > 0 and float(np.max(post)) > local_min_val:
+            full_idx = start + local_min_pos
+            return local_min_val, full_idx
+    # Fallback: global argmin
+    g_idx = int(np.argmin(arr))
+    return float(arr[g_idx]), g_idx
 
 
-def lowest_rsi_1m(closes: list, period: int = 14) -> dict:
+def compute_ht_sine_extrema(closes: list, cycle_bars: int = 20) -> dict:
     """
-    RSI(14) on 1m closes.
+    HT_SINE analysis anchored between the global argmin and argmax of the
+    full close array.
 
-    Returns:
-      rsi_val        – current RSI (lower = more oversold = more bounce fuel)
-      rsi_oversold   – bool: RSI < 30
-      rsi_extreme    – bool: RSI < 20 (capitulation zone)
-      rsi_depth      – 0-1 normalised depth (1.0 at RSI=0, 0.0 at RSI=70)
+    Extracts HT_SINE + HT_LEADSINE values at:
+      - Global argmin bar  (lowest close = absolute floor of window)
+      - Global argmax bar  (highest close = absolute ceiling of window)
+      - Current bar        (last close)
 
-    Insight: sort by rsi_val ASCENDING — the asset with the LOWEST RSI
-    among all major-TF-confirmed candidates has the deepest oversold
-    reading and the most pent-up mean-reversion energy.
+    Also finds the most recent LOCAL DIP LOW using _find_local_dip_low
+    with the dominant cycle length as the lookback window.
+
+    The price MIDPOINT between global extrema is: (argmin_price + argmax_price) / 2.
+
+    Condition A (price_above_floor) is checked on LOCAL DIP LOW vs GLOBAL FLOOR:
+      local_dip_price > argmin_price
+      → The most recent local dip did NOT undercut the absolute floor.
+
+    ht_bull_signal = True when ALL FOUR hold simultaneously:
+      1. leadsine[-1] > sine[-1]   (lead above sine: cycle is turning up)
+      2. sine[-1] < -0.5           (currently in the lower half of the cycle)
+      3. local_dip_price > argmin  (local dip above the global floor)
+      4. argmin_idx > argmax_idx   (global floor established more recently than ceiling)
     """
     arr = np.asarray(closes, dtype=float)
-    if len(arr) < period + 2:
-        return {"rsi_val": 50.0, "rsi_oversold": False,
-                "rsi_extreme": False, "rsi_depth": 0.0}
-    rsi_arr = ta.RSI(arr, timeperiod=period)
-    valid   = rsi_arr[~np.isnan(rsi_arr)]
-    rsi_val = float(valid[-1]) if len(valid) > 0 else 50.0
-    depth   = float(np.clip((70.0 - rsi_val) / 70.0, 0.0, 1.0))
-    return {
-        "rsi_val":      rsi_val,
-        "rsi_oversold": bool(rsi_val < 30.0),
-        "rsi_extreme":  bool(rsi_val < 20.0),
-        "rsi_depth":    depth,
+    n   = len(arr)
+    empty = {
+        "sine": 0.0, "leadsine": 0.0,
+        "sine_at_argmin": 0.0, "leadsine_at_argmin": 0.0,
+        "sine_at_argmax": 0.0, "leadsine_at_argmax": 0.0,
+        "argmin_price": 0.0, "argmax_price": 0.0,
+        "argmin_idx": 0, "argmax_idx": 0,
+        "midpoint_price": 0.0, "current_price": 0.0,
+        "local_dip_price": 0.0, "local_dip_idx": 0,
+        "price_above_floor": False,
+        "argmin_more_recent": False,
+        "leadsine_above_sine": False,
+        "sine_in_lower_half": False,
+        "ht_bull_signal": False,
+        "ht_trough_proximity": 0.0,
+        "n_bars": n,
     }
-
-
-def price_vs_time_geometry(closes: list, lookback: int = 100) -> dict:
-    """
-    OLS linear + quadratic regression of price vs bar-index.
-
-    Returns:
-      angle_deg    – slope angle in degrees (negative = downtrend)
-      below_trend  – current price is below the OLS trend line
-      curvature    – sign of quadratic coefficient:
-                     +1 = concave up (bowl/bounce geometry)
-                     -1 = concave down (cliff geometry)
-                      0 = indeterminate
-      geo_score    – 0-1 composite: high when price is deep below trend
-                     AND curvature is turning positive
-      slope_pct    – slope as % per bar relative to mean price
-      norm_dist    – standard deviations below trend (negative = below)
-
-    Insight: the ideal dip has three geometric signatures:
-      (a) negative angle  — price has been falling
-      (b) below trend     — current price stretched below equilibrium
-      (c) positive curv   — the fall is decelerating (bowl shape)
-    All three together = maximum bounce geometry.
-    """
-    arr = np.array(closes[-lookback:] if len(closes) >= lookback else closes,
-                   dtype=float)
-    n = len(arr)
-    if n < 10:
-        return {"angle_deg": 0.0, "below_trend": False,
-                "curvature": 0, "geo_score": 0.0,
-                "slope_pct": 0.0, "norm_dist": 0.0}
-    t          = np.arange(n, dtype=float)
-    lin        = np.polyfit(t, arr, 1)
-    slope, icp = float(lin[0]), float(lin[1])
-    mean_price = float(np.mean(arr))
-    trend_now  = slope * (n - 1) + icp
-    slope_pct  = (slope / (mean_price + 1e-12)) * 100.0
-    angle_deg  = float(np.degrees(np.arctan(slope_pct / 100.0)))
-    residual   = float(arr[-1]) - trend_now
-    std_arr    = float(np.std(arr) + 1e-9)
-    norm_dist  = residual / std_arr
-    below_trend = bool(arr[-1] < trend_now)
+    if n < 32:
+        return empty
     try:
-        quad       = np.polyfit(t, arr, 2)
-        curvature  = int(np.sign(quad[0]))
+        sine_arr, leadsine_arr = ta.HT_SINE(arr)
     except Exception:
-        curvature = 0
-    depth_score = float(np.clip(-norm_dist / 2.0, 0.0, 1.0))
-    curv_bonus  = 0.25 if curvature > 0 else 0.0
-    geo_score   = float(np.clip(depth_score + curv_bonus, 0.0, 1.0))
+        return empty
+
+    sine_now  = float(sine_arr[-1])     if not np.isnan(sine_arr[-1])     else 0.0
+    lead_now  = float(leadsine_arr[-1]) if not np.isnan(leadsine_arr[-1]) else 0.0
+
+    # Global extrema
+    argmin_idx   = int(np.argmin(arr))
+    argmax_idx   = int(np.argmax(arr))
+    argmin_price = float(arr[argmin_idx])
+    argmax_price = float(arr[argmax_idx])
+    midpoint     = (argmin_price + argmax_price) / 2.0
+    current_price = float(arr[-1])
+
+    # Most recent local dip low (lookback = one dominant cycle)
+    local_dip_price, local_dip_idx = _find_local_dip_low(arr, cycle_bars)
+
+    # HT_SINE values at global extrema bars
+    def _safe(a, i): return float(a[i]) if not np.isnan(a[i]) else 0.0
+    sine_at_min = _safe(sine_arr,     argmin_idx)
+    lead_at_min = _safe(leadsine_arr, argmin_idx)
+    sine_at_max = _safe(sine_arr,     argmax_idx)
+    lead_at_max = _safe(leadsine_arr, argmax_idx)
+
+    # Condition A: local dip must be STRICTLY above the global floor
+    price_above_floor  = bool(local_dip_price > argmin_price)
+    argmin_more_recent = bool(argmin_idx > argmax_idx)
+    leadsine_above     = bool(lead_now > sine_now)
+    sine_lower_half    = bool(sine_now < -0.5)
+
+    # Trough proximity: 1.0 when sine = -1 (mathematical bottom)
+    ht_trough_prox = float(np.clip((1.0 - sine_now) / 2.0, 0.0, 1.0))
+
+    ht_bull = bool(leadsine_above and sine_lower_half and
+                   price_above_floor and argmin_more_recent)
+
     return {
-        "angle_deg":   angle_deg,
-        "below_trend": below_trend,
-        "curvature":   curvature,
-        "geo_score":   geo_score,
-        "slope_pct":   slope_pct,
-        "norm_dist":   float(norm_dist),
+        "sine":                 sine_now,
+        "leadsine":             lead_now,
+        "sine_at_argmin":       sine_at_min,
+        "leadsine_at_argmin":   lead_at_min,
+        "sine_at_argmax":       sine_at_max,
+        "leadsine_at_argmax":   lead_at_max,
+        "argmin_price":         argmin_price,
+        "argmax_price":         argmax_price,
+        "argmin_idx":           argmin_idx,
+        "argmax_idx":           argmax_idx,
+        "midpoint_price":       midpoint,
+        "current_price":        current_price,
+        "local_dip_price":      local_dip_price,
+        "local_dip_idx":        local_dip_idx,
+        "price_above_floor":    price_above_floor,
+        "argmin_more_recent":   argmin_more_recent,
+        "leadsine_above_sine":  leadsine_above,
+        "sine_in_lower_half":   sine_lower_half,
+        "ht_bull_signal":       ht_bull,
+        "ht_trough_proximity":  ht_trough_prox,
+        "n_bars":               n,
     }
 
 
-def bull_vol_dominance_1m(raw_klines: list) -> dict:
+def compute_fft_forecast(closes: list, forecast_bars: int = 5,
+                          top_n_freqs: int = 5) -> dict:
     """
-    Bull vs bear volume across ALL provided 1m klines.
-    Bull candle = close >= open.
+    FFT price forecast: detrend → FFT → keep top-N frequencies by magnitude
+    → extrapolate each frequency component forward → re-add trend.
+
+    The immediate next-bar forecast price (forecast_next) must be ABOVE the
+    current close for the gate to pass (Condition C).
 
     Returns:
-      bull_majority – bool: bull_vol > bear_vol
-      bull_pct      – 0-100 float
-      bear_pct      – 0-100 float
-
-    Insight: this is a TOTAL-BOOK assessment, not just recent candles.
-    When the full 1m history shows more bull volume than bear volume
-    despite a falling price, it is textbook Wyckoff absorption —
-    smart money is accumulating into the dip.
+      fft_forecast_above_close  bool   — forecast_next > current_close
+      forecast_next             float  — predicted price of next 1m bar
+      current_close             float  — last close used
+      lowest_low                float  — min(closes) = global floor
+      forecast_prices           list   — next `forecast_bars` predicted prices
+      dominant_cycles           list   — period lengths of top-N components
+      fft_slope_5bar            float  — % slope per bar over forecast window
     """
-    if not raw_klines:
-        return {"bull_majority": False, "bull_pct": 50.0,
-                "bear_pct": 50.0, "bull_vol": 0.0, "bear_vol": 0.0}
-    bull = bear = 0.0
-    for k in raw_klines:
-        o, c, v = float(k[1]), float(k[4]), float(k[5])
-        if c >= o:
-            bull += v
-        else:
-            bear += v
-    total = bull + bear + 1e-12
+    arr = np.asarray(closes, dtype=float)
+    n   = len(arr)
+    empty = {
+        "fft_forecast_above_close": False,
+        "forecast_next": 0.0, "current_close": 0.0,
+        "lowest_low":    0.0, "forecast_prices": [],
+        "dominant_cycles": [], "fft_slope_5bar": 0.0,
+    }
+    if n < 32:
+        return empty
+
+    current_close = float(arr[-1])
+    lowest_low    = float(np.min(arr))
+
+    # Detrend
+    t          = np.arange(n, dtype=float)
+    trend_coef = np.polyfit(t, arr, 1)
+    trend_line = np.polyval(trend_coef, t)
+    detrended  = arr - trend_line
+
+    # FFT — keep only cycles between 4 bars and n/2 bars
+    fft_vals   = np.fft.rfft(detrended)
+    freqs      = np.fft.rfftfreq(n)
+    magnitudes = np.abs(fft_vals)
+    valid      = np.where((freqs > 0) & (freqs <= 1.0 / 4))[0]
+    if len(valid) == 0:
+        return {**empty, "current_close": current_close, "lowest_low": lowest_low}
+
+    top_idxs = valid[np.argsort(magnitudes[valid])[::-1]][:top_n_freqs]
+    dominant_cycles = []
+    for idx in top_idxs:
+        if freqs[idx] > 0:
+            dominant_cycles.append(int(round(1.0 / freqs[idx])))
+
+    # Extrapolate each component forward
+    t_future = np.arange(n, n + forecast_bars, dtype=float)
+    forecast_osc = np.zeros(forecast_bars)
+    for idx in top_idxs:
+        freq  = float(freqs[idx])
+        mag   = float(magnitudes[idx])
+        phase = float(np.angle(fft_vals[idx]))
+        forecast_osc += (2.0 / n) * mag * np.cos(
+            2.0 * np.pi * freq * t_future + phase)
+
+    forecast_prices_arr = forecast_osc + np.polyval(trend_coef, t_future)
+    forecast_next  = float(forecast_prices_arr[0])
+    forecast_prices = forecast_prices_arr.tolist()
+
+    fft_above = bool(forecast_next > current_close)
+    if forecast_bars >= 2:
+        slope = float((forecast_prices_arr[-1] - forecast_prices_arr[0]) /
+                       (forecast_bars - 1) / (current_close + 1e-12) * 100.0)
+    else:
+        slope = 0.0
+
     return {
-        "bull_majority": bool(bull > bear),
-        "bull_pct":      float(bull / total * 100.0),
-        "bear_pct":      float(bear / total * 100.0),
-        "bull_vol":      float(bull),
-        "bear_vol":      float(bear),
+        "fft_forecast_above_close": fft_above,
+        "forecast_next":   forecast_next,
+        "current_close":   current_close,
+        "lowest_low":      lowest_low,
+        "forecast_prices": forecast_prices,
+        "dominant_cycles": dominant_cycles,
+        "fft_slope_5bar":  slope,
     }
 
 
-def compute_micro_dip_score(trader, symbol: str) -> dict:
+def compute_ht_fft_gate(raw_klines_1m: list) -> dict:
     """
-    Compute the full micro-TF dip quality profile for a symbol.
-    Called on every asset that survived the 1D+4H+2H major-TF gates.
+    Master gate.  Uses the FULL 1m klines array (up to 1000 bars).
 
-    Fetch order (cheapest to most expensive):
-      1m  (500 bars)  — argmin, RSI, geometry, bull vol
-      5m  (200 bars)  — argmin, geometry
-      15m (200 bars)  — argmin only
+    THREE CONDITIONS — all must pass:
+      A. local_dip_price > global_argmin_price   (local dip above global floor)
+      B. argmin_idx > argmax_idx                  (minima more recent than maxima)
+      C. fft_forecast_next > current_close        (dominant cycle pointing up)
 
-    Composite sort key:
-      micro_score   : 0-1 float (PRIMARY sort dimension)
-      rsi_val       : float  (SECONDARY sort: lower is better)
-      argmin_count  : 0-3 int (TERTIARY: more TFs confirming floor = better)
+    local_dip_price = lowest close of the most recent local dip,
+    confirmed as a swing low (recovery bar exists after it).
+    This is NOT current_close — it's the actual floor of the current local dip.
+    """
+    empty = {
+        "gate_pass": False,
+        "cond_A_local_dip_above_floor": False,
+        "cond_B_argmin_recent":         False,
+        "cond_C_fft_up":                False,
+        "ht": {}, "fft": {},
+        "resonance_extra": 0.0,
+        "gate_reason": "insufficient data",
+    }
+    if not raw_klines_1m or len(raw_klines_1m) < 64:
+        return empty
 
-    The micro_tf_hard_pass flag:
-      True when ALL mandatory conditions are met:
-        • argmin more recent than argmax on 1m, 5m, AND 15m
-        • 1m RSI < 30 (oversold)
-        • 1m bull vol > bear vol (absorption)
-        • 1m or 5m price below trend line (stretched)
+    closes = [float(k[4]) for k in raw_klines_1m]
+    arr    = np.asarray(closes, dtype=float)
 
-    Insight:  hard_pass assets are the ideal targets — they have a
-    synchronized micro-bottom across three timeframes with confirmed
-    buying absorption at a stretched price.  When hard_pass > 0,
-    only those are considered for final selection.
+    # Estimate dominant cycle for local dip lookback
+    try:
+        n = len(arr)
+        detrended = arr - np.polyval(np.polyfit(np.arange(n), arr, 1), np.arange(n))
+        fft_v  = np.abs(np.fft.rfft(detrended))
+        fft_f  = np.fft.rfftfreq(n)
+        valid  = np.where((fft_f > 0) & (fft_f <= 0.25))[0]
+        if len(valid) > 0:
+            peak     = valid[int(np.argmax(fft_v[valid]))]
+            cycle_bars = int(np.clip(round(1.0 / fft_f[peak]), 6, n // 4))
+        else:
+            cycle_bars = 20
+    except Exception:
+        cycle_bars = 20
+
+    ht  = compute_ht_sine_extrema(closes, cycle_bars=cycle_bars)
+    fft = compute_fft_forecast(closes, forecast_bars=5, top_n_freqs=5)
+
+    cond_A = bool(ht["price_above_floor"])
+    cond_B = bool(ht["argmin_more_recent"])
+    cond_C = bool(fft["fft_forecast_above_close"])
+
+    gate_pass = cond_A and cond_B and cond_C
+
+    reasons = []
+    if not cond_A:
+        reasons.append(
+            f"local_dip({ht['local_dip_price']:.8f}) "
+            f"<= global_floor({ht['argmin_price']:.8f}) "
+            f"— new structural low, no floor")
+    if not cond_B:
+        reasons.append(
+            f"argmax({ht['argmax_idx']}) more recent than "
+            f"argmin({ht['argmin_idx']}) — still falling from peak")
+    if not cond_C:
+        reasons.append(
+            f"FFT forecast({fft['forecast_next']:.8f}) "
+            f"<= close({fft['current_close']:.8f}) — cycle pointing down")
+    gate_reason = "ALL PASS" if gate_pass else " | ".join(reasons)
+
+    # Resonance bonus: how strongly do the conditions pass?
+    conds_met   = sum([cond_A, cond_B, cond_C])
+    ht_bonus    = 0.15 if ht.get("ht_bull_signal") else 0.0
+    slope_bonus = float(np.clip(fft.get("fft_slope_5bar", 0.0) / 2.0, 0.0, 0.15))
+    # Margin bonus for condition A: how far above the floor is the local dip?
+    if cond_A and ht["argmin_price"] > 0:
+        margin_pct   = (ht["local_dip_price"] - ht["argmin_price"]) / ht["argmin_price"] * 100.0
+        margin_bonus = float(np.clip(margin_pct / 1.0, 0.0, 0.10))
+    else:
+        margin_bonus = 0.0
+
+    resonance_extra = float(np.clip(
+        conds_met / 3.0 * 0.60 + ht_bonus + slope_bonus + margin_bonus,
+        0.0, 1.0
+    ))
+
+    return {
+        "gate_pass":                    gate_pass,
+        "cond_A_local_dip_above_floor": cond_A,
+        "cond_B_argmin_recent":         cond_B,
+        "cond_C_fft_up":                cond_C,
+        "ht":                           ht,
+        "fft":                          fft,
+        "resonance_extra":              resonance_extra,
+        "gate_reason":                  gate_reason,
+        "cycle_bars_used":              cycle_bars,
+    }
+
+
+def format_ht_fft_block(gate: dict, W: int = 74):
+    """
+    Print the full HT_SINE + FFT gate block inside format_sr_output.
+    """
+    if not gate:
+        return
+    print("─" * W)
+    print("  📡  HT_SINE + FFT FORECAST GATE  (3 MANDATORY HARD CONDITIONS)")
+    print("─" * W)
+
+    def yn(v): return "✅ PASS" if v else "❌ FAIL"
+
+    gp  = gate.get("gate_pass", False)
+    cA  = gate.get("cond_A_local_dip_above_floor", False)
+    cB  = gate.get("cond_B_argmin_recent",         False)
+    cC  = gate.get("cond_C_fft_up",                False)
+    ht  = gate.get("ht",  {})
+    fft = gate.get("fft", {})
+    gr  = gate.get("gate_reason", "")
+    cyc = gate.get("cycle_bars_used", 0)
+
+    icon = "✅ GATE OPEN — all 3 conditions met" if gp else "❌ GATE CLOSED — asset rejected"
+    print(f"\n  {icon}")
+    print(f"  Cycle used for local-dip lookback: {cyc} bars")
+    print(f"  Reason: {gr}\n")
+
+    # A: local dip above global floor
+    ldp = ht.get("local_dip_price", 0.0)
+    llf = ht.get("argmin_price",    0.0)
+    lid = ht.get("local_dip_idx",   0)
+    n   = ht.get("n_bars",          0)
+    cp  = ht.get("current_price",   0.0)
+    gap = (ldp - llf) / (llf + 1e-12) * 100.0 if llf > 0 else 0.0
+    print(f"  [A] Local dip above global floor   : {yn(cA)}")
+    print(f"      local_dip_price = {ldp:.8f}  (bar {lid}, {n-lid} bars ago)")
+    print(f"      global_floor    = {llf:.8f}  (argmin of full {n}-bar window)")
+    print(f"      margin          = {gap:+.4f}%   current_close = {cp:.8f}")
+
+    # B: argmin more recent
+    ami = ht.get("argmin_idx", 0)
+    axi = ht.get("argmax_idx", 0)
+    print(f"  [B] Argmin more recent than argmax : {yn(cB)}")
+    print(f"      argmin bar={ami} ({n-ami} bars ago)  "
+          f"argmax bar={axi} ({n-axi} bars ago)")
+
+    # C: FFT forecast
+    fn  = fft.get("forecast_next",  0.0)
+    cc  = fft.get("current_close",  0.0)
+    fd  = (fn - cc) / (cc + 1e-12) * 100.0 if cc > 0 else 0.0
+    sl  = fft.get("fft_slope_5bar", 0.0)
+    dc  = fft.get("dominant_cycles", [])
+    print(f"  [C] FFT forecast next bar > close  : {yn(cC)}")
+    print(f"      forecast_next = {fn:.8f}  current = {cc:.8f}  delta = {fd:+.5f}%")
+    print(f"      5-bar slope = {sl:+.4f}%/bar   dominant cycles = {dc}")
+
+    # HT_SINE extrema table
+    print(f"\n  📊  HT_SINE between extrema (full {n}-bar 1m window)")
+    aln_p = ht.get("argmin_price",     0.0)
+    axn_p = ht.get("argmax_price",     0.0)
+    mid_p = ht.get("midpoint_price",   0.0)
+    s_min = ht.get("sine_at_argmin",   0.0)
+    l_min = ht.get("leadsine_at_argmin", 0.0)
+    s_max = ht.get("sine_at_argmax",   0.0)
+    l_max = ht.get("leadsine_at_argmax", 0.0)
+    s_now = ht.get("sine",             0.0)
+    l_now = ht.get("leadsine",         0.0)
+    print(f"  {'Point':<14} {'Price':>14} {'HT_SINE':>10} {'LEADSINE':>10}  Note")
+    print("  " + "─" * 54)
+    print(f"  {'ARGMIN (floor)':<14} {aln_p:>14.8f} {s_min:>10.4f} {l_min:>10.4f}  ← global lowest low")
+    print(f"  {'MIDPOINT':<14} {mid_p:>14.8f} {'—':>10} {'—':>10}  ← (low+high)/2")
+    print(f"  {'LOCAL DIP':<14} {ldp:>14.8f} {'—':>10} {'—':>10}  ← most recent local dip")
+    print(f"  {'ARGMAX (ceil)':<14} {axn_p:>14.8f} {s_max:>10.4f} {l_max:>10.4f}  ← global highest high")
+    print(f"  {'CURRENT':<14} {cc:>14.8f} {s_now:>10.4f} {l_now:>10.4f}  ← now")
+
+    # HT_SINE bull signal breakdown
+    ht_bs = ht.get("ht_bull_signal",     False)
+    la    = ht.get("leadsine_above_sine", False)
+    sl_h  = ht.get("sine_in_lower_half",  False)
+    paf   = ht.get("price_above_floor",   False)
+    amr   = ht.get("argmin_more_recent",  False)
+    ht_tp = ht.get("ht_trough_proximity", 0.0)
+    print(f"\n  HT_SINE Bull Signal : {'✅ YES — full 4-condition confirmation' if ht_bs else '❌ NO'}")
+    print(f"    leadsine > sine    : {'✅' if la   else '❌'}  (cycle turning up from trough)")
+    print(f"    sine < -0.5        : {'✅' if sl_h else '❌'}  (in lower half, proximity={ht_tp*100:.0f}%)")
+    print(f"    local dip > floor  : {'✅' if paf  else '❌'}  (floor intact)")
+    print(f"    argmin more recent : {'✅' if amr  else '❌'}  (low was the most recent extreme)")
+
+    # FFT forecast line
+    fp = fft.get("forecast_prices", [])
+    if fp:
+        print(f"\n  FFT 5-bar price forecast : {' → '.join(f'{p:.6f}' for p in fp[:5])}")
+
+    re  = gate.get("resonance_extra", 0.0)
+    bar = "█" * int(re * 20) + "░" * (20 - int(re * 20))
+    print(f"  Gate resonance bonus     : [{bar}]  {re*100:.0f}%")
+    print()
+
+def _sma_cross_recent(closes: list, fast_p: int, slow_p: int,
+                       lookback: int = 3) -> dict:
+    """
+    Check if fast SMA crossed above slow SMA within the last `lookback` bars.
+
+    Returns:
+      crossed   – bool: cross happened within lookback bars
+      imminent  – bool: fast is within 0.1% of slow (cross very close)
+      fast_now  – current fast SMA value
+      slow_now  – current slow SMA value
+      gap_pct   – fast-slow gap as % of price (positive = fast above slow)
+    """
+    arr = np.asarray(closes, dtype=float)
+    min_len = max(slow_p + lookback + 2, 30)
+    if len(arr) < min_len:
+        return {"crossed": False, "imminent": False,
+                "fast_now": 0.0, "slow_now": 0.0, "gap_pct": 0.0}
+    fast = ta.SMA(arr, timeperiod=fast_p)
+    slow = ta.SMA(arr, timeperiod=slow_p)
+    # Check recent bars for cross: fast[i-1] <= slow[i-1] and fast[i] > slow[i]
+    crossed = False
+    for i in range(-lookback, 0):
+        if (not np.isnan(fast[i]) and not np.isnan(slow[i]) and
+                not np.isnan(fast[i - 1]) and not np.isnan(slow[i - 1])):
+            if fast[i - 1] <= slow[i - 1] and fast[i] > slow[i]:
+                crossed = True
+                break
+    fn = float(fast[-1]) if not np.isnan(fast[-1]) else 0.0
+    sn = float(slow[-1]) if not np.isnan(slow[-1]) else 0.0
+    gap = (fn - sn) / (sn + 1e-12) * 100.0
+    return {
+        "crossed":   crossed,
+        "imminent":  bool(abs(gap) < 0.15 and fn > sn * 0.998),
+        "fast_now":  fn,
+        "slow_now":  sn,
+        "gap_pct":   float(gap),
+    }
+
+
+def _sine_cosine_trough_state(closes: list, cycle_bars: int) -> dict:
+    """
+    Fit price = C0 + A·sin(ωt + φ) via OLS.
+    Compute sin and cos components at the current bar.
+    Determine proximity to the ideal mathematical trough.
+
+    The ideal trough: sin_component = 0 (crossing upward), cos_component = +max.
+    In terms of the fitted model: when ωt + φ ≡ -π/2 (mod 2π), sin = -1 (absolute min).
+    The RECOVERY POINT is when ωt + φ ≡ 0 (mod 2π), sin = 0 rising, cos = 1.
+
+    divergence_angle:
+      0°  = exactly at the mathematical recovery point (sin=0 rising, cos=1)
+      90° = at the bottom of the sine (sin=-1)
+      180°= at the top (sin=+1)
+
+    We want divergence_angle close to 0 (near recovery) OR close to 90
+    (at bottom, about to turn) — both are valid entry zones.
+    Near 90° = "at the floor",  near 0° = "just turned".
+    """
+    arr = np.asarray(closes, dtype=float)
+    n   = len(arr)
+    empty = {"sin_val": 0.0, "cos_val": 0.0, "div_angle_deg": 90.0,
+             "at_trough": False, "just_turned": False, "trough_proximity": 0.0,
+             "cycle_phase_deg": 0.0, "amplitude": 0.0, "r_squared": 0.0}
+    if n < cycle_bars * 2 or cycle_bars < 4:
+        return empty
+    t     = np.arange(n, dtype=float)
+    omega = 2.0 * np.pi / cycle_bars
+    # OLS: price = c0 + c_sin·sin(ωt) + c_cos·cos(ωt) + c_drift·t
+    A_mat = np.column_stack([np.ones(n),
+                              np.sin(omega * t),
+                              np.cos(omega * t),
+                              t])
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A_mat, arr, rcond=None)
+    except Exception:
+        return empty
+    c0, c_sin, c_cos, c_drift = coeffs
+    amplitude = float(np.sqrt(c_sin ** 2 + c_cos ** 2))
+    if amplitude < 1e-10:
+        return empty
+    # Current phase angle
+    phase_offset = float(np.arctan2(c_cos, c_sin))   # OLS phase
+    cur_phase    = (omega * (n - 1) + phase_offset)   # unwrapped
+    cur_phase_mod = float(cur_phase % (2 * np.pi))
+    # Normalised sin/cos at current bar (unit amplitude)
+    sin_val = float(np.sin(cur_phase_mod))
+    cos_val = float(np.cos(cur_phase_mod))
+    # R² of the fit
+    fitted = A_mat @ coeffs
+    ss_res = float(np.sum((arr - fitted) ** 2))
+    ss_tot = float(np.sum((arr - np.mean(arr)) ** 2) + 1e-9)
+    r_sq   = float(np.clip(1.0 - ss_res / ss_tot, 0.0, 1.0))
+    # Divergence angle from the ideal recovery point (sin=0, cos=+1)
+    # Using vector angle: ideal = (cos=1, sin=0), current = (cos_val, sin_val)
+    div_angle = float(np.degrees(np.arctan2(abs(sin_val), max(cos_val, 0.0))))
+    div_angle = float(np.clip(div_angle, 0.0, 180.0))
+    # at_trough: phase is in [π*0.75, π*1.25] i.e. near sin = -1
+    at_trough  = bool(np.pi * 0.70 <= cur_phase_mod <= np.pi * 1.30)
+    # just_turned: phase is in [0, π*0.30] or [2π-0.30π, 2π] i.e. near sin = 0 rising
+    just_turned = bool(cur_phase_mod <= np.pi * 0.30 or
+                       cur_phase_mod >= np.pi * 1.70)
+    # Trough proximity: 1.0 at the bottom (phase=π), decays to 0 at phase=0
+    trough_prox = float(np.clip(
+        1.0 - abs(cur_phase_mod - np.pi) / np.pi, 0.0, 1.0
+    ))
+    return {
+        "sin_val":           sin_val,
+        "cos_val":           cos_val,
+        "div_angle_deg":     div_angle,
+        "at_trough":         at_trough,
+        "just_turned":       just_turned,
+        "trough_proximity":  trough_prox,
+        "cycle_phase_deg":   float(np.degrees(cur_phase_mod)),
+        "amplitude":         amplitude,
+        "r_squared":         r_sq,
+    }
+
+
+def _energy_density_per_tf(closes: list, level: int = 5) -> dict:
+    """
+    Compute wavelet energy density per frequency band.
+
+    Energy density = mean(detail_band²) / len(band)
+    For exhaustion confirmation, we check whether energy density is
+    DECLINING in recent bars vs the historical average for each band.
+
+    Returns per-band (trend, swing, micro) energy densities and
+    the 'all_declining' flag.
+    """
+    arr = np.asarray(closes, dtype=float)
+    n   = len(arr)
+    if n < 64:
+        return {"trend_ed": 0.0, "swing_ed": 0.0, "micro_ed": 0.0,
+                "trend_declining": False, "swing_declining": False,
+                "micro_declining": False, "all_declining": False,
+                "energy_collapse_score": 0.0}
+    bands = wavelet_decompose(arr, level=min(level, 4))
+    def band_energy_density(b_arr: np.ndarray, window: int = 20) -> tuple:
+        if len(b_arr) < window * 2:
+            return 0.0, 0.0, False
+        hist_ed = float(np.mean(b_arr[:-window] ** 2) / (len(b_arr) - window + 1e-9))
+        rec_ed  = float(np.mean(b_arr[-window:] ** 2) / (window + 1e-9))
+        declining = bool(rec_ed < hist_ed * 0.80)   # recent 20%+ below historical
+        return hist_ed, rec_ed, declining
+    trend_h, trend_r, trend_dec = band_energy_density(bands.get('trend', np.zeros(n)))
+    swing_h, swing_r, swing_dec = band_energy_density(bands.get('swing', np.zeros(n)))
+    micro_h, micro_r, micro_dec = band_energy_density(bands.get('micro', np.zeros(n)))
+    all_dec   = trend_dec and swing_dec and micro_dec
+    # Collapse score: how far below historical are ALL bands?
+    def ratio_score(h, r): return float(np.clip(1.0 - r / (h + 1e-9), 0.0, 1.0))
+    collapse = np.mean([ratio_score(trend_h, trend_r),
+                        ratio_score(swing_h, swing_r),
+                        ratio_score(micro_h, micro_r)])
+    return {
+        "trend_ed_hist":    trend_h, "trend_ed_recent":  trend_r,
+        "swing_ed_hist":    swing_h, "swing_ed_recent":  swing_r,
+        "micro_ed_hist":    micro_h, "micro_ed_recent":  micro_r,
+        "trend_declining":  trend_dec,
+        "swing_declining":  swing_dec,
+        "micro_declining":  micro_dec,
+        "all_declining":    all_dec,
+        "energy_collapse_score": float(collapse),
+    }
+
+
+def _wyckoff_spring_detected(raw_klines: list, min_bars: int = 5) -> dict:
+    """
+    Wyckoff spring: last N bars made successively lower lows, BUT
+    with DECREASING volume on each new low.
+    Sellers are running out of fuel — this is the final capitulation
+    before the reversal spike.
+
+    Also detects the classic Wyckoff 'test': after a spring, price
+    retests the low on even LOWER volume — strongest spring signature.
+
+    Returns:
+      spring      – bool: decreasing-vol new-lows pattern found
+      test        – bool: spring + retest both detected
+      new_lows    – number of successive new lows found
+      vol_decline – average % decline in volume across new-low bars
+      strength    – 0-1 composite strength
+    """
+    if not raw_klines or len(raw_klines) < min_bars + 2:
+        return {"spring": False, "test": False, "new_lows": 0,
+                "vol_decline": 0.0, "strength": 0.0}
+    # Find bars with new lows
+    closes = [float(k[4]) for k in raw_klines]
+    lows   = [float(k[3]) for k in raw_klines]
+    vols   = [float(k[5]) for k in raw_klines]
+    # Walk backward from current bar looking for sequence of new-low bars
+    new_low_bars = []
+    running_low  = float('inf')
+    for i in range(len(lows) - 1, max(0, len(lows) - 20), -1):
+        if lows[i] < running_low:
+            running_low = lows[i]
+            new_low_bars.append(i)
+        else:
+            if len(new_low_bars) >= 2:
+                break
+    new_low_bars = list(reversed(new_low_bars))
+    if len(new_low_bars) < 2:
+        return {"spring": False, "test": False, "new_lows": 0,
+                "vol_decline": 0.0, "strength": 0.0}
+    # Check volumes on those bars are decreasing
+    vols_at_lows = [vols[i] for i in new_low_bars]
+    vol_declining = all(vols_at_lows[i] > vols_at_lows[i + 1]
+                        for i in range(len(vols_at_lows) - 1))
+    # Volume decline magnitude
+    if len(vols_at_lows) >= 2 and vols_at_lows[0] > 0:
+        vol_dec_pct = float((vols_at_lows[0] - vols_at_lows[-1]) /
+                             vols_at_lows[0] * 100.0)
+    else:
+        vol_dec_pct = 0.0
+    spring = vol_declining and len(new_low_bars) >= 2
+    # Test detection: after the last new low, does price attempt the low again
+    # with even lower volume?
+    test = False
+    if spring and len(raw_klines) > new_low_bars[-1] + 2:
+        post_bars  = raw_klines[new_low_bars[-1] + 1:]
+        if post_bars:
+            retest_low  = min(float(k[3]) for k in post_bars[:5])
+            retest_vol  = min(float(k[5]) for k in post_bars[:5])
+            orig_low    = lows[new_low_bars[-1]]
+            orig_vol    = vols[new_low_bars[-1]]
+            test = bool(retest_low <= orig_low * 1.003 and
+                        retest_vol < orig_vol * 0.70)
+    strength = float(np.clip(
+        0.50 * float(spring) +
+        0.30 * float(test) +
+        0.20 * float(np.clip(vol_dec_pct / 50.0, 0.0, 1.0)),
+        0.0, 1.0
+    ))
+    return {
+        "spring":      spring,
+        "test":        test,
+        "new_lows":    len(new_low_bars),
+        "vol_decline": vol_dec_pct,
+        "strength":    strength,
+    }
+
+
+def _dominant_cycle_fft(closes: list) -> int:
+    """Quick FFT dominant-cycle detection. Returns bars (int)."""
+    arr = np.asarray(closes, dtype=float)
+    n   = len(arr)
+    if n < 32:
+        return 20
+    detrended = arr - np.polyval(np.polyfit(np.arange(n), arr, 1), np.arange(n))
+    fft_v  = np.abs(np.fft.rfft(detrended))
+    fft_f  = np.fft.rfftfreq(n)
+    fft_f  = np.where(fft_f == 0, 1e-12, fft_f)
+    peak   = int(np.argmax(fft_v[1:]) + 1)
+    cyc    = int(round(1.0 / fft_f[peak]))
+    return int(np.clip(cyc, 6, n // 2))
+
+
+def _harmonic_anchor_score(trader, symbol: str,
+                             current_price: float,
+                             tolerance_pct: float = 0.40) -> dict:
+    """
+    Magnetic resonance between extrema across TFs.
+
+    For each TF (1m, 5m, 15m, 4h):
+      1. Detect the dominant cycle
+      2. Fit the cyclic regression line
+      3. Find the last fitted trough PRICE (cyclic midline - amplitude)
+
+    If the current price is within `tolerance_pct`% of the fitted trough
+    price on 2+ TFs, they are "resonant" — the same magnetic price level
+    is a turning point across multiple frequencies.
+
+    anchor_count: 0-4 (number of TFs where current price ≈ cyclic trough)
+    resonant    : bool (anchor_count >= 2)
+    anchor_score: 0-1
+    """
+    tfs = [('1m', 500), ('5m', 200), ('15m', 200), ('4h', 200)]
+    trough_prices = {}
+    for interval, limit in tfs:
+        try:
+            c = trader.get_klines(symbol, interval, limit=limit)
+            if not c or len(c) < 40:
+                continue
+            cyc = _dominant_cycle_fft(c)
+            fit = cyclic_line_fit(np.asarray(c, dtype=float), cyc)
+            trough_prices[interval] = float(fit.get("fitted_low_price", 0.0))
+        except Exception:
+            pass
+    if not trough_prices:
+        return {"anchor_count": 0, "resonant": False,
+                "anchor_score": 0.0, "anchor_tfs": []}
+    anchor_tfs = []
+    for interval, tp in trough_prices.items():
+        if tp <= 0:
+            continue
+        dist_pct = abs(current_price - tp) / (tp + 1e-12) * 100.0
+        if dist_pct <= tolerance_pct:
+            anchor_tfs.append(interval)
+    count = len(anchor_tfs)
+    return {
+        "anchor_count":  count,
+        "resonant":      count >= 2,
+        "anchor_score":  float(np.clip(count / 4.0, 0.0, 1.0)),
+        "anchor_tfs":    anchor_tfs,
+        "trough_prices": trough_prices,
+    }
+
+
+def compute_exhaustion_profile(trader, symbol: str) -> dict:
+    """
+    Master exhaustion profile.  Runs all seven exhaustion proofs
+    concurrently where possible.
+
+    Returns a single dict with:
+      resonance_score      : 0-1 composite (PRIMARY sort key)
+      exhaustion_confirmed : bool (resonance_score >= 0.68)
+      + all sub-signals
+
+    Sort order for best candidate selection:
+      1. exhaustion_confirmed = True  (mandatory tier)
+      2. resonance_score DESC         (depth of confirmation)
+      3. rsi_1m ASC                   (most oversold wins ties)
+      4. anchor_count DESC            (most resonant TFs)
     """
     result = {
-        # per-TF argmin
-        "argmin_1m":      False,
-        "argmin_5m":      False,
-        "argmin_15m":     False,
-        "argmin_count":   0,
-        "argmin_all_3":   False,
-        # geometry
-        "geo_1m":         {},
-        "geo_5m":         {},
-        # RSI
-        "rsi_1m":         {"rsi_val": 50.0, "rsi_oversold": False,
-                           "rsi_extreme": False, "rsi_depth": 0.0},
-        # bull vol
-        "vol_1m":         {"bull_majority": False, "bull_pct": 50.0},
-        # composite
-        "micro_score":    0.0,
-        "rsi_val":        50.0,
-        "hard_pass":      False,
+        "resonance_score":      0.0,
+        "exhaustion_confirmed": False,
+        # sine/cosine
+        "sc_1m": {}, "sc_5m": {}, "sc_15m": {},
+        # SMA cross
+        "sma_cross_1m": {}, "sma_cross_5m": {}, "sma_cross_15m": {},
+        "sma_cross_count": 0,
+        # energy density
+        "energy_1m": {}, "energy_5m": {},
+        # wyckoff
+        "wyckoff_1m": {}, "wyckoff_5m": {},
+        # harmonic anchor
+        "anchor": {},
+        # RSI (kept for sort tiebreak)
+        "rsi_1m": 50.0,
+        # argmin recency (kept from v25)
+        "argmin_1m": False, "argmin_5m": False, "argmin_15m": False,
+        "argmin_count": 0,
+        # bull vol (kept)
+        "bull_vol_1m": 50.0, "bull_vol_majority": False,
     }
+    current_price = 0.0
+    # ── 1m ───────────────────────────────────────────────────────────
     try:
-        # ── 1m ───────────────────────────────────────────────────────
         kl1 = trader.get_klines(symbol, '1m', limit=500, return_raw=True)
-        if kl1 and len(kl1) >= 30:
-            c1 = [float(k[4]) for k in kl1]
-            result["argmin_1m"] = argmin_more_recent_than_argmax(c1)
-            result["geo_1m"]    = price_vs_time_geometry(c1, lookback=100)
-            result["rsi_1m"]    = lowest_rsi_1m(c1)
-            result["vol_1m"]    = bull_vol_dominance_1m(kl1)
-            result["rsi_val"]   = result["rsi_1m"]["rsi_val"]
+        if kl1 and len(kl1) >= 60:
+            c1  = [float(k[4]) for k in kl1]
+            current_price = c1[-1]
+            cyc1 = _dominant_cycle_fft(c1)
+            # Sine/cosine trough state
+            result["sc_1m"] = _sine_cosine_trough_state(c1, cyc1)
+            # SMA cross
+            fp1 = max(3, cyc1 // 4)
+            sp1 = max(6, cyc1 // 2)
+            result["sma_cross_1m"] = _sma_cross_recent(c1, fp1, sp1, lookback=3)
+            # Energy density
+            result["energy_1m"] = _energy_density_per_tf(c1)
+            # Wyckoff spring
+            result["wyckoff_1m"] = _wyckoff_spring_detected(kl1, min_bars=3)
+            # RSI
+            rsi_arr = ta.RSI(np.asarray(c1), timeperiod=14)
+            valid   = rsi_arr[~np.isnan(rsi_arr)]
+            result["rsi_1m"] = float(valid[-1]) if len(valid) > 0 else 50.0
+            # Bull vol
+            bull = sum(float(k[5]) for k in kl1 if float(k[4]) >= float(k[1]))
+            bear = sum(float(k[5]) for k in kl1 if float(k[4]) <  float(k[1]))
+            tot  = bull + bear + 1e-12
+            result["bull_vol_1m"]       = float(bull / tot * 100.0)
+            result["bull_vol_majority"] = bool(bull > bear)
+            # Argmin
+            arr1 = np.asarray(c1)
+            result["argmin_1m"] = bool(int(np.argmin(arr1)) > int(np.argmax(arr1)))
     except Exception:
         pass
+    # ── 5m ───────────────────────────────────────────────────────────
     try:
-        # ── 5m ───────────────────────────────────────────────────────
         kl5 = trader.get_klines(symbol, '5m', limit=200, return_raw=True)
-        if kl5 and len(kl5) >= 20:
-            c5 = [float(k[4]) for k in kl5]
-            result["argmin_5m"] = argmin_more_recent_than_argmax(c5)
-            result["geo_5m"]    = price_vs_time_geometry(c5, lookback=100)
+        if kl5 and len(kl5) >= 40:
+            c5  = [float(k[4]) for k in kl5]
+            cyc5 = _dominant_cycle_fft(c5)
+            result["sc_5m"]       = _sine_cosine_trough_state(c5, cyc5)
+            fp5 = max(3, cyc5 // 4)
+            sp5 = max(6, cyc5 // 2)
+            result["sma_cross_5m"] = _sma_cross_recent(c5, fp5, sp5, lookback=3)
+            result["energy_5m"]    = _energy_density_per_tf(c5)
+            result["wyckoff_5m"]   = _wyckoff_spring_detected(kl5, min_bars=3)
+            arr5 = np.asarray(c5)
+            result["argmin_5m"] = bool(int(np.argmin(arr5)) > int(np.argmax(arr5)))
     except Exception:
         pass
+    # ── 15m ──────────────────────────────────────────────────────────
     try:
-        # ── 15m ──────────────────────────────────────────────────────
         kl15 = trader.get_klines(symbol, '15m', limit=200, return_raw=True)
-        if kl15 and len(kl15) >= 20:
-            c15 = [float(k[4]) for k in kl15]
-            result["argmin_15m"] = argmin_more_recent_than_argmax(c15)
+        if kl15 and len(kl15) >= 40:
+            c15  = [float(k[4]) for k in kl15]
+            cyc15 = _dominant_cycle_fft(c15)
+            result["sc_15m"]        = _sine_cosine_trough_state(c15, cyc15)
+            fp15 = max(3, cyc15 // 4)
+            sp15 = max(6, cyc15 // 2)
+            result["sma_cross_15m"] = _sma_cross_recent(c15, fp15, sp15, lookback=3)
+            arr15 = np.asarray(c15)
+            result["argmin_15m"] = bool(int(np.argmin(arr15)) > int(np.argmax(arr15)))
     except Exception:
         pass
-
-    # ── derived aggregates ───────────────────────────────────────────
-    argmin_count = sum([result["argmin_1m"], result["argmin_5m"], result["argmin_15m"]])
-    result["argmin_count"] = argmin_count
-    result["argmin_all_3"] = bool(argmin_count == 3)
-
-    geo1 = result["geo_1m"]
-    geo5 = result["geo_5m"]
-    rsi  = result["rsi_1m"]
-    vol  = result["vol_1m"]
-
-    # ── composite micro_score (0-1, higher = deeper/better dip) ─────
-    # Component weights:
-    #   RSI depth    0.30  — primary: how oversold is it?
-    #   geo 1m       0.20  — bowl geometry forming on 1m?
-    #   geo 5m       0.15  — bowl geometry forming on 5m?
-    #   argmin 1m    0.15  — most recent extreme was a low on 1m?
-    #   argmin 5m    0.08  — confirmed on 5m?
-    #   argmin 15m   0.07  — confirmed on 15m?
-    #   bull vol     0.05  — absorption confirmation
-    micro_score = (
-        rsi.get("rsi_depth",  0.0) * 0.30 +
-        geo1.get("geo_score", 0.0) * 0.20 +
-        geo5.get("geo_score", 0.0) * 0.15 +
-        float(result["argmin_1m"])  * 0.15 +
-        float(result["argmin_5m"])  * 0.08 +
-        float(result["argmin_15m"]) * 0.07 +
-        float(vol.get("bull_majority", False)) * 0.05
+    # ── Harmonic anchor (uses all TFs internally) ─────────────────────
+    try:
+        if current_price > 0:
+            result["anchor"] = _harmonic_anchor_score(trader, symbol, current_price)
+    except Exception:
+        result["anchor"] = {"anchor_count": 0, "resonant": False,
+                            "anchor_score": 0.0, "anchor_tfs": []}
+    # ── Derived aggregates ────────────────────────────────────────────
+    ac = sum([result["argmin_1m"], result["argmin_5m"], result["argmin_15m"]])
+    result["argmin_count"] = ac
+    # SMA cross count across TFs
+    sma_count = sum([
+        bool(result["sma_cross_1m"].get("crossed") or
+             result["sma_cross_1m"].get("imminent")),
+        bool(result["sma_cross_5m"].get("crossed") or
+             result["sma_cross_5m"].get("imminent")),
+        bool(result["sma_cross_15m"].get("crossed") or
+             result["sma_cross_15m"].get("imminent")),
+    ])
+    result["sma_cross_count"] = sma_count
+    # ── RESONANCE SCORE (0-1) ─────────────────────────────────────────
+    #
+    # Component weights — each targeting one dimension of exhaustion:
+    #
+    #  Sine/cos trough proximity 1m  → 0.18  (are we AT the mathematical trough?)
+    #  Sine/cos trough proximity 5m  → 0.12
+    #  SMA cross count (0-3 TFs)     → 0.15  (frequency-locked momentum flip)
+    #  Energy collapse 1m            → 0.12  (selling impulse spent across freqs)
+    #  Energy collapse 5m            → 0.08
+    #  Wyckoff spring 1m             → 0.12  (volume exhaustion on new lows)
+    #  Harmonic anchor score         → 0.10  (magnetic resonance across TFs)
+    #  RSI depth 1m                  → 0.08  (oversold fuel)
+    #  Argmin recency (0-3 / 3)      → 0.05  (floor established recently)
+    #
+    sc1_prox = float(result["sc_1m"].get("trough_proximity", 0.0))
+    sc5_prox = float(result["sc_5m"].get("trough_proximity", 0.0))
+    sma_frac = sma_count / 3.0
+    e1_score = float(result["energy_1m"].get("energy_collapse_score", 0.0))
+    e5_score = float(result["energy_5m"].get("energy_collapse_score", 0.0))
+    wy1_str  = float(result["wyckoff_1m"].get("strength", 0.0))
+    anchor_s = float(result["anchor"].get("anchor_score", 0.0))
+    rsi_d    = float(np.clip((70.0 - result["rsi_1m"]) / 70.0, 0.0, 1.0))
+    arg_frac = ac / 3.0
+    # Bonus flags
+    sc1_just_turned = float(result["sc_1m"].get("just_turned", False))
+    sc1_at_trough   = float(result["sc_1m"].get("at_trough",   False))
+    wy1_test        = float(result["wyckoff_1m"].get("test", False))
+    anchor_resonant = float(result["anchor"].get("resonant", False))
+    resonance = (
+        sc1_prox  * 0.18 +
+        sc5_prox  * 0.12 +
+        sma_frac  * 0.15 +
+        e1_score  * 0.12 +
+        e5_score  * 0.08 +
+        wy1_str   * 0.12 +
+        anchor_s  * 0.10 +
+        rsi_d     * 0.08 +
+        arg_frac  * 0.05 +
+        # Bonus: exact trough state
+        sc1_just_turned * 0.06 +
+        sc1_at_trough   * 0.03 +
+        wy1_test        * 0.04 +
+        anchor_resonant * 0.04
     )
-    result["micro_score"] = float(np.clip(micro_score, 0.0, 1.0))
-
-    # ── hard_pass: all mandatory micro conditions met ────────────────
-    result["hard_pass"] = bool(
-        result["argmin_all_3"] and
-        rsi.get("rsi_oversold", False) and
-        vol.get("bull_majority", False) and
-        (geo1.get("below_trend", False) or geo5.get("below_trend", False))
-    )
-
+    # Cap at 1.0 — bonuses can push above base
+    resonance = float(np.clip(resonance, 0.0, 1.0))
+    result["resonance_score"]      = resonance
+    result["exhaustion_confirmed"] = bool(resonance >= 0.68)
     return result
 
 
-def pick_best_micro_candidate(trader, symbols: List[str],
-                               label: str,
-                               max_workers: int = 15) -> Tuple:
+def pick_best_exhausted_candidate(trader, symbols: List[str],
+                                   label: str,
+                                   max_workers: int = 12) -> tuple:
     """
-    Given a pool of symbols that already passed major-TF gates,
-    fetch micro-TF data concurrently and rank by:
-      1. hard_pass = True  (mandatory — if any exist, only those advance)
-      2. micro_score DESC  (primary numeric sort key)
-      3. rsi_val ASC       (secondary: lowest RSI wins tiebreaks)
-      4. argmin_count DESC (tertiary: most TFs confirming the floor)
+    Rank all symbols by exhaustion_profile.resonance_score.
 
-    Returns (symbol, micro_dict) for the winner, or None if pool is empty.
+    Sort order:
+      1. exhaustion_confirmed = True  (hard tier — must be exhausted)
+      2. resonance_score DESC         (depth of confirmation)
+      3. rsi_1m ASC                   (most oversold wins ties)
+      4. anchor_count DESC            (most resonant TFs)
 
-    Why this ordering?
-      hard_pass ensures ALL mandatory conditions are simultaneously met.
-      micro_score is a weighted combination that rewards assets with the
-      deepest RSI + bowl geometry + argmin recency across TFs.
-      rsi_val as tiebreaker catches two assets with equal micro_score —
-      the one that is MORE oversold has more mean-reversion fuel.
-      argmin_count as final tiebreaker picks the one with the most
-      synchronized micro bottom across all three timeframes.
+    Returns (symbol, exhaustion_dict) for the winner, or None.
     """
     if not symbols:
         return None
-
     W = 78
-    print(f"\n  🔬  Micro-TF scoring {len(symbols)} {label} candidates...")
-
-    scores = {}
-    tracker = ProgressTracker(len(symbols), "micro-TF scoring")
+    print(f"\n  ⚡  Exhaustion-scoring {len(symbols)} {label} candidates...")
+    profiles = {}
+    tracker  = ProgressTracker(len(symbols), "exhaustion scoring")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(compute_micro_dip_score, trader, s): s for s in symbols}
+        futures = {ex.submit(compute_exhaustion_profile, trader, s): s
+                   for s in symbols}
         for f in as_completed(futures):
             try:
-                sym = futures[f]
-                micro = f.result()
-                scores[sym] = micro
-                tracker.update(passed=bool(micro.get("hard_pass")))
+                sym  = futures[f]
+                prof = f.result()
+                profiles[sym] = prof
+                tracker.update(passed=bool(prof.get("exhaustion_confirmed")))
                 print(tracker.get_stats(), end="", flush=True)
             except Exception:
                 tracker.update()
     print(f"\r{tracker.get_stats()}" + " " * 20)
-
-    if not scores:
+    if not profiles:
         return None
-
-    # Separate hard_pass from non-hard_pass
-    hard = [(s, m) for s, m in scores.items() if m.get("hard_pass")]
-    soft = [(s, m) for s, m in scores.items() if not m.get("hard_pass")]
-
+    confirmed = [(s, p) for s, p in profiles.items() if p.get("exhaustion_confirmed")]
+    unconfirmed = [(s, p) for s, p in profiles.items() if not p.get("exhaustion_confirmed")]
     def sort_key(pair):
-        _, m = pair
+        _, p = pair
         return (
-            -m.get("micro_score",  0.0),   # higher is better
-             m.get("rsi_val",     50.0),   # lower is better
-            -m.get("argmin_count", 0),     # higher is better
+            -p.get("resonance_score", 0.0),
+             p.get("rsi_1m", 50.0),
+            -p.get("argmin_count", 0),
+            -p.get("anchor", {}).get("anchor_count", 0),
         )
-
-    hard.sort(key=sort_key)
-    soft.sort(key=sort_key)
-
-    ranked = hard + soft   # hard_pass always first
-
-    print(f"\n  📊  Micro-TF ranked ({label}) — {len(hard)} hard-pass / {len(soft)} soft:")
-    for i, (sym, m) in enumerate(ranked[:8], 1):
-        hp  = "✅HARD" if m.get("hard_pass") else "·soft"
-        arg = f"argmin={m.get('argmin_count',0)}/3"
-        rsi = f"RSI={m.get('rsi_val',50):.1f}"
-        g1  = f"geo1m={m.get('geo_1m',{}).get('geo_score',0)*100:.0f}%"
-        bv  = f"bullvol={m.get('vol_1m',{}).get('bull_pct',50):.0f}%"
-        sc  = f"score={m.get('micro_score',0):.3f}"
-        print(f"     #{i:<2} {sym:<20} {hp}  {sc}  {arg}  {rsi}  {g1}  {bv}")
-
-    best_sym, best_micro = ranked[0]
-    return (best_sym, best_micro)
+    confirmed.sort(key=sort_key)
+    unconfirmed.sort(key=sort_key)
+    ranked = confirmed + unconfirmed
+    n_confirmed = len(confirmed)
+    print(f"\n  📊  Exhaustion ranked ({label}) — "
+          f"{n_confirmed} confirmed / {len(unconfirmed)} soft:")
+    for i, (sym, p) in enumerate(ranked[:8], 1):
+        tier = "✅EXHST" if p.get("exhaustion_confirmed") else "·soft "
+        rs   = f"res={p.get('resonance_score', 0)*100:.1f}%"
+        rsi  = f"RSI={p.get('rsi_1m', 50):.1f}"
+        sc1  = f"sinφ={p.get('sc_1m', {}).get('trough_proximity', 0)*100:.0f}%"
+        sma  = f"SMAx={p.get('sma_cross_count', 0)}/3"
+        wy   = f"wy={p.get('wyckoff_1m', {}).get('strength', 0)*100:.0f}%"
+        anc  = f"anc={p.get('anchor', {}).get('anchor_count', 0)}"
+        print(f"     #{i:<2} {sym:<20} {tier}  {rs}  {rsi}  {sc1}  {sma}  {wy}  {anc}")
+    return ranked[0]
 
 
-def format_micro_block(micro: dict, W: int = 74):
+def format_exhaustion_block(exh: dict, W: int = 74):
     """
-    Print the micro-TF dip quality block inside format_sr_output.
-    Shows all five filter results plus composite score and hard_pass verdict.
+    Print the full exhaustion profile block in format_sr_output.
+    Shows all seven exhaustion dimensions + resonance score verdict.
     """
-    if not micro:
+    if not exh:
         return
     print("─" * W)
-    print("  🔬  MICRO-TF DIP QUALITY FILTERS  (1m / 5m / 15m)")
+    print("  ⚡  CONFIRMED DIP EXHAUSTION ENGINE  (7-DIMENSIONAL PROOF)")
     print("─" * W)
-
     def yn(v): return "✅ YES" if v else "❌ NO"
-    def cv(v): return "↑ UP (bowl)" if v > 0 else ("↓ DOWN (cliff)" if v < 0 else "─ flat")
-
-    # argmin recency row
-    a1  = micro.get("argmin_1m",  False)
-    a5  = micro.get("argmin_5m",  False)
-    a15 = micro.get("argmin_15m", False)
-    ac  = micro.get("argmin_count", 0)
-    print(f"  Argmin > Argmax  "
-          f"[1m]: {yn(a1)}   [5m]: {yn(a5)}   [15m]: {yn(a15)}   "
-          f"({ac}/3 TFs confirm floor)")
-
-    # geometry rows
-    g1 = micro.get("geo_1m", {})
-    g5 = micro.get("geo_5m", {})
-    print(f"  Price/Time Geo [1m] : "
-          f"angle={g1.get('angle_deg',0):+.2f}°  "
-          f"below_trend={yn(g1.get('below_trend'))}  "
-          f"curvature={cv(g1.get('curvature',0))}  "
-          f"score={g1.get('geo_score',0)*100:.0f}%")
-    print(f"  Price/Time Geo [5m] : "
-          f"angle={g5.get('angle_deg',0):+.2f}°  "
-          f"below_trend={yn(g5.get('below_trend'))}  "
-          f"curvature={cv(g5.get('curvature',0))}  "
-          f"score={g5.get('geo_score',0)*100:.0f}%")
-
-    # RSI
-    r = micro.get("rsi_1m", {})
-    print(f"  RSI(14)      [1m]   : "
-          f"{r.get('rsi_val',50):.2f}  "
-          f"oversold={yn(r.get('rsi_oversold'))}  "
-          f"extreme={yn(r.get('rsi_extreme'))}  "
-          f"depth={r.get('rsi_depth',0)*100:.0f}%")
-
-    # bull vol
-    v = micro.get("vol_1m", {})
-    bp = v.get("bull_pct", 50.0)
-    print(f"  1m Bull Vol         : "
-          f"{bp:.1f}% bull / {100-bp:.1f}% bear  "
-          f"majority={yn(v.get('bull_majority'))}")
-
-    # composite
-    ms  = micro.get("micro_score", 0.0)
-    hp  = micro.get("hard_pass",   False)
-    bar = "█" * int(ms * 20) + "░" * (20 - int(ms * 20))
-    verdict = "✅ HARD PASS — all mandatory micro conditions met" if hp else "⚠️  SOFT — partial micro confirmation"
-    print(f"  Micro Score         : [{bar}]  {ms*100:.1f}%  {verdict}")
+    rs   = exh.get("resonance_score", 0.0)
+    conf = exh.get("exhaustion_confirmed", False)
+    # 1. Sine/cosine trough state
+    sc1 = exh.get("sc_1m", {})
+    sc5 = exh.get("sc_5m", {})
+    print(f"  [1] Sine/Cos Trough  [1m] : "
+          f"phase={sc1.get('cycle_phase_deg',0):.0f}°  "
+          f"sin={sc1.get('sin_val',0):+.3f}  cos={sc1.get('cos_val',0):+.3f}  "
+          f"prox={sc1.get('trough_proximity',0)*100:.0f}%  "
+          f"at_trough={yn(sc1.get('at_trough'))}  "
+          f"just_turned={yn(sc1.get('just_turned'))}")
+    print(f"       Sine/Cos Trough  [5m] : "
+          f"phase={sc5.get('cycle_phase_deg',0):.0f}°  "
+          f"prox={sc5.get('trough_proximity',0)*100:.0f}%  "
+          f"at_trough={yn(sc5.get('at_trough'))}  "
+          f"R²={sc5.get('r_squared',0):.2f}")
+    # 2. SMA cross
+    sx1 = exh.get("sma_cross_1m",  {})
+    sx5 = exh.get("sma_cross_5m",  {})
+    sx15= exh.get("sma_cross_15m", {})
+    sxc = exh.get("sma_cross_count", 0)
+    print(f"  [2] SMA Cross [1m]: {yn(sx1.get('crossed') or sx1.get('imminent'))} "
+          f"gap={sx1.get('gap_pct',0):+.3f}%  "
+          f"[5m]: {yn(sx5.get('crossed') or sx5.get('imminent'))}  "
+          f"[15m]: {yn(sx15.get('crossed') or sx15.get('imminent'))}  "
+          f"({sxc}/3 TFs)")
+    # 3. Energy density
+    e1 = exh.get("energy_1m", {})
+    e5 = exh.get("energy_5m", {})
+    print(f"  [3] Energy Collapse [1m]: "
+          f"trend={yn(e1.get('trend_declining'))}  "
+          f"swing={yn(e1.get('swing_declining'))}  "
+          f"micro={yn(e1.get('micro_declining'))}  "
+          f"all={yn(e1.get('all_declining'))}  "
+          f"score={e1.get('energy_collapse_score',0)*100:.0f}%")
+    print(f"       Energy Collapse [5m]: "
+          f"trend={yn(e5.get('trend_declining'))}  "
+          f"swing={yn(e5.get('swing_declining'))}  "
+          f"micro={yn(e5.get('micro_declining'))}  "
+          f"all={yn(e5.get('all_declining'))}  "
+          f"score={e5.get('energy_collapse_score',0)*100:.0f}%")
+    # 4. Wyckoff spring
+    wy1 = exh.get("wyckoff_1m", {})
+    wy5 = exh.get("wyckoff_5m", {})
+    print(f"  [4] Wyckoff Spring  [1m]: "
+          f"spring={yn(wy1.get('spring'))}  "
+          f"test={yn(wy1.get('test'))}  "
+          f"new_lows={wy1.get('new_lows',0)}  "
+          f"vol_decline={wy1.get('vol_decline',0):.1f}%  "
+          f"strength={wy1.get('strength',0)*100:.0f}%")
+    print(f"       Wyckoff Spring  [5m]: "
+          f"spring={yn(wy5.get('spring'))}  "
+          f"test={yn(wy5.get('test'))}  "
+          f"strength={wy5.get('strength',0)*100:.0f}%")
+    # 5. Harmonic anchor
+    anc = exh.get("anchor", {})
+    atfs = anc.get("anchor_tfs", [])
+    print(f"  [5] Harmonic Anchor : "
+          f"count={anc.get('anchor_count',0)}/4 TFs  "
+          f"resonant={yn(anc.get('resonant'))}  "
+          f"tfs={atfs}  "
+          f"score={anc.get('anchor_score',0)*100:.0f}%")
+    # 6. RSI + argmin + bull vol
+    rsi_v = exh.get("rsi_1m", 50.0)
+    bv    = exh.get("bull_vol_1m", 50.0)
+    ac    = exh.get("argmin_count", 0)
+    print(f"  [6] RSI(14) [1m]    : {rsi_v:.2f}  "
+          f"{'✅ OVERSOLD' if rsi_v < 30 else ('⚠️ borderline' if rsi_v < 40 else '❌ not oversold')}")
+    print(f"  [7] Argmin recency  : {ac}/3 TFs confirm floor  "
+          f"| 1m bull vol: {bv:.1f}%  {yn(exh.get('bull_vol_majority'))}")
+    # Resonance composite bar
+    bar = "█" * int(rs * 20) + "░" * (20 - int(rs * 20))
+    verdict = "✅ EXHAUSTION CONFIRMED — dip floor proven across all dimensions" if conf else \
+              ("⚠️  NEAR THRESHOLD — strong but not all dimensions confirmed" if rs >= 0.50 else \
+               "❌ NOT EXHAUSTED — risk of further decline remains")
+    print(f"\n  ⚡  RESONANCE SCORE : [{bar}]  {rs*100:.1f}%")
+    print(f"  ⚡  VERDICT         : {verdict}")
     print()
 
 def check_tf_dip(trader, symbol, interval):
@@ -2403,113 +3046,101 @@ def score_daily_best_candidate(trader, symbol) -> Tuple[str, float, dict]:
         return (symbol, 0.0, {})
 
 
-def run_daily_best_fallback(trader, symbols: List[str],
-                             max_workers: int = 15) -> Tuple:
-    """
-    Last-resort fallback: called when max_scans exhausted.
-    Scores every USDC pair that passes the 1D dip filter right now,
-    picks the one with the best daily dip + spike potential,
-    and returns it as a result tuple compatible with the main output path:
-      (symbol, cmo_val, vratio, False, bull_ratio, ml_prob, combined)
-    """
-    if not symbols:
-        return None
-
-    # Re-run 1D filter to get current daily dips
-    W = 78
-    print("\n" + "╔" + "═" * W + "╗")
-    print("║" + " " * W + "║")
-    print("║" + "  🌅  DAILY BEST-DIP FALLBACK — scanning 1D dips across universe...".ljust(W) + "║")
-    print("║" + " " * W + "║")
-    print("║" + "  (Max scans reached with no full MTF setup — delivering best daily candidate)".ljust(W) + "║")
-    print("║" + " " * W + "║")
-    print("╚" + "═" * W + "╝")
-
-    daily_dips = run_tf_filter(trader, symbols, '1d', max_workers=20)
-    if not daily_dips:
-        print("⚠️  No daily dips found in universe right now.")
-        return None
-
-    print(f"\n📊  {len(daily_dips)} daily dips found — scoring for best spike/pump candidate...")
-
-    results = []
-    tracker = ProgressTracker(len(daily_dips), "Daily best-dip scoring")
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(score_daily_best_candidate, trader, s): s for s in daily_dips}
-        for f in as_completed(futures):
-            try:
-                res = f.result()
-                if res[2]:
-                    results.append(res)
-                tracker.update(passed=bool(res[2]))
-                print(tracker.get_stats(), end="", flush=True)
-            except Exception:
-                tracker.update()
-    print(f"\r{tracker.get_stats()}" + " " * 20)
-
-    if not results:
-        return None
-
-    results.sort(key=lambda r: r[1], reverse=True)
-    best_sym, best_score, best_combined = results[0]
-
-    cmo_val    = best_combined.get('_cmo_1m', best_combined.get('_cmo_1d', 0.0))
-    vratio     = best_combined.get('_vratio', 0.0)
-    bull_ratio = best_combined.get('_bull_ratio', 0.0)
-    ml_prob    = best_combined.get('_ml_prob', 0.0)
-
-    best_combined['_is_daily_fallback']   = True
-    best_combined['_daily_fallback_score'] = best_score
-    best_combined['_daily_fallback_rank']  = f"1/{len(results)}"
-    best_combined['_total_daily_dips']     = len(daily_dips)
-
-    return (best_sym, cmo_val, vratio, False, bull_ratio, ml_prob, best_combined)
-
 
 def check_1m_final(trader, symbol):
     """
-    Enhanced 1m final check with wavelet frequency decomposition.
+    1m final filter — dipzz28.
 
-    New frequency-layer conditions added on top of original 4:
-      cond_5: Wavelet swing reversal on 15m
-      cond_6: Micro momentum positive spark (5m)
-      cond_7: 1m cycle near trough (spectral)
-      cond_8: MTF frequency alignment >= 3/5
+    Gate hierarchy (all must pass for is_strong = True):
+
+    LAYER 0  HT_FFT HARD GATE  [immediate reject on any failure]
+      Fetches 1000 bars (maximum Binance 1m history).
+      Uses dominant-cycle FFT to determine local-dip lookback window.
+
+      A. local_dip_price > global_argmin_price
+         The most recent local dip low (confirmed swing low within one
+         dominant cycle) must be STRICTLY ABOVE the global floor of the
+         full 1000-bar window.  This is NOT current_close — it is the
+         actual bottom of the current local dip move.
+         If it equals or undercuts the global floor → new structural low
+         → no established support → REJECT.
+
+      B. argmin_idx > argmax_idx  (on full 1000-bar window)
+         The most recent extreme in the full window must be a LOW, not
+         a HIGH.  If the most recent extreme is a high, price is falling
+         FROM that high — we are mid-downswing.  REJECT.
+
+      C. fft_forecast_next > current_close
+         The top-5 dominant frequencies reconstructed from 1000 bars
+         and projected forward must predict the next bar HIGHER than the
+         current close.  If the dominant cycle is still pointing down
+         → dip is NOT over → REJECT.
+
+    LAYER 1  STRUCTURAL DIP (cond 1-4)
+      cond_1: RSI < 30 + MACD hist turning
+      cond_2: price below OLS regression lower band
+      cond_3: sinusoidal wave at bottom AND turning up
+      cond_4: cycle wave confirmed turning up
+
+    LAYER 2  FREQUENCY ALIGNMENT (cond 5-8, need ≥ 2)
+      cond_5: wavelet swing reversal on 15m
+      cond_6: micro momentum positive on 5m
+      cond_7: 1m spectral cycle at trough
+      cond_8: MTF frequency alignment ≥ 3/5
+
+    LAYER 3  EXHAUSTION PROFILE
+      compute_exhaustion_profile runs the 7-dimensional exhaustion check.
+      Resonance score is boosted by HT_FFT gate quality.
+      If exhaustion_confirmed AND freq_extra >= 1 → is_strong = True
+      (relaxes layer-2 requirement when exhaustion is proven).
     """
-    klines = trader.get_klines(symbol, '1m', limit=500, return_raw=True)
-    default_dict = {"golden_score": 0.0, "energy_state": "INSUFFICIENT",
-                    "spike_prob": 0.0, "phase_aligned": False, "near_min": False,
-                    "wave_near_bottom": False, "turning_up": False,
-                    "est_bars_to_pump": 0, "phase_pos": 0.5,
-                    "freq": None}
-    if not klines or len(klines) < 100:
+    default_dict = {
+        "golden_score": 0.0, "energy_state": "INSUFFICIENT",
+        "spike_prob": 0.0, "phase_aligned": False, "near_min": False,
+        "wave_near_bottom": False, "turning_up": False,
+        "est_bars_to_pump": 0, "phase_pos": 0.5,
+        "freq": None, "_ht_fft_gate": {}, "_exh": {},
+    }
+
+    # ── LAYER 0: HT_FFT HARD GATE ────────────────────────────────────
+    klines_full = trader.get_klines(symbol, '1m', limit=1000, return_raw=True)
+    if not klines_full or len(klines_full) < 64:
         return (symbol, 0.0, 0.0, False, 0.0, 0.0, default_dict)
 
-    close   = [float(k[4]) for k in klines]
-    volumes = [float(k[5]) for k in klines]
+    ht_fft_gate = compute_ht_fft_gate(klines_full)
+    default_dict["_ht_fft_gate"] = ht_fft_gate
+
+    if not ht_fft_gate["gate_pass"]:
+        return (symbol, 0.0, 0.0, False, 0.0, 0.0, default_dict)
+
+    # ── LAYERS 1-3: deeper analysis on last 500 bars ──────────────────
+    klines = klines_full[-500:] if len(klines_full) > 500 else klines_full
+    if len(klines) < 100:
+        return (symbol, 0.0, 0.0, False, 0.0, 0.0, default_dict)
+
+    close         = [float(k[4]) for k in klines]
+    volumes       = [float(k[5]) for k in klines]
+    current_price = float(close[-1])
 
     cmo     = ta.CMO(np.asarray(close), timeperiod=14)
     cmo_val = float(cmo[-1]) if not np.isnan(cmo[-1]) else 0.0
 
     closed_vols = [v for v in volumes[:-1] if v > 0]
-    vratio      = 0.0
+    vratio = 0.0
     if closed_vols:
-        avg_vol     = np.mean(closed_vols[-50:])
-        last_closed = closed_vols[-1]
-        vratio      = last_closed / avg_vol if avg_vol > 0 else 0.0
+        avg_vol = np.mean(closed_vols[-50:])
+        vratio  = closed_vols[-1] / avg_vol if avg_vol > 0 else 0.0
 
     is_rej, bull_ratio = has_bullish_rejection_volume(klines, window=10)
     metrics = calculate_effort_result_metrics(close, volumes, window=20)
     prob    = ml_spike_probability(metrics["R"], metrics["C"], metrics["E"],
                                    bull_ratio, cmo_val, vratio)
 
-    golden    = compute_phase_alignment(close, dt=1.0, N=3, epsilon=0.18)
+    golden     = compute_phase_alignment(close, dt=1.0, N=3, epsilon=0.18)
     sinusoidal = get_sinusoidal_dip_timing(close, 500)
-    combined  = {**golden, **sinusoidal}
+    combined   = {**golden, **sinusoidal}
+    combined["_ht_fft_gate"] = ht_fft_gate
 
-    # ----- Frequency decomposition (new) -----
-    # Pull extra timeframes for MTF wavelet check
-    # (these are lightweight fetches — 100 bars each)
     freq_result = None
     try:
         prices_5m  = trader.get_klines(symbol, '5m',  limit=100)
@@ -2520,40 +3151,50 @@ def check_1m_final(trader, symbol):
                                                prices_15m, prices_4h)
     except Exception:
         freq_result = None
-
     combined['freq'] = freq_result
 
-    # ── Quadratic price forecast ──────────────────────────────────────
-    # Use a tight klines window (200 bars max) so targets will be hit
-    klines_tight = klines[-200:] if len(klines) > 200 else klines
+    klines_tight  = klines[-200:] if len(klines) > 200 else klines
     dom_cycle_now = int((freq_result or {}).get("dominant_cycle", 0) or 0)
     quad_forecast = quadratic_price_forecast(
         klines_tight, current_price, combined, dom_cycle=dom_cycle_now)
     combined['quad_forecast'] = quad_forecast
 
-    # ORIGINAL GATEKEEPERS
+    # LAYER 1
     cond_1 = is_confirmed_dip(close, high_tf=False)
     cond_2 = is_below_regression_low(close, deviation=0.01)
     cond_3 = combined.get('wave_near_bottom', False)
-    cond_4 = combined.get('turning_up', False)
+    cond_4 = combined.get('turning_up',       False)
 
-    # NEW FREQUENCY GATEKEEPERS
+    # LAYER 2
     if freq_result:
-        cond_5 = bool(freq_result.get('cond_swing_rev', False))        # swing reversing
-        cond_6 = bool(freq_result.get('cond_micro_spark', False))      # micro burst
-        cond_7 = bool(freq_result.get('cond_1m_trough', False))        # cycle trough
-        cond_8 = bool(freq_result.get('strong_alignment', False))      # 3+/5 aligned
+        cond_5 = bool(freq_result.get('cond_swing_rev',   False))
+        cond_6 = bool(freq_result.get('cond_micro_spark', False))
+        cond_7 = bool(freq_result.get('cond_1m_trough',   False))
+        cond_8 = bool(freq_result.get('strong_alignment', False))
     else:
         cond_5 = cond_6 = cond_7 = cond_8 = False
 
-    # PASS RULE:
-    #   Original 4 must hold (strict structural dip confirmed)
-    #   + at least 2 of the 4 new frequency conditions
     freq_extra = sum([cond_5, cond_6, cond_7, cond_8])
     is_strong  = cond_1 and cond_2 and cond_3 and cond_4 and freq_extra >= 2
 
-    return (symbol, cmo_val, vratio, is_strong, bull_ratio, prob, combined)
+    # LAYER 3 — Exhaustion profile
+    try:
+        exh = compute_exhaustion_profile(trader, symbol)
+        # Boost resonance score by HT_FFT gate quality (up to +20%)
+        exh["resonance_score"] = float(np.clip(
+            exh.get("resonance_score", 0.0) +
+            ht_fft_gate.get("resonance_extra", 0.0) * 0.20,
+            0.0, 1.0
+        ))
+        exh["exhaustion_confirmed"] = bool(exh["resonance_score"] >= 0.68)
+        combined["_exh"] = exh
+        # Relax layer-2 gate if exhaustion fully confirmed
+        if exh.get("exhaustion_confirmed") and freq_extra >= 1:
+            is_strong = True
+    except Exception:
+        combined["_exh"] = {}
 
+    return (symbol, cmo_val, vratio, is_strong, bull_ratio, prob, combined)
 
 class ProgressTracker:
     def __init__(self, total, label):
@@ -2762,14 +3403,73 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio,
     if qf:
         format_quadratic_block(qf, W)
 
-    # ── Micro-TF Dip Quality Block ────────────────────────────────────
+    # ── Exhaustion Profile Block (new — dipzz28) ──────────────────────
+    exh = golden.get("_exh") if golden else None
+    if exh:
+        format_exhaustion_block(exh, W)
+
+    # ── HT_SINE + FFT Forecast Gate Block (new — dipzz28) ────────────
+    ht_fft = golden.get("_ht_fft_gate") if golden else None
+    if ht_fft:
+        format_ht_fft_block(ht_fft, W)
+
+    # ── Micro-TF Dip Quality Block (v25 — kept as supplementary) ─────
     micro = golden.get("_micro") if golden else None
     if micro:
         format_micro_block(micro, W)
 
     all_signals = []
 
-    # ── Micro-TF signals (collected first — highest priority) ─────────
+    # ── HT_SINE + FFT gate signals ────────────────────────────────────
+    if ht_fft and ht_fft.get("gate_pass"):
+        ht_d  = ht_fft.get("ht", {})
+        fft_d = ht_fft.get("fft", {})
+        all_signals.append("📡 HT_FFT GATE PASS — all 3 mandatory conditions confirmed")
+        if ht_d.get("ht_bull_signal"):
+            all_signals.append(
+                f"📡 HT_SINE bull: leadsine({ht_d.get('leadsine',0):.3f}) > "
+                f"sine({ht_d.get('sine',0):.3f}) — cycle turning up from trough")
+        fn  = fft_d.get("forecast_next",  0.0)
+        cc  = fft_d.get("current_close",  0.0)
+        fd  = (fn - cc) / (cc + 1e-12) * 100.0 if cc > 0 else 0.0
+        cyc = fft_d.get("dominant_cycles", [])
+        all_signals.append(f"📡 FFT forecast: next={fn:.8f} ({fd:+.4f}%) cycles={cyc}")
+        ldp = ht_d.get("local_dip_price", 0.0)
+        llf = ht_d.get("argmin_price",    0.0)
+        gap = (ldp - llf) / (llf + 1e-12) * 100.0 if llf > 0 else 0.0
+        all_signals.append(
+            f"📡 Local dip ({ldp:.8f}) is {gap:+.4f}% above global floor ({llf:.8f})")
+
+    # ── EXHAUSTION signals ─────────────────────────────────────────────
+    if exh:
+        rs   = exh.get("resonance_score", 0.0)
+        conf = exh.get("exhaustion_confirmed", False)
+        if conf:
+            all_signals.append(
+                f"⚡ DIP EXHAUSTION CONFIRMED (resonance={rs*100:.0f}%) — "
+                f"selling force proven spent across all 7 dimensions")
+        if exh.get("sc_1m", {}).get("just_turned"):
+            all_signals.append("⚡ Sine cycle JUST TURNED at 1m trough — mathematical reversal point hit")
+        if exh.get("sc_1m", {}).get("at_trough"):
+            all_signals.append("⚡ 1m sine cycle AT TROUGH — price at mathematical floor of cycle")
+        if exh.get("sma_cross_count", 0) >= 2:
+            sxc = exh.get("sma_cross_count", 0)
+            all_signals.append(f"⚡ Frequency-locked SMA cross on {sxc}/3 TFs — cycle momentum flipping")
+        if exh.get("energy_1m", {}).get("all_declining"):
+            all_signals.append("⚡ Energy density COLLAPSING on all 1m wavelet bands — impulse spent")
+        if exh.get("wyckoff_1m", {}).get("test"):
+            all_signals.append("⚡ Wyckoff SPRING + TEST confirmed on 1m — classic capitulation pattern")
+        elif exh.get("wyckoff_1m", {}).get("spring"):
+            ndl = exh["wyckoff_1m"].get("new_lows", 0)
+            vd  = exh["wyckoff_1m"].get("vol_decline", 0)
+            all_signals.append(f"⚡ Wyckoff spring on 1m ({ndl} new lows, {vd:.0f}% vol decline)")
+        if exh.get("anchor", {}).get("resonant"):
+            atfs = exh["anchor"].get("anchor_tfs", [])
+            all_signals.append(f"⚡ Harmonic anchor RESONANT across {atfs} — magnetic price floor")
+        if exh.get("sc_5m", {}).get("at_trough"):
+            all_signals.append("⚡ 5m sine cycle also AT TROUGH — multi-TF trough synchrony")
+
+    # ── Micro-TF signals (v25 — kept as supplementary) ────────────────
     if micro:
         def _yn(v): return "YES" if v else "NO"
         ac  = micro.get("argmin_count", 0)
@@ -3159,21 +3859,17 @@ def print_scan_header(scan_count: int):
 # ==========================================
 
 
-# ==========================================
-# MAIN SCAN LOOP  (dipzz25 — infinite retry)
-# ==========================================
+
 
 def main():
     CREDENTIALS_FILE     = "credentials.txt"
     MIN_SIGNALS_REQUIRED = 3
-    # After this many scans that reach the 1m gate without MIN_SIGNALS,
-    # trigger the daily-best fallback ONCE, then reset and keep looping.
     MAX_SCANS_BEFORE_DAILY = 10
 
     print("=" * 78)
-    print("  🌊  STRICT MTF CASCADE DIP DETECTOR  dipzz25")
-    print("  🌊  1D→4H→2H→15M→5M(REG)→1M  +  MICRO-TF DIP SORTER")
-    print("  🌊  (φ-PHASE · WAVELET · CYCLIC · QUAD · MICRO-TF GEOMETRY)")
+    print("  🌊  STRICT MTF CASCADE DIP DETECTOR  dipzz28")
+    print("  🌊  1D→4H→2H→15M→5M(REG)→1M  +  HT_SINE/FFT HARD GATE")
+    print("  🌊  (HT_SINE·EXTREMA · FFT·FORECAST · EXHAUSTION · φ · WAVELET)")
     print("=" * 78)
     print()
 
@@ -3183,50 +3879,33 @@ def main():
         print(f"❌ Failed to initialize trader: {e}")
         return
 
-    scan_count             = 0
-    no_major_dip_streak    = 0   # consecutive scans with zero 1D+4H+2H dips
+    scan_count          = 0
+    no_major_dip_streak = 0
 
     # ──────────────────────────────────────────────────────────────────
-    # _deliver_cascade_best
+    # _deliver_cascade_best: exhaustion-sorted stall delivery
     # ──────────────────────────────────────────────────────────────────
     def _deliver_cascade_best(pool: List[str], label: str) -> bool:
-        """
-        Called when the cascade stalls at some intermediate stage.
-        Uses pick_best_micro_candidate to SORT by micro-TF quality
-        (argmin recency + RSI + geometry + bull vol), then runs
-        score_15m_candidate on the winner for full analysis output.
-
-        Selection logic:
-          1. Compute micro_dip_score for every symbol in pool (parallel)
-          2. Separate hard_pass from soft candidates
-          3. Sort hard by (micro_score DESC, rsi_val ASC, argmin_count DESC)
-          4. If no hard_pass exists, sort soft by the same key
-          5. score_15m_candidate on the top-ranked symbol only
-          6. Deliver full S/R + golden + micro analysis
-        """
         if not pool:
             return False
         W = 78
         print("\n" + "╔" + "═" * W + "╗")
         print("║" + " " * W + "║")
-        print("║" + f"  🎯  CASCADE STALL — BEST MICRO-TF DIP ({label})".ljust(W) + "║")
+        print("║" + f"  🎯  CASCADE STALL — EXHAUSTION-SORTED BEST {label} CANDIDATE".ljust(W) + "║")
         print("║" + " " * W + "║")
-        print("║" + f"  {len(pool)} pair(s) confirmed at {label} level.".ljust(W) + "║")
-        print("║" + "  Ranking by: micro_score → RSI depth → argmin count...".ljust(W) + "║")
+        print("║" + f"  {len(pool)} pair(s) at {label} level. Ranking by resonance score...".ljust(W) + "║")
         print("║" + " " * W + "║")
         print("╚" + "═" * W + "╝")
 
-        best = pick_best_micro_candidate(trader, pool, label)
+        best = pick_best_exhausted_candidate(trader, pool, label)
         if not best:
             return False
+        best_sym, best_exh = best
 
-        best_sym, best_micro = best
-
-        # Full scoring for output (φ / wavelet / cyclic / quad)
         _, best_score, best_combined = score_15m_candidate(trader, best_sym)
         if not best_combined:
             return False
-        best_combined["_micro"]              = best_micro
+        best_combined["_exh"]               = best_exh
         best_combined["_is_cascade_fallback"] = True
         best_combined["_cascade_label"]       = label
 
@@ -3234,22 +3913,24 @@ def main():
         vratio     = best_combined.get("_vratio",     0.0)
         bull_ratio = best_combined.get("_bull_ratio", 0.0)
         ml_prob    = best_combined.get("_ml_prob",    0.0)
-        hp_tag     = "✅ HARD PASS" if best_micro.get("hard_pass") else "⚠️  soft"
+        rs         = best_exh.get("resonance_score", 0.0)
+        conf_tag   = "✅ EXHAUSTED" if best_exh.get("exhaustion_confirmed") else "⚠️  soft"
 
         print("\n" + "╔" + "═" * W + "╗")
         print("║" + " " * W + "║")
-        print("║" + f"  🥇  BEST {label} CANDIDATE (MICRO-TF SORTED)".ljust(W) + "║")
+        print("║" + f"  🥇  BEST {label} — EXHAUSTION CONFIRMED".ljust(W) + "║")
         print("║" + " " * W + "║")
-        print("║" + f"  Asset         : {best_sym}".ljust(W) + "║")
-        print("║" + f"  Micro Score   : {best_micro.get('micro_score',0)*100:.1f}%  {hp_tag}".ljust(W) + "║")
-        print("║" + f"  RSI(14) 1m    : {best_micro.get('rsi_val',50):.2f}  (lowest RSI = deepest dip)".ljust(W) + "║")
-        print("║" + f"  Argmin        : {best_micro.get('argmin_count',0)}/3 TFs confirm floor".ljust(W) + "║")
-        print("║" + f"  1m Bull Vol   : {best_micro.get('vol_1m',{}).get('bull_pct',50):.1f}%  (absorption)".ljust(W) + "║")
-        print("║" + f"  MTF Score     : {best_score:.4f}  (φ/wavelet/cyclic)".ljust(W) + "║")
-        print("║" + f"  1m CMO        : {cmo_val:+.2f}   ML Prob: {ml_prob*100:.1f}%".ljust(W) + "║")
-        print("║" + " " * W + "║")
-        print("║" + f"  ✅  {label} dip confirmed on major TFs.".ljust(W) + "║")
-        print("║" + "  ⚠️  Lower TF gates may not be fully met — use moderate stops.".ljust(W) + "║")
+        print("║" + f"  Asset          : {best_sym}".ljust(W) + "║")
+        print("║" + f"  Resonance Score: {rs*100:.1f}%  {conf_tag}".ljust(W) + "║")
+        print("║" + f"  RSI(14) 1m     : {best_exh.get('rsi_1m', 50):.2f}".ljust(W) + "║")
+        print("║" + f"  Wyckoff spring : {'✅ YES' if best_exh.get('wyckoff_1m', {}).get('spring') else '❌ NO'}  "
+              f"test={'✅' if best_exh.get('wyckoff_1m', {}).get('test') else '❌'}".ljust(W) + "║")
+        print("║" + f"  Harmonic anchor: {best_exh.get('anchor', {}).get('anchor_count', 0)}/4 TFs  "
+              f"resonant={'✅' if best_exh.get('anchor', {}).get('resonant') else '❌'}".ljust(W) + "║")
+        print("║" + f"  SMA cross TFs  : {best_exh.get('sma_cross_count', 0)}/3".ljust(W) + "║")
+        print("║" + f"  Energy collapse: 1m={'✅' if best_exh.get('energy_1m', {}).get('all_declining') else '❌'}  "
+              f"5m={'✅' if best_exh.get('energy_5m', {}).get('all_declining') else '❌'}".ljust(W) + "║")
+        print("║" + f"  MTF Score      : {best_score:.4f}  CMO: {cmo_val:+.2f}  ML: {ml_prob*100:.1f}%".ljust(W) + "║")
         print("║" + " " * W + "║")
         print("╚" + "═" * W + "╝")
 
@@ -3271,7 +3952,7 @@ def main():
         )
         print("\n" + "╔" + "═" * W + "╗")
         print("║" + " " * W + "║")
-        print("║" + f"  🎯  {label} MICRO-SORTED BEST DIP DELIVERED — STOPPING".ljust(W) + "║")
+        print("║" + f"  🎯  {label} EXHAUSTION-SORTED DIP DELIVERED — STOPPING".ljust(W) + "║")
         print("║" + " " * W + "║")
         print("║" + f"  Asset    : {best_sym}".ljust(W) + "║")
         print("║" + f"  Price    : {current_price:.8f} USDC".ljust(W) + "║")
@@ -3279,35 +3960,12 @@ def main():
         print("║" + f"  Verdict  : {verdict}".ljust(W) + "║")
         print("║" + " " * W + "║")
         print("╚" + "═" * W + "╝")
-        print(f"\n✅ Bot completed ({label} cascade-best — micro-TF sorted). Exiting...")
+        print(f"\n✅ Bot completed ({label} exhaustion-sorted). Exiting...")
         return True
 
     # ══════════════════════════════════════════════════════════════════
     # INFINITE SCAN LOOP
     # ══════════════════════════════════════════════════════════════════
-    #
-    # RULE (from spec):
-    #   If NO pairs pass the major-TF gates (1D + 4H + 2H) simultaneously,
-    #   the loop RETRIES IMMEDIATELY — it never exits.  It runs until at
-    #   least one asset passes ALL three major-TF filters on the same scan.
-    #
-    # Cascade stages:
-    #   1D → 4H → 2H  : major-TF gates (mandatory — infinite retry if none pass)
-    #   15M            : intermediate filter
-    #   5M (regression): below lowest-regression-line gate
-    #   1M (final)     : CMO + wavelet + φ + cyclic + regression
-    #
-    # Best-candidate selection (NEW — micro-TF sorted):
-    #   At EVERY cascade stall point and at the final 1M ranking,
-    #   candidates are sorted by the micro-TF composite:
-    #     PRIMARY   → micro_score (RSI depth + geometry + argmin recency + bull vol)
-    #     SECONDARY → rsi_val ASC (lower = deeper oversold)
-    #     TERTIARY  → argmin_count DESC (more TFs confirming floor)
-    #
-    #   hard_pass candidates (all mandatory conditions met) are always
-    #   preferred over soft candidates.
-    # ══════════════════════════════════════════════════════════════════
-
     while True:
         scan_count += 1
         print_scan_header(scan_count)
@@ -3319,59 +3977,51 @@ def main():
                 time.sleep(10)
                 continue
 
-            # ── STAGE 1: Major TF cascade (1D → 4H → 2H) ──────────────
-            # Per spec: if none pass ALL THREE, retry IMMEDIATELY (infinite loop)
+            # ── Major TF gates (1D → 4H → 2H) — INFINITE RETRY ────────
             daily_passed = run_tf_filter(trader, symbols, "1d", max_workers=20)
             if not daily_passed:
                 no_major_dip_streak += 1
-                print(f"⚠️  No 1D dips found (streak={no_major_dip_streak}). "
-                      "Retrying immediately per spec...")
+                print(f"⚠️  No 1D dips (streak={no_major_dip_streak}). Retrying immediately...")
                 time.sleep(5)
                 continue
 
             four_h_passed = run_tf_filter(trader, daily_passed, "4h", max_workers=20)
             if not four_h_passed:
                 no_major_dip_streak += 1
-                print(f"⚠️  4H cleared all candidates (streak={no_major_dip_streak}). "
-                      "No 1D+4H pair — retrying immediately...")
+                print(f"⚠️  4H cleared all (streak={no_major_dip_streak}). Retrying...")
                 time.sleep(5)
                 continue
 
             two_h_passed = run_tf_filter(trader, four_h_passed, "2h", max_workers=20)
             if not two_h_passed:
                 no_major_dip_streak += 1
-                print(f"⚠️  2H cleared all candidates (streak={no_major_dip_streak}). "
-                      "No 1D+4H+2H pair — retrying immediately...")
+                print(f"⚠️  2H cleared all (streak={no_major_dip_streak}). Retrying...")
                 time.sleep(5)
                 continue
 
-            # ✅ At least one pair confirmed on ALL major TFs (1D+4H+2H)
             no_major_dip_streak = 0
-            print(f"\n✅ {len(two_h_passed)} pair(s) passed ALL major TFs (1D+4H+2H). "
-                  "Proceeding to micro-TF sorting + lower cascade...")
+            print(f"\n✅ {len(two_h_passed)} pairs confirmed on ALL major TFs (1D+4H+2H).")
 
-            # ── STAGE 2: 15M filter ──────────────────────────────────────
+            # ── 15M ────────────────────────────────────────────────────
             fifteen_m_passed = run_tf_filter(trader, two_h_passed, "15m", max_workers=20)
             if not fifteen_m_passed:
-                print("⚠️  15M gate cleared all — delivering best 1D+4H+2H (micro-sorted)...")
+                print("⚠️  15M cleared all — exhaustion-sorted 1D+4H+2H delivery...")
                 if _deliver_cascade_best(two_h_passed, "1D+4H+2H"):
                     return
                 time.sleep(5)
                 continue
 
-            # ── STAGE 3: 5M regression gate ─────────────────────────────
+            # ── 5M regression ──────────────────────────────────────────
             five_m_passed = run_5m_regression_filter(trader, fifteen_m_passed, max_workers=20)
             if not five_m_passed:
-                print("⚠️  No 5m regression — activating MTF fallback (micro-sorted)...")
+                print("⚠️  5M regression cleared all — MTF fallback (exhaustion-sorted)...")
                 fallback = run_best_mtf_fallback(trader, fifteen_m_passed, max_workers=15)
                 if not fallback:
-                    print("⚠️  MTF fallback empty — delivering best 1D+4H+2H (micro-sorted)...")
                     if _deliver_cascade_best(two_h_passed, "1D+4H+2H"):
                         return
                     time.sleep(5)
                     continue
 
-                # Unpack fallback and enrich with micro-TF data
                 f_symbol   = fallback[0]
                 f_cmo      = fallback[1]
                 f_vratio   = fallback[2]
@@ -3380,26 +4030,23 @@ def main():
                 f_combined = fallback[6]
                 f_score    = f_combined.get("_fallback_score", 0.0)
                 f_rank     = f_combined.get("_fallback_rank", "?")
-
-                # Compute micro profile for output
-                f_micro = compute_micro_dip_score(trader, f_symbol)
-                f_combined["_micro"] = f_micro
+                # Compute exhaustion for output
+                f_exh = compute_exhaustion_profile(trader, f_symbol)
+                f_combined["_exh"] = f_exh
 
                 W = 78
                 print("\n" + "╔" + "═" * W + "╗")
                 print("║" + " " * W + "║")
                 print("║" + "  ⚡  FALLBACK — BEST MTF DIP (NO 5M REGRESSION)".ljust(W) + "║")
                 print("║" + " " * W + "║")
-                print("║" + f"  Candidate  : {f_symbol}  (rank {f_rank})".ljust(W) + "║")
-                print("║" + f"  MTF Score  : {f_score:.4f}".ljust(W) + "║")
-                print("║" + f"  Micro Score: {f_micro.get('micro_score',0)*100:.1f}%  "
-                      f"RSI={f_micro.get('rsi_val',50):.1f}  "
-                      f"argmin={f_micro.get('argmin_count',0)}/3  "
-                      f"{'✅HARD' if f_micro.get('hard_pass') else '·soft'}".ljust(W-3) + "║")
-                print("║" + f"  CMO        : {f_cmo:+.2f}   ML Prob: {f_ml*100:.1f}%   "
-                      f"Bull Rej: {f_bull*100:.1f}%".ljust(W) + "║")
+                print("║" + f"  Candidate   : {f_symbol}  (rank {f_rank})".ljust(W) + "║")
+                print("║" + f"  MTF Score   : {f_score:.4f}".ljust(W) + "║")
+                print("║" + f"  Resonance   : {f_exh.get('resonance_score',0)*100:.1f}%  "
+                      f"{'✅EXHAUSTED' if f_exh.get('exhaustion_confirmed') else '·soft'}".ljust(W) + "║")
+                print("║" + f"  CMO         : {f_cmo:+.2f}  ML: {f_ml*100:.1f}%  "
+                      f"BullRej: {f_bull*100:.1f}%".ljust(W) + "║")
                 print("║" + " " * W + "║")
-                print("║" + "  ⚠️  5m regression gate NOT met — lower-confidence setup".ljust(W) + "║")
+                print("║" + "  ⚠️  5m regression NOT met — lower confidence".ljust(W) + "║")
                 print("║" + " " * W + "║")
                 print("╚" + "═" * W + "╝")
 
@@ -3417,94 +4064,72 @@ def main():
                         f_symbol, sr, current_price, f_cmo, f_vratio,
                         f_bull, f_ml, tf_volumes, f_combined
                     )
-                    print("\n" + "╔" + "═" * W + "╗")
-                    print("║" + " " * W + "║")
-                    print("║" + "  ⚡  FALLBACK CANDIDATE DELIVERED — BOT STOPPING".ljust(W) + "║")
-                    print("║" + " " * W + "║")
-                    print("║" + f"  Asset   : {f_symbol}".ljust(W) + "║")
-                    print("║" + f"  Price   : {current_price:.8f} USDC".ljust(W) + "║")
-                    print("║" + f"  Signals : {signal_count}  (fallback — 5m regression skipped)".ljust(W) + "║")
-                    print("║" + f"  Verdict : {verdict}".ljust(W) + "║")
-                    print("║" + " " * W + "║")
-                    print("║" + "  ⚠️  Use wider stops — regression gate not confirmed.".ljust(W) + "║")
-                    print("║" + " " * W + "║")
-                    print("╚" + "═" * W + "╝")
-                    print("\n✅ Bot completed (fallback mode). Exiting...")
+                    print(f"\n✅ Bot completed (fallback mode). Exiting...")
                     return
-                else:
-                    print(f"❌ Could not fetch 1m klines for {f_symbol}. Retrying...")
-                    time.sleep(3)
-                    continue
+                time.sleep(3)
+                continue
 
-            # ── STAGE 4: 1M final filter ─────────────────────────────────
+            # ── 1M final filter ────────────────────────────────────────
             results_1m = run_1m_filter(trader, five_m_passed, max_workers=15)
             if not results_1m:
-                print("⚠️  1m filter empty — delivering best 1D+4H+2H+15M (micro-sorted)...")
+                print("⚠️  1m filter empty — exhaustion-sorted 1D+4H+2H+15M delivery...")
                 if _deliver_cascade_best(fifteen_m_passed, "1D+4H+2H+15M"):
                     return
                 time.sleep(5)
                 continue
 
-            # ── MICRO-TF SORT of 1m-passed results ───────────────────────
-            # Collect symbols that passed 1m gate
-            passed_1m_syms = [r[0] for r in results_1m]
-            best_micro_pick = pick_best_micro_candidate(
-                trader, passed_1m_syms, "1D+4H+2H+15M+5M+1M"
+            # ── EXHAUSTION SORT of 1m-passed results ───────────────────
+            passed_syms = [r[0] for r in results_1m]
+            best_pick   = pick_best_exhausted_candidate(
+                trader, passed_syms, "1D+4H+2H+15M+5M+1M"
             )
-
-            # Build lookup: symbol → 1m result tuple
             result_lookup = {r[0]: r for r in results_1m}
 
-            if best_micro_pick:
-                best_sym_micro, best_micro_data = best_micro_pick
-                # Start with the micro-sorted winner
-                micro_sorted = [best_sym_micro] + [
-                    s for s in passed_1m_syms if s != best_sym_micro
-                ]
-            else:
-                micro_sorted = passed_1m_syms
-                best_micro_data = {}
-
-            # Also sort 1m results by existing final_score as tiebreaker
             def final_score(r):
-                ml             = r[5]
-                gs             = r[6].get("spike_prob", 0.0)
-                near_bottom    = r[6].get("wave_near_bottom", False)
-                turning_up     = r[6].get("turning_up", False)
-                est_bars       = r[6].get("est_bars_to_pump", 0)
-                freq           = r[6].get("freq") or {}
-                freq_alignment = freq.get("alignment_score", 0.0)
-                reversal_score = r[6].get("reversal_score", 0.0)
-                at_cyclic_low  = r[6].get("cyc_at_cyclic_low", False)
-                phi_ready      = r[6].get("phi_reversal_ready", False)
-                phi_fwd_bias   = float(r[6].get("phi_fwd_bias", 0.0))
-                phi_zone       = r[6].get("phi_phase_zone", "NEUTRAL")
-                score = (ml * 0.28 + gs * 0.20 + freq_alignment * 0.12
-                         + reversal_score * 0.12 + phi_fwd_bias * 5.0 * 0.05)
-                if near_bottom:   score += 0.10
-                if turning_up:    score += 0.08
-                if at_cyclic_low: score += 0.07
-                if phi_ready:     score += 0.06
-                if phi_zone in ("REVERSAL_LOW", "BIAS_BULL"): score += 0.04
-                if est_bars < 15: score += 0.05
+                ml  = r[5]
+                gs  = r[6].get("spike_prob", 0.0)
+                nb  = r[6].get("wave_near_bottom", False)
+                tu  = r[6].get("turning_up", False)
+                eb  = r[6].get("est_bars_to_pump", 0)
+                fa  = (r[6].get("freq") or {}).get("alignment_score", 0.0)
+                rv  = r[6].get("reversal_score", 0.0)
+                cl  = r[6].get("cyc_at_cyclic_low", False)
+                pr  = r[6].get("phi_reversal_ready", False)
+                pb  = float(r[6].get("phi_fwd_bias", 0.0))
+                pz  = r[6].get("phi_phase_zone", "NEUTRAL")
+                # Exhaustion resonance from _exh (if already computed in check_1m_final)
+                exh = r[6].get("_exh") or {}
+                rs  = float(exh.get("resonance_score", 0.0))
+                ec  = float(exh.get("exhaustion_confirmed", False))
+                score = (ml * 0.22 + gs * 0.16 + fa * 0.10 + rv * 0.10
+                         + pb * 5.0 * 0.04 + rs * 0.18)
+                if nb:  score += 0.08
+                if tu:  score += 0.07
+                if cl:  score += 0.06
+                if pr:  score += 0.05
+                if pz in ("REVERSAL_LOW", "BIAS_BULL"): score += 0.04
+                if eb < 15: score += 0.04
+                if ec:  score += 0.10   # exhaustion confirmed bonus
                 score -= r[1] * 0.0015
                 return score
 
             results_1m.sort(key=final_score, reverse=True)
 
-            # Final winner = micro-sorted top (micro_score + RSI + argmin),
-            # falling back to final_score top if micro pick not in result_lookup
-            if best_micro_pick and best_sym_micro in result_lookup:
-                top_candidate = result_lookup[best_sym_micro]
-                print(f"\n🔬 Micro-TF winner selected: {best_sym_micro}  "
-                      f"(micro={best_micro_data.get('micro_score',0)*100:.1f}%  "
-                      f"RSI={best_micro_data.get('rsi_val',50):.1f}  "
-                      f"argmin={best_micro_data.get('argmin_count',0)}/3  "
-                      f"{'✅HARD' if best_micro_data.get('hard_pass') else '·soft'})")
+            if best_pick and best_pick[0] in result_lookup:
+                best_sym, best_exh_data = best_pick
+                top_candidate = result_lookup[best_sym]
+                # Ensure exhaustion data attached
+                if "_exh" not in top_candidate[6] or not top_candidate[6]["_exh"]:
+                    top_candidate[6]["_exh"] = best_exh_data
+                print(f"\n⚡ Exhaustion winner: {best_sym}  "
+                      f"res={best_exh_data.get('resonance_score',0)*100:.1f}%  "
+                      f"{'✅EXHAUSTED' if best_exh_data.get('exhaustion_confirmed') else '·soft'}  "
+                      f"RSI={best_exh_data.get('rsi_1m',50):.1f}  "
+                      f"anchor={best_exh_data.get('anchor',{}).get('anchor_count',0)}/4")
             else:
-                top_candidate = results_1m[0]
-                best_micro_data = compute_micro_dip_score(trader, top_candidate[0])
-                print(f"\n⚠️  Micro sort had no match — using final_score top: {top_candidate[0]}")
+                top_candidate  = results_1m[0]
+                best_exh_data  = top_candidate[6].get("_exh") or {}
+                print(f"\n⚠️  Exhaustion sort had no result — using final_score top: {top_candidate[0]}")
 
             symbol     = top_candidate[0]
             cmo_val    = top_candidate[1]
@@ -3513,16 +4138,23 @@ def main():
             ml_prob    = top_candidate[5]
             golden     = top_candidate[6]
 
-            # Attach micro data to combined dict for output
-            golden["_micro"] = best_micro_data
-
-            print(f"\n🏆 TOP CANDIDATE : {symbol}")
-            print(f"   φ/wavelet score: {final_score(top_candidate):.4f}")
-            print(f"   Micro score    : {best_micro_data.get('micro_score',0)*100:.1f}%")
-            print(f"   RSI(14) 1m     : {best_micro_data.get('rsi_val',50):.2f}")
-            print(f"   Argmin recent  : {best_micro_data.get('argmin_count',0)}/3 TFs")
-            print(f"   1m Bull vol    : {best_micro_data.get('vol_1m',{}).get('bull_pct',50):.1f}%")
-            print(f"   Hard pass      : {'✅ YES' if best_micro_data.get('hard_pass') else '❌ NO (soft)'}")
+            print(f"\n🏆 TOP CANDIDATE     : {symbol}")
+            print(f"   φ/wavelet score  : {final_score(top_candidate):.4f}")
+            exh_now = golden.get("_exh") or {}
+            rs_now  = exh_now.get("resonance_score", 0.0)
+            print(f"   Resonance score  : {rs_now*100:.1f}%  "
+                  f"{'✅EXHAUSTION CONFIRMED' if exh_now.get('exhaustion_confirmed') else '⚠️ soft'}")
+            print(f"   RSI(14) 1m       : {exh_now.get('rsi_1m', 50):.2f}")
+            print(f"   Sine trough 1m   : {exh_now.get('sc_1m', {}).get('trough_proximity',0)*100:.0f}%  "
+                  f"at_trough={'✅' if exh_now.get('sc_1m',{}).get('at_trough') else '❌'}  "
+                  f"just_turned={'✅' if exh_now.get('sc_1m',{}).get('just_turned') else '❌'}")
+            print(f"   SMA cross TFs    : {exh_now.get('sma_cross_count',0)}/3")
+            print(f"   Wyckoff spring   : {'✅' if exh_now.get('wyckoff_1m',{}).get('spring') else '❌'}  "
+                  f"test={'✅' if exh_now.get('wyckoff_1m',{}).get('test') else '❌'}")
+            print(f"   Harmonic anchor  : {exh_now.get('anchor',{}).get('anchor_count',0)}/4 TFs  "
+                  f"resonant={'✅' if exh_now.get('anchor',{}).get('resonant') else '❌'}")
+            print(f"   Energy collapse  : 1m={'✅' if exh_now.get('energy_1m',{}).get('all_declining') else '❌'}  "
+                  f"5m={'✅' if exh_now.get('energy_5m',{}).get('all_declining') else '❌'}")
 
             klines_1m = trader.get_klines(symbol, "1m", limit=1200, return_raw=True)
             if klines_1m:
@@ -3544,13 +4176,12 @@ def main():
                     print("║" + " " * W + "║")
                     print("║" + "  ✅  SETUP FOUND — BOT STOPPING".ljust(W) + "║")
                     print("║" + " " * W + "║")
-                    print("║" + f"  Asset         : {symbol}".ljust(W) + "║")
-                    print("║" + f"  Price         : {current_price:.8f} USDC".ljust(W) + "║")
-                    print("║" + f"  Signals       : {signal_count}".ljust(W) + "║")
-                    print("║" + f"  Verdict       : {verdict}".ljust(W) + "║")
-                    print("║" + f"  Micro score   : {best_micro_data.get('micro_score',0)*100:.1f}%  "
-                          f"RSI={best_micro_data.get('rsi_val',50):.2f}  "
-                          f"argmin={best_micro_data.get('argmin_count',0)}/3".ljust(W) + "║")
+                    print("║" + f"  Asset          : {symbol}".ljust(W) + "║")
+                    print("║" + f"  Price          : {current_price:.8f} USDC".ljust(W) + "║")
+                    print("║" + f"  Signals        : {signal_count}".ljust(W) + "║")
+                    print("║" + f"  Resonance      : {rs_now*100:.1f}%  "
+                          f"{'✅EXHAUSTION CONFIRMED' if exh_now.get('exhaustion_confirmed') else '⚠️ soft'}".ljust(W) + "║")
+                    print("║" + f"  Verdict        : {verdict}".ljust(W) + "║")
                     print("║" + " " * W + "║")
                     print("║" + "  🎯  Review the analysis above and make your decision.".ljust(W) + "║")
                     print("║" + " " * W + "║")
@@ -3558,39 +4189,33 @@ def main():
                     print("\n✅ Bot completed successfully. Exiting...")
                     return
                 else:
-                    print(f"\n⚠️  {signal_count} signals (need {MIN_SIGNALS_REQUIRED}). "
-                          "Continuing search...")
+                    print(f"\n⚠️  {signal_count} signals (need {MIN_SIGNALS_REQUIRED}). Continuing...")
                     time.sleep(3)
             else:
                 print(f"\n❌ Failed to fetch 1m klines for {symbol}")
                 time.sleep(3)
 
-            # ── Daily fallback after MAX_SCANS_BEFORE_DAILY full passes ──
+            # ── Daily fallback after MAX_SCANS_BEFORE_DAILY ─────────────
             if scan_count >= MAX_SCANS_BEFORE_DAILY and no_major_dip_streak == 0:
                 W = 78
                 print("\n" + "╔" + "═" * W + "╗")
                 print("║" + " " * W + "║")
-                print("║" + "  ⚠️   MAX SCANS — ACTIVATING DAILY BEST-DIP FALLBACK".ljust(W) + "║")
-                print("║" + " " * W + "║")
-                print("║" + f"  {scan_count} scans completed without {MIN_SIGNALS_REQUIRED}+ signals.".ljust(W) + "║")
+                print("║" + "  ⚠️   MAX SCANS — DAILY BEST-DIP FALLBACK".ljust(W) + "║")
                 print("║" + " " * W + "║")
                 print("╚" + "═" * W + "╝")
-
                 try:
                     all_symbols = trader.get_usdc_pairs()
                 except Exception as e:
-                    print(f"❌ Could not fetch symbols: {e}")
+                    print(f"❌ {e}")
                     scan_count = 0
                     time.sleep(5)
                     continue
-
                 daily_fallback = run_daily_best_fallback(trader, all_symbols, max_workers=15)
                 if not daily_fallback:
-                    print("⚠️  Daily fallback found nothing. Resetting and retrying...")
+                    print("⚠️  Daily fallback empty. Resetting and retrying...")
                     scan_count = 0
                     time.sleep(10)
                     continue
-
                 df_symbol   = daily_fallback[0]
                 df_cmo      = daily_fallback[1]
                 df_vratio   = daily_fallback[2]
@@ -3602,30 +4227,12 @@ def main():
                 df_total    = df_combined.get("_total_daily_dips", 0)
                 df_cmo_1d   = df_combined.get("_cmo_1d", 0.0)
                 df_pos_1d   = df_combined.get("_pos_1d", 0.5)
-
-                # Enrich daily fallback with micro-TF data
-                df_micro = compute_micro_dip_score(trader, df_symbol)
-                df_combined["_micro"] = df_micro
-
-                W = 78
-                print("\n" + "╔" + "═" * W + "╗")
-                print("║" + " " * W + "║")
-                print("║" + "  🌅  DAILY BEST-DIP CANDIDATE SELECTED (+ MICRO-TF PROFILE)".ljust(W) + "║")
-                print("║" + " " * W + "║")
-                print("║" + f"  Candidate    : {df_symbol}  (rank {df_rank} of {df_total})".ljust(W) + "║")
-                print("║" + f"  Daily Score  : {df_score:.4f}".ljust(W) + "║")
-                print("║" + f"  1D CMO       : {df_cmo_1d:+.2f}  (oversold depth)".ljust(W) + "║")
-                print("║" + f"  1D Pos/Range : {df_pos_1d*100:.1f}%  (0%=floor)".ljust(W) + "║")
-                print("║" + f"  Micro Score  : {df_micro.get('micro_score',0)*100:.1f}%  "
-                      f"RSI={df_micro.get('rsi_val',50):.1f}  "
-                      f"argmin={df_micro.get('argmin_count',0)}/3  "
-                      f"{'✅HARD' if df_micro.get('hard_pass') else '·soft'}".ljust(W-3) + "║")
-                print("║" + " " * W + "║")
-                print("║" + "  ⚠️  Full MTF cascade not satisfied — daily dip only.".ljust(W) + "║")
-                print("║" + "  ⚠️  Use wider stops. Best potential among current daily dips.".ljust(W) + "║")
-                print("║" + " " * W + "║")
-                print("╚" + "═" * W + "╝")
-
+                # Exhaustion profile for daily fallback
+                df_exh = compute_exhaustion_profile(trader, df_symbol)
+                df_combined["_exh"] = df_exh
+                print(f"\n  🌅  Daily fallback: {df_symbol}  "
+                      f"score={df_score:.4f}  "
+                      f"resonance={df_exh.get('resonance_score',0)*100:.1f}%")
                 klines_1m = trader.get_klines(df_symbol, "1m", limit=1200, return_raw=True)
                 if klines_1m:
                     current_price = float(klines_1m[-1][4])
@@ -3640,21 +4247,7 @@ def main():
                         df_symbol, sr, current_price, df_cmo, df_vratio,
                         df_bull, df_ml, tf_volumes, df_combined
                     )
-                    print("\n" + "╔" + "═" * W + "╗")
-                    print("║" + " " * W + "║")
-                    print("║" + "  🌅  DAILY BEST-DIP FALLBACK DELIVERED — BOT STOPPING".ljust(W) + "║")
-                    print("║" + " " * W + "║")
-                    print("║" + f"  Asset    : {df_symbol}".ljust(W) + "║")
-                    print("║" + f"  Price    : {current_price:.8f} USDC".ljust(W) + "║")
-                    print("║" + f"  Signals  : {signal_count}  (daily fallback)".ljust(W) + "║")
-                    print("║" + f"  1D CMO   : {df_cmo_1d:+.2f}   1D Pos: {df_pos_1d*100:.1f}%".ljust(W) + "║")
-                    print("║" + f"  Verdict  : {verdict}".ljust(W) + "║")
-                    print("║" + " " * W + "║")
-                    print("║" + "  ⚠️  Daily dip confirmed — micro/swing TF not fully met.".ljust(W) + "║")
-                    print("║" + "  ⚠️  Use wider stops than normal.".ljust(W) + "║")
-                    print("║" + " " * W + "║")
-                    print("╚" + "═" * W + "╝")
-                    print("\n✅ Bot completed (daily best-dip fallback). Exiting...")
+                    print(f"\n✅ Bot completed (daily best-dip fallback). Exiting...")
                     return
                 else:
                     print(f"❌ Could not fetch 1m klines for {df_symbol}. Resetting...")
