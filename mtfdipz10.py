@@ -421,7 +421,6 @@ def get_sr_targets(raw_klines: list, current_price: float) -> Dict:
     lookbacks_data = []
     n = len(raw_klines)
     
-    # STRICTLY EVALUATE ONLY THE FULL 500 BAR RANGE
     if n >= 100:
         ext = get_structural_extremes(closes, highs, lows, n)
         grid = build_fib_grid(ext, current_price)
@@ -560,22 +559,53 @@ def ml_forecast_price(c: np.ndarray, h: np.ndarray, l: np.ndarray, v: np.ndarray
     top_features = []
     if hasattr(final_model, 'feature_importances_'):
         importance = dict(zip(feature_names, final_model.feature_importances_)); top_features = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]
-    current_price = float(c[-1]); bias = best_bt.get('bias', 0); bias_corrected_prediction = max(0, raw_prediction - bias)
-    mean_actual = best_bt.get('mean_actual', 1.0); confidence = best_bt.get('confidence', 0)
-    final_prediction = bias_corrected_prediction * confidence * 2 + mean_actual * (1 - confidence * 2) if confidence < 0.3 else bias_corrected_prediction
-    final_prediction = max(0, final_prediction)
-    forecast_price = current_price * (1 + final_prediction / 100); conservative_price = current_price * (1 + max(0, final_prediction - best_bt.get('mae', 0)) / 100)
-    optimistic_price = current_price * (1 + (final_prediction + best_bt.get('mae', 0)) / 100)
+    current_price = float(c[-1])
+    confidence = best_bt.get('confidence', 0)
+    
+    # ==========================================
+    # ANCHORED TARGETING LOGIC (2.5% MINIMUM ENFORCED)
+    # ==========================================
+    # If ML predicts flat or down, invalidate completely
+    if raw_prediction <= 0.01:
+        return {
+            'valid': False, 'error': f'ML validates NO bounce (raw pred: {raw_prediction:.3f}%)',
+            'current_price': current_price, 'best_model': best_name, 'confidence': 0.0,
+            'backtest': best_bt, 'all_backtests': backtest_results, 'n_samples': len(X_valid), 
+            'n_features': len(feature_names), 'computation_time_ms': (time.time() - t_start) * 1000
+        }
+        
+    # Calculate 100-bar ATR percentage to anchor a realistic target
+    atr_period = min(100, len(c) - 1)
+    atr_array = ta.ATR(h, l, c, timeperiod=atr_period)
+    atr_pct = float(np.nan_to_num(atr_array[-1], nan=0.0)) / current_price * 100
+    
+    # Standard dip bounce targets 1.5x to 2x the ATR. Enforce strict 2.5% minimum floor.
+    base_target = max(2.5, atr_pct * 2.0)
+    
+    # Scale target slightly by ML confidence (higher conf = closer to base_target * 1.5)
+    if confidence > 0.6:
+        final_prediction = max(2.5, base_target * 1.2)
+    elif confidence > 0.3:
+        final_prediction = max(2.5, base_target)
+    else:
+        final_prediction = 2.5  # Absolute floor for low confidence
+        
+    conservative_prediction = 2.5  # Absolute floor for conservative
+    optimistic_prediction = final_prediction * 1.5
+    
+    forecast_price = current_price * (1 + final_prediction / 100)
+    conservative_price = current_price * (1 + conservative_prediction / 100)
+    optimistic_price = current_price * (1 + optimistic_prediction / 100)
     
     return {
         'valid': True, 'current_price': current_price, 'forecast_price': forecast_price, 
         'conservative_price': conservative_price, 'optimistic_price': optimistic_price, 
-        'forecast_gain_pct': final_prediction, 'conservative_gain_pct': max(0, final_prediction - best_bt.get('mae', 0)), 
-        'optimistic_gain_pct': final_prediction + best_bt.get('mae', 0), 'n_ahead': n_ahead, 
+        'forecast_gain_pct': final_prediction, 'conservative_gain_pct': conservative_prediction, 
+        'optimistic_gain_pct': optimistic_prediction, 'n_ahead': n_ahead, 
         'best_model': best_name, 'confidence': confidence, 'backtest': best_bt, 
         'all_backtests': backtest_results, 'top_features': top_features, 'n_features': len(feature_names), 
         'n_samples': len(X_valid), 
-        'computation_time_ms': (time.time() - t_start) * 1000, 'bias_correction': bias
+        'computation_time_ms': (time.time() - t_start) * 1000, 'bias_correction': 0.0
     }
 
 def print_ml_forecast(forecast: Dict, symbol: str):
@@ -583,15 +613,14 @@ def print_ml_forecast(forecast: Dict, symbol: str):
     W = 74; bt = forecast['backtest']
     print("\n" + "=" * W); print(f"  🧠  REAL ML PRICE FORECAST  —  {symbol}"); print("=" * W)
     print(f"  📊 Best Model: {forecast['best_model']} | Features: {forecast['n_features']} | Samples: {forecast['n_samples']}")
-    print(f"  ⏱ Computation: {forecast['computation_time_ms']:.0f}ms | Bias Correction: {forecast['bias_correction']:+.3f}%")
-    print("\n  " + "─" * W); print("  📈 WALK-FORWARD BACKTEST (Instantaneous, No Storage)"); print("  " + "─" * W)
-    print(f"    Samples Tested: {bt['n_samples']}\n    Directional Accuracy: {bt['directional_accuracy']*100:.1f}%\n    R-Squared: {bt['r_squared']:.4f}\n    MAE: {bt['mae']:.3f}% | RMSE: {bt['rmse']:.3f}% | Median AE: {bt['median_ae']:.3f}%\n    Correlation: {bt['correlation']:.4f} (p={bt['p_value']:.4f})\n    Bias: {bt['bias']:+.3f}% (relative: {bt['relative_bias_pct']:+.1f}%)")
-    if bt.get('avg_gain_1.0') is not None: print(f"    When pred > 1%: Avg Gain={bt['avg_gain_1.0']:.2f}%, Win Rate={bt['win_rate_1.0']*100:.0f}%")
+    print(f"  ⏱ Computation: {forecast['computation_time_ms']:.0f}ms")
+    print("\n  " + "─" * W); print("  📈 WALK-FORWARD BACKTEST (Directional Validator)"); print("  " + "─" * W)
+    print(f"    Samples Tested: {bt['n_samples']}\n    Directional Accuracy: {bt['directional_accuracy']*100:.1f}%\n    R-Squared: {bt['r_squared']:.4f}\n    Correlation: {bt['correlation']:.4f} (p={bt['p_value']:.4f})")
     print("\n  " + "─" * W); print("  🤖 MODEL COMPARISON"); print("  " + "─" * W)
-    print(f"    {'Model':<20} {'DA':>6} {'R²':>7} {'Conf':>6} {'MAE':>7}"); print("    " + "─" * 50)
+    print(f"    {'Model':<20} {'DA':>6} {'R²':>7} {'Conf':>6}"); print("    " + "─" * 50)
     for name, abt in forecast['all_backtests'].items():
         if abt.get('valid'):
-            marker = "►" if name == forecast['best_model'] else " "; print(f"  {marker} {name:<18} {abt['directional_accuracy']*100:5.1f}% {abt['r_squared']:6.3f} {abt['confidence']*100:5.0f}% {abt['mae']:6.3f}%")
+            marker = "►" if name == forecast['best_model'] else " "; print(f"  {marker} {name:<18} {abt['directional_accuracy']*100:5.1f}% {abt['r_squared']:6.3f} {abt['confidence']*100:5.0f}%")
     if forecast['top_features']:
         print("\n  " + "─" * W); print("  🔬 TOP 10 FEATURE IMPORTANCE"); print("  " + "─" * W)
         max_imp = forecast['top_features'][0][1]
@@ -601,7 +630,7 @@ def print_ml_forecast(forecast: Dict, symbol: str):
     print("\n  " + "═" * W); conf = forecast['confidence']; conf_tag = "🟢 HIGH" if conf > 0.6 else ("🟡 MEDIUM" if conf > 0.3 else "🔴 LOW")
     print(f"  📍 CURRENT PRICE:    {forecast['current_price']:.10f}"); print(f"  🎯 FORECAST PRICE:   {forecast['forecast_price']:.10f}  (+{forecast['forecast_gain_pct']:.3f}%)")
     print(f"  📉 CONSERVATIVE:     {forecast['conservative_price']:.10f}  (+{forecast['conservative_gain_pct']:.3f}%)"); print(f"  📈 OPTIMISTIC:       {forecast['optimistic_price']:.10f}  (+{forecast['optimistic_gain_pct']:.3f}%)")
-    print(f"  ⏰ TIMEFRAME:        {forecast['n_ahead']} bars ahead"); print(f"  📊 CONFIDENCE:       {conf*100:.0f}% [{conf_tag}]"); print("  " + "═" * W)
+    print(f"  ⏰ TIMEFRAME:        Anchored to 100-bar ATR (Min 2.5% enforced)"); print(f"  📊 CONFIDENCE:       {conf*100:.0f}% [{conf_tag}]"); print("  " + "═" * W)
 
 # ==========================================
 # CONCURRENT FILTER FUNCTIONS
@@ -706,7 +735,7 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio, bull_ratio, ml_
     
     cycle_target = circuit.get('cycle_target', 0)
     primary_target = ml_forecast.get('forecast_price', current_price) if ml_forecast.get('valid') else (cycle_target if (circuit.get('direction') == 'UP' and cycle_target > current_price) else current_price)
-    target_label = "🧠 ML FORECAST" if ml_forecast.get('valid') else ("🌀 CYCLIC" if (circuit.get('direction') == 'UP' and cycle_target > current_price) else "N/A")
+    target_label = "🧠 ML ANCHORED" if ml_forecast.get('valid') else ("🌀 CYCLIC" if (circuit.get('direction') == 'UP' and cycle_target > current_price) else "N/A")
     
     print(f"  🎯 {target_label} TARGET: {primary_target:.10f}")
     if ml_forecast.get('valid'):
@@ -739,7 +768,7 @@ def format_sr_output(symbol, sr, current_price, cmo_val, vratio, bull_ratio, ml_
         print(f"  {tf:>4s}  [{bar}]  Bull: {vd['bull_pct']:.1f}%")
         
     for lb_data in sr['lookbacks']:
-        ext = lb_data['extremes']; print("\n" + "─" * W); print(f"  📐  STRICT {lb_data['lookback']} BAR RANGE") # Label explicitly shows it's only the 500 bars
+        ext = lb_data['extremes']; print("\n" + "─" * W); print(f"  📐  STRICT {lb_data['lookback']} BAR RANGE")
         print(f"  High: {ext['high']:.10f} ({ext['high_age']} bars ago)  |  Low: {ext['low']:.10f} ({ext['low_age']} bars ago) | More Recent: {ext['more_recent']}")
         grid = lb_data['grid']
         if grid:
@@ -803,7 +832,7 @@ def main():
             tf_volumes = {tf: get_volume_breakdown(trader, sym, tf, limit=50) for tf in ['1m', '5m', '15m', '2h']}
             sr_data = get_sr_targets(trader.get_max_klines(sym, '1m', max_candles=MAX_CANDLES, verbose=False), rt_price)
             
-            print(f"\n🧠 Running Real ML Walk-Forward Backtest on {sym}...")
+            print(f"\n🧠 Running Real ML Anchored Forecast on {sym}...")
             raw_ml = trader.get_max_klines(sym, '1m', max_candles=MAX_CANDLES, verbose=False)
             ml_forecast = {'valid': False}
             if raw_ml and len(raw_ml) >= 150:
